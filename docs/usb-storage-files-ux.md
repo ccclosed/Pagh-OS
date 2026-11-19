@@ -18,7 +18,7 @@ SCSI, block, mount, WARN/flush) — в `docs/usb-mass-storage-spec.md` (аген
 (`usb-files-spec` ↔ `usb-kernel-spec`). Согласовано и финализировано: block-имена `usb0`/`usb0pN`,
 mount point `/usb0p1`, `/dev/uevent` fixed-record **128 B** с точными
 смещениями (`§5.2`) + `/proc/partitions` fallback, `mount(2)` 165 /
-`umount2(2)` 166 root-only, политика «авто-mount только pagh-томов»,
+`umount2(2)` 166 root-only, политика «авто-mount только pagh-томов — userspace-композитор»,
 видимость всех устройств независимо от mount, `removing` — overlay
 композитора, exclusive single-reader в композиторе, PDP
 `devices_subscribe` → `devices`, initial snapshot на `open(/dev/uevent)`
@@ -31,10 +31,12 @@ label), mount disabled с честной причиной «exFAT пока не 
 попыток записи и без ложного mount; exFAT-драйвер — будущий этап. Несмонтированные
 и foreign-устройства видны в Files.
 
-Контракт закрыт целиком, включая entry point (`§5.4`). Три вопроса остаются
-за kernel-спекой и уходят с ней на review: кто владеет авто-mount (ядро или
-userspace), отказ устройств с `sector_size != 512` и ёмкостью > 2 TiB, и
-raw-узлы как future (`§10`, G15/G16).
+Контракт закрыт целиком, включая entry point (`§5.4`). **Решение lead
+(2026-11-19): авто-mount pagh-томов делает userspace — root-композитор по
+`ADD fs_class=pagh_ext2`; ядро только публикует события, на hotplug ничего не
+монтирует, boot-mount `/mnt` не меняется.** За kernel-спекой остаются два
+вопроса: отказ устройств с `sector_size != 512`/ёмкостью > 2 TiB (G15) и
+raw-узлы как future; coordination item по auto-mount — G16 (`§10`).
 
 ---
 
@@ -45,9 +47,9 @@ raw-узлы как future (`§10`, G15/G16).
 | Источник списка устройств | `/dev/uevent` читает **композитор**, один reader на N клиентов; Files получает снимок по PDP |
 | Список в Files | секция «УСТРОЙСТВА» из снимка: `/` (id 10), `/mnt` (id 11, если смонтирован), USB-устройства (id `1000+N`) |
 | Видимость | показываются **все** перечисленные устройства: `present` / `unmounted` / `mounted` / `removing` / `error`, включая foreign/blank/other ФС |
-| Mount | только `fs_class=1` (pagh-том); Files (non-root) шлёт PDP-request, root-композитор зовёт `mount(2)` 165 / `umount2(2)` 166; авто-mount — политика ядра (открытый вопрос владельца) |
+| Mount | только `fs_class=1` (pagh-том); Files (non-root) шлёт PDP-request, root-композитор зовёт `mount(2)` 165 / `umount2(2)` 166. **Авто-mount — тоже композитор:** по `ADD fs_class=1` (ядро на hotplug не монтирует) |
 | Foreign/exFAT/blank | видны, mount **disabled** с причиной; read/write не заявляется; format — вне v1 |
-| Safe removal | подтверждение → `device_request(eject)` → root-композитор: `umount2` (flush WAL + SYNCHRONIZE CACHE) → «можно отключать» **только** после `safe_to_remove`; ошибка flush оставляет том смонтированным |
+| Safe removal | подтверждение → `device_request(eject)` → root-композитор: `umount2` (flush WAL + SYNCHRONIZE CACHE) → «можно отключать» **только** после `safe_to_remove`; ошибка flush оставляет том смонтированным. Eject без mount — no-op, но показывает «можно отключать», **не** выдаётся за unmount |
 | Реальный листинг | `navigate_to` уже работает; новых механизмов листинга нет |
 | Открытие файлов | `OpenPath` остаётся `println` до track B; зависимость названа |
 | Free space | `statfs(2)` (nr 137) уже есть; P2, в acceptance v1 не входит |
@@ -183,7 +185,7 @@ flush на kernel-стороне, mount-политика (это `docs/usb-mass-
 | **R-USBF-8** | Листинг после mount — реальный `read_dir` того же `Vfs`; никаких синтетических записей, «пусто» и «ошибка» различаются | T11; `§8.2` шаг 3 |
 | **R-USBF-9** | Событийный канал не теряет состояние: композитор держит полный снимок, `seq`-разрыв вызывает resync; поздно подключившийся клиент получает полный список | T3, T5, T8 |
 | **R-USBF-10** | Files не хардкодит mount path: берёт `mount` из события как есть, без переписывания корня; путь валидируется (`/usb…`, без `..`) — иначе `ENOENT` из-за `ROOT_KEEPING_COMPONENTS` | T10, T17, T21 |
-| **R-USBF-11** | Ошибки показываются текстом с причиной (io/mount_failed/flush_failed/unsupported_fs/foreign/blank/no_media/read_only/gone; `in_use` — флаг, текст приходит из `device_result`); молчаливых отказов нет | T9, T12, T13 |
+| **R-USBF-11** | Ошибки показываются текстом с причиной (io/mount_failed/flush_failed/unsupported_fs/foreign/blank/no_media/read_only/bad_mount/gone; `in_use` — флаг, текст приходит из `device_result`); молчаливых отказов нет | T9, T12, T13 |
 | **R-USBF-12** | Открытие файла остаётся `OpenPath` (track B); устройство-специфичного открытия в v1 нет | `§7` |
 | **R-USBF-13** | Files — non-root клиент: не вызывает `mount`/`umount2` и не читает `/dev/uevent`; любое действие — только `device_request` композитору | T22; `§5.4` |
 
@@ -270,6 +272,13 @@ ASCII-only, не-ASCII → `?`; UI-fallback «USB-накопитель» — ч�
 `N, M ≤ 99` (например `/media/usb99p99` = 15 символов, ровно лимит); если
 понадобится длиннее — это новый ABI, а не «допишем в строку».
 
+**ENFORCE, а не обрезание.** `mount`, который не помещается в 15 символов,
+не начинается с `/usb` или содержит `..`, **не** молча укорачивается:
+композитор помечает строку `state=error`, `reason=bad_mount`, не даёт
+навигацию/mount/eject и показывает «Точка монтирования не помещается в ABI
+(15 символов)»; `mount(2)` с таким `target` ядро всё равно отвергнет
+(`EINVAL`). Тот же предикат — в Files до `navigate_to`.
+
 **Состояние устройства = вывод из полей, а не отдельное поле ядра:**
 
 | Условие | `state` | `reason` |
@@ -284,6 +293,7 @@ ASCII-only, не-ASCII → `?`; UI-fallback «USB-накопитель» — ч�
 | `fs_class == 3` | `present` | `blank` |
 | `fs_class == 4` | `present` | `unsupported_fs` |
 | `fs_class == 5` | `present` | `no_media` |
+| `mount` невалиден (`> 15`, не `/usb…`, `..`) | `error` | `bad_mount` — ABI-нарушение, не «поправим путь» |
 | `fs_class == 0` | `present` | `enumeration_failed` |
 
 `MOUNTED`/`UNMOUNTED` применяются как переход (`mounted=1/0`) и затем
@@ -339,7 +349,7 @@ u16 count                       // <= 32 (MAX_DEVICES)
   u8 reason                     // 0 none, 1 unsupported_fs, 2 foreign_volume, 3 blank,
                                 // 4 io, 5 mount_failed, 6 flush_failed,
                                 // 7 enumeration_failed, 8 device_gone, 9 no_media,
-                                // 10 read_only
+                                // 10 read_only, 11 bad_mount
                                 // (in_use — это flags.bit3, не reason)
   u64 capacity                  // байты; 0 = неизвестно
   string vendor
@@ -396,11 +406,14 @@ root-only (`euid == 0`), Linux-сигнатуры.
 * **Surprise removal:** dead-флаг, I/O → `EIO`, `REMOVE surprise=1`; WAL
   replay при следующем mount.
 
-**Unmount vs «Безопасно извлечь».** Обе кнопки вызывают один и тот же
-`umount2`, разница только в UX: «Отмонтировать» — без подтверждения,
-`device_result status=ok`; «Безопасно извлечь…» — подтверждение и
-`status=safe_to_remove` с сообщением «теперь можно отключить». Второго
-kernel-пути нет и выдумывать его нельзя.
+**Unmount vs «Безопасно извлечь».** Для смонтированного тома обе кнопки
+вызывают один и тот же `umount2`, разница только в UX: «Отмонтировать» — без
+подтверждения, `device_result status=ok`; «Безопасно извлечь…» — подтверждение
+и `status=safe_to_remove` с сообщением «теперь можно отключить». Второго
+kernel-пути нет и выдумывать его нельзя. Для **несмонтированного** тома
+(`present`/`unmounted`) eject — **no-op**: композитор не зовёт `umount2`, сразу
+отвечает `status=safe_to_remove` и «можно отключать». Это не unmount: строка
+не становится `unmounted`, UI не пишет «отмонтировано», в логе нет `umount2`.
 
 Композитор не вызывает сисколлы из своего цикла: операция может длиться
 секунды (flush носителя). Схема:
@@ -435,13 +448,22 @@ server loop ──device_request──► worker thread ──mount(2)/umount2(2
 «починить» путь: `navigate_to` делает только лексическую нормализацию
 (`//`, `.`, `..`), а не переписывание корня.
 
-**Авто-mount: два допустимых владельца (открытый вопрос O7/G16).** Если авто-mount
-остаётся за ядром, при `ADD fs_class=1` приходит `MOUNTED` и UX только
-отображает точку. Если за userspace, композитор при `ADD fs_class=1 &&
-!mounted && !in_use && !read_only` сам вызывает `mount(2)` без диалога (это не «явное
-действие пользователя», а политика), а `device_request(mount)` остаётся для
-повторного монтирования после `umount2`. PDP-контракт и UI в обоих случаях
-одинаковы — меняется только место вызова.
+**Авто-mount: userspace-driven, root-композитор (решение lead 2026-11-19).**
+Ядро на hotplug **не монтирует**: оно публикует `ADD` с `fs_class` и всё.
+Композитор при `ADD fs_class=pagh_ext2 && !mounted && !read_only` сам вызывает
+`mount(2)` через worker (без диалога — это политика, не действие пользователя);
+успех приходит как `MOUNTED`, и `device_request(mount)` остаётся для повторного
+монтирования после `umount2`. Foreign/other/blank/read-only композитор **не**
+монтирует: строка видна, mount disabled с причиной. Boot-mount `/mnt`
+(`boot.rs::init_fs`) не меняется — это отдельный путь.
+
+Следствия, названные явно: без живого root-композитора USB-том не монтируется
+(и список не приходит — Files получает его по PDP), поэтому shell/`/mnt`-путь
+не регрессирует. Kernel-спека b666bcae §11.3 рекомендовала kernel-side
+auto-mount — решение lead это отменяет; kernel-правка убирает auto-mount из
+`usb-storage`-потока и оставляет только `ADD` (coordination item, G16). Если
+композитор не root, авто-mount не выполняется, и первая же попытка даёт
+понятную ошибку прав (`§5.4`, errno-таблица).
 
 Валидация на стороне композитора (до вызова): `id` есть в снимке; `state` и
 `fs_class` допускают действие; `target` из события, а не собранный из строки
@@ -467,7 +489,7 @@ Kernel-ошибка не показывается пользователю ко�
 | `rust-apps/pagh-desktop/src/protocol.rs` | `Message::{DevicesSubscribe, Devices, DeviceRequest, DeviceResult}`, типы 17–20, `ERR_DEVICE`, `ERR_DEVICE_BUSY`, roundtrip-тесты |
 | `rust-apps/pagh-ui/src/protocol.rs` | те же типы (вторая реализация протокола — обязана совпадать; тесты в обоих крейтах) |
 | `rust-apps/pagh-ui/src/client.rs` | `DesktopClient::{subscribe_devices, request_device}`, `Incoming::{Devices, DeviceResult}` |
-| `rust-apps/pagh-desktop/src/server.rs` | подписка per-client, broadcast снимка, `device_request` → worker, `device_result`, маркеры в serial-логе |
+| `rust-apps/pagh-desktop/src/server.rs` | подписка per-client, broadcast снимка, `device_request` → worker, **авто-mount по `ADD fs_class=1`**, `device_result`, маркеры в serial-логе |
 | `rust-apps/pagh-desktop/src/usbdev_ops.rs` (новый) | `DeviceOps` + реализация через `mount(2)`/`umount2(2)` (extern-FFI, без libc-крейта); фейк для тестов |
 | `rust-apps/pagh-files/src/device.rs` (новый) | `DeviceInfo`, `DeviceState`, `DeviceAction`, `reason_text`, `ui_label` (из `label`/vendor/product), `detail` |
 | `rust-apps/pagh-files/src/app.rs` | `devices: Vec<DeviceInfo>`, `apply_devices`, `device_result`, `build_device_places`, place-aware контекстное меню, диалоги, `Command::DeviceRequest` |
@@ -517,6 +539,7 @@ Kernel-ошибка не показывается пользователю ко�
 | `device_gone` | «Устройство отключено» |
 | `no_media` | «Нет носителя (картридер без карты)» |
 | `read_only` | «Носитель защищён от записи — монтирование только для чтения не поддерживается» |
+| `bad_mount` | «Точка монтирования не помещается в ABI (15 символов) или некорректна» |
 
 ### 6.2 Сайдбар
 
@@ -707,8 +730,9 @@ Files запускает приложение через `launch_targets`-рее
   синтетический кадр концепта) + golden hash; существующие сцены не меняются.
 * T21 `mount_path_used_verbatim` — снимок `mount="/usb0p1"` → `navigate_to`
   получает ровно `/usb0p1` (никакого `/mnt/usb0p1`); лексическая нормализация
-  `//`, `.`, `..` работает, но корень не переписывается; mount с `..` или не
-  `/usb…` отвергается до навигации.
+  `//`, `.`, `..` работает, но корень не переписывается; mount с `..`, не
+  `/usb…` или длиннее 15 символов → `state=error reason=bad_mount`, навигации
+  нет, текст ошибки показан (никакого обрезания).
 * T22 `requests_go_to_compositor` — каждое действие из меню даёт
   `Command::DeviceRequest`; в `pagh-files` нет вызовов `mount`/`umount2` и нет
   чтения `/dev/uevent` (R-USBF-13); ответ приходит только как
@@ -743,9 +767,12 @@ Files запускает приложение через `launch_targets`-рее
 4. Ассерты в serial-логе (детерминированные маркеры, без времени). Точные строки
    ядра задаёт `docs/usb-mass-storage-spec.md` (b666bcae); ниже — контрактные
    примеры, grep-паттерны фиксируются при реализации: `usb: uevent open ok`;
-   `usb: add usb0 vendor=… product=… label=… sectors=… class=1`;
-   `usb: mount usb0 /usb0p1`;
+   `usb: add usb0 vendor=… product=… label=… sectors=… class=1` (ядро только
+   классифицирует — **авто-mount в ядре нет**);
+   `pagh-desktop: mount usb0p1 /usb0p1 ok` (root-композитор по `ADD`);
    `pagh-files: devices 1 (usb0 mounted /usb0p1 label="PAGH")`;
+   **boot не затронут:** `/mnt` монтируется тем же `boot.rs::init_fs`, что и до
+   фичи (проверяют существующие `desktop`/`usb` режимы).
    `USBFILES write PASS`, `USBFILES read PASS`, `USBFILES unmount PASS`,
    `USBFILES eject PASS`.
    **ROOT_KEEPING**: `read_dir("/usb0p1")` в госте обязан работать, а
@@ -759,7 +786,8 @@ Files запускает приложение через `launch_targets`-рее
    removal (`REMOVE surprise=1`, читатели получают `EIO`), Files убирает
    строку, не падает и показывает `surprise`-notice, если `cwd` был внутри
    точки. Повторный `device_add` того же образа в этой же загрузке → `ADD`,
-   авто-mount, чтение ранее записанного файла: WAL replay, а не «чистый» том.
+   авто-mount композитора, чтение ранее записанного файла: WAL replay, а не
+   «чистый» том.
 6. Негатив: `usb.img` как чужой ext2 (`mkfs.ext2` с хоста) → `class=2`, mount
    пуст, строка видна, mount disabled; `blank`-образ → `class=3`.
 7. Persistence (совпадает с kernel-приёмкой b666bcae): файл, оставленный
@@ -808,10 +836,10 @@ kernel-спекой, запрещает авто-mount и mount чужих то�
 | Этап | Содержание | Зависит от | Гейты |
 |---|---|---|---|
 | **S0** | Эта спека + согласование контракта | — | review lead |
-| **S1** | kernel: `/dev/uevent` (128 B, exclusive, `PUEV_IOC_SNAPSHOT`), `mount(2)` 165 / `umount2(2)` 166, flush/SYNCHRONIZE CACHE, surprise-remove; `docs/usb-mass-storage-spec.md` | kernel-агент | kernel-гейты (их PR) |
+| **S1** | kernel: `/dev/uevent` (128 B, exclusive, `PUEV_IOC_SNAPSHOT`), `mount(2)` 165 / `umount2(2)` 166, flush/SYNCHRONIZE CACHE, surprise-remove, `ROOT_KEEPING_COMPONENTS += "usb"`, **без auto-mount** (только `ADD`); `docs/usb-mass-storage-spec.md` | kernel-агент | kernel-гейты (их PR) |
 | **S2** | `pagh-desktop/src/usbdev.rs` + PDP 17–20 + подписка/broadcast + маркеры в serial-логе; **без UI** | S1 (или фейковый reader для тестов) | `cargo test -p pagh-desktop`, `-p pagh-ui` |
 | **S3** | Files: модель устройств, сайдбар, detail, свойства, контекстное меню, состояния; mount/unmount — disabled до S4 (нет worker'а и подтверждений) | S2 | `cargo test -p pagh-files -p pagh-ui`; screenshot |
-| **S4** | mount/unmount/eject: worker + `DeviceOps` + `mount`/`umount2` + overlay `removing` + диалоги | S1 (uevent + сисколлы), S3 | crate + `e2e.py usbfiles` |
+| **S4** | mount/unmount/eject: worker + `DeviceOps` + `mount`/`umount2` + **авто-mount pagh по `ADD`** + overlay `removing` + диалоги | S1 (uevent + сисколлы), S3 | crate + `e2e.py usbfiles` |
 | **S5** | Реальное железо (Ventoy = обнаружение/foreign; Pagh-том = mount/read/write), README/`docs`, снятие «USB mass storage нет» | S4 | ручная проверка + e2e |
 
 Правила: каждый этап — отдельный PR в `dev` **после** stable-merge; PR base —
@@ -847,8 +875,8 @@ crate-тесты затронутых rust-apps; для S4 — `python3 tools/e2
 | G13 | **Хабы не поддерживаются**, только корневые порты | флешка в хабе не появится | kernel-спека; UX ничего не обещает |
 | G14 | **Деградированный `/proc/partitions`** без vendor/fs_class | «USB-накопитель» без деталей | warning в serial; не приёмка |
 | G15 | **Устройства с `sector_size != 512` и ёмкостью > 2 TiB** kernel-контракт отвергает (открытый вопрос review) | такие носители не появятся/покажут error | UI показывает `error`/`enumeration_failed`, если ядро вообще отдаст устройство; иначе — «не отдано ядром» |
-| G16 | **Владелец авто-mount не решён** (ядро или userspace) | если userspace — композитор сам зовёт `mount(2)` при `ADD fs_class=1`; если ядро — UX только отображает | вопрос уходит с kernel-спекой на review; контракт PDP от этого не меняется |
-| G17 | **`mount[16]` = 15 символов** | будущие длинные точки не влезут | Phase 1 ok; при вложенных путях держать `usbNpM` ≤ 15 символов; иначе — новый ABI |
+| G16 | **Авто-mount — userspace: нужен живой root-композитор**; kernel-спека b666bcae §11.3 пока рекомендует kernel-side | без композитора нет ни mount, ни списка (Files — PDP-клиент); если композитор non-root — auto-mount не идёт | kernel-правка убирает auto-mount из `usb-storage`-потока (только `ADD`); композитор монтирует по `ADD fs_class=1`; boot `/mnt` не меняется |
+| G17 | **`mount[16]` = 15 символов** | будущие длинные точки не влезут | ENFORCE: невалидный/длинный `mount` → `error/bad_mount` с внятным текстом; вложенные `usbNpM ≤ 99` влезают; длиннее — ABI v2 |
 | G18 | **`ROOT_KEEPING_COMPONENTS` без `"usb"`** уводит `/usb0p1` в `/mnt/usb0p1` (kernel-правка §11.5 kernel-спеки) | Files/композитор получат `ENOENT`, если правку забыть | S1 обязан добавить `"usb"` + host-свойство; приёмка проверяет `/usb0p1` и `/mnt/usb0p1` (§8.2 шаг 4) |
 | G19 | **Kernel-спека b666bcae ещё не в `origin/dev`** | S1/S4 нельзя начинать до её merge | dependency line; UX-код S2 можно писать на фейковых записях |
 | G20 | **Read-only носитель** (sense 07/27) и **ro-mount** | auto-mount не выполняется (ext2 mount пишет); тома с защитой от записи видны, но не монтируются | UI: `reason=read_only`, mount disabled; ro-mount — future (kernel §11.3) |
@@ -873,22 +901,28 @@ crate-тесты затронутых rust-apps; для S4 — `python3 tools/e2
 3. **O3 — закрыт контрактом.** Top-level `usbNpM`; `/mnt`, `/proc`, `/dev`,
    `/tmp`, `/media` зарезервированы (`EINVAL`), коллизия с файлом невозможна
    (rootfs не writable). `/media` остаётся за будущими вложенными точками.
-4. **O4 — «Безопасно извлечь» без mount.** Для `present`/`unmounted` eject —
-   no-op с сообщением «можно отключать». Подтвердить, что это ожидаемое
-   поведение, а не «кнопка должна отсутствовать».
-5. **O5 — `--device-selftest` как продуктовая поверхность.** Оставляем скрытый
-   флаг в `pagh-files` (как `--shot`) для e2e или считаем его тестовым и
-   убираем после S4? Рекомендация: оставить — он проверяет те же пути кода на
-   реальном железе без указателя.
-6. **O6 — закрыт контрактом: `label[16]`, а не serial.** В записи 108..124 —
-   метка тома ext2 (`s_volume_name`); serial (VPD 0x80) и VID:PID в Phase 1
-   **не читаются** и в ABI не входят (v2 — отдельным полем, не подменой). UI
-   использует label → vendor/product; «Свойства» без serial/VID:PID.
-7. **O7 — три вопроса kernel-спеки идут с ней на review, не блокируют UX:**
-   владелец авто-mount (kernel-спека рекомендует ядро, `is_pagh_volume`;
-   userspace-вариант меняет одну точку вызова, G16); отказ `sector_size !=
-   512` и > 2 TiB (G15); raw-узлы как future. Контракт PDP/`devices` от их
-   решения не меняется.
+4. **O4 — решено lead: eject без mount = no-op, но с «можно отключать».** Для
+   `present`/`unmounted` «Безопасно извлечь…» не зовёт `umount2` (нечего
+   сбрасывать), сразу отдаёт `safe_to_remove` и сообщение «теперь можно
+   отключить». Это **не** unmount: строка не становится `unmounted`, UI не
+   пишет «отмонтировано», в логе нет `umount2`. «Отмонтировать» для
+   несмонтированного disabled.
+5. **O5 — решено lead: `--device-selftest` — скрытый test-only флаг.** Это не
+   пользовательская фича и не документируется в `--help` для конечного
+   пользователя; он существует для `tools/e2e.py usbfiles` и проверяет те же
+   пути `FilesApp`/PDP/HostVfs, что и клики. Убирать после S4 не нужно, но и
+   «фичей» он не считается.
+6. **O6 — решено/закрыто контрактом: `label[16]`, а не serial.** В записи
+   108..124 — метка тома ext2 (`s_volume_name`); serial (VPD 0x80) и VID:PID в
+   Phase 1 **не читаются** и в ABI не входят (v2 — отдельным полем, не
+   подменой). UI использует label → vendor/product; «Свойства» без
+   serial/VID:PID.
+7. **O7 — решено lead: авто-mount — userspace/root-композитор.** Ядро на
+   hotplug только публикует `ADD` (`fs_class`), `mount(2)` зовёт композитор;
+   boot-mount `/mnt` не меняется. За kernel-спекой остаются два вопроса:
+   отказ `sector_size != 512` и > 2 TiB (G15) и raw-узлы как future. Контракт
+   PDP/`devices` от них не меняется. Kernel-спека b666bcae §11.3 (kernel-side
+   auto-mount) этим решением отменяется — coordination item G16.
 
 ---
 
