@@ -37,6 +37,7 @@ use alloc::vec::Vec;
 use crate::drivers::framebuffer;
 use crate::drivers::partition::PartitionContent;
 use crate::drivers::BlockDevice;
+use crate::fs::mount_choice::{self, Action as MountAction};
 use crate::shell::keys::{Decoder, KeyEvent};
 
 /// What the operator decided.
@@ -68,7 +69,7 @@ struct Row {
 /// Seconds the menu waits before taking the safe default.
 const TIMEOUT_SECS: u64 = 20;
 
-/// Show the menu when there is something to choose.
+/// Show the menu when there is something to choose **and nobody has answered yet**.
 ///
 /// `partitions` is the boot path's [`crate::drivers::partition::candidates`] list:
 /// the caller classifies devices once and both the menu and the fallback path use
@@ -78,14 +79,28 @@ const TIMEOUT_SECS: u64 = 20;
 /// Returns [`Choice::Skip`] immediately when the machine exposes nothing to choose
 /// (a plain RAM-disk boot has nothing to ask about) or when the framebuffer is
 /// unavailable, so an unattended boot is never blocked.
+///
+/// ONE QUESTION PER MACHINE. The menu is a first-boot ritual only: it runs while
+/// no mount choice has been recorded and never again after one has
+/// ([`crate::fs::mount_choice`], written by [`record_choice`] once the boot path
+/// has actually mounted the volume). The answer to "is there anything to ask?"
+/// is therefore *not* "does a pagh volume exist" — an image built by
+/// `tools/mkimage.py` arrives with a provisioned volume on the very first boot, and
+/// skipping on that made the menu unreachable for exactly the operator who had
+/// never seen it. A volume can be present while the choice is still unmade.
 pub fn run(partitions: &[(Arc<dyn BlockDevice>, PartitionContent)]) -> Choice {
-    // A boot that already carries a pagh-owned volume is unambiguous: `Skip`
-    // mounts it by the normal priority. Asking again every boot is the
-    // "first launch" ritual this avoids — a 20 s menu with mount/format to
-    // answer a question whose safe answer is already on disk. The menu stays
-    // for genuinely ambiguous media (blank/foreign disk, first provision).
-    if has_pagh_volume(partitions) {
-        crate::info!("fs: pagh volume already present; boot disk menu skipped");
+    // Only a RECORDED CHOICE skips the menu. Before this, an already-provisioned
+    // volume skipped it too, which hid the one-time question from every disk that
+    // shipped provisioned (the demo image) and left the operator with no mount
+    // menu at all — while the rule before it asked on *every* boot, 20 s each.
+    // The marker is what separates those two failures: it exists only after
+    // somebody answered.
+    if let Some((device, choice)) = recorded_choice(partitions) {
+        crate::info!(
+            "fs: mount choice already recorded ({} on {}); boot disk menu skipped",
+            choice.action().name(),
+            device
+        );
         return Choice::Skip;
     }
     let rows = collect(partitions);
@@ -287,19 +302,110 @@ fn wait_ms_polling(ms: u32, decoder: &mut Decoder) -> Vec<KeyEvent> {
     events
 }
 
-/// True when the machine already has a pagh-provisioned volume, including a RAM
-/// disk carried by the boot medium. `classify` is the same probe the menu and
-/// the boot path use, so "provisioned" means exactly "mountable by pagh".
-fn has_pagh_volume(partitions: &[(Arc<dyn BlockDevice>, PartitionContent)]) -> bool {
-    if partitions
-        .iter()
-        .any(|(_, content)| *content == PartitionContent::PaghVolume)
+/// The recorded mount choice, and the device it was written on.
+///
+/// Every device the boot path may mount is checked — the caller's partitions
+/// first, then the same fixed names [`crate::boot::init_fs`] falls back to. The
+/// marker lives in a raw sector ([`crate::fs::mount_choice::MARKER_SECTOR`]), so
+/// this needs no filesystem: it must run before anything is mounted, because
+/// mounting is what the answer decides.
+///
+/// A strict decode is what makes scanning every device harmless: only a sector
+/// this kernel itself wrote matches magic, version, action, name charset,
+/// checksum and a zeroed tail. A partition table header, a boot sector or
+/// garbage reads as "no choice", so the menu is asked again rather than silently
+/// skipped.
+fn recorded_choice(
+    partitions: &[(Arc<dyn BlockDevice>, PartitionContent)],
+) -> Option<(String, mount_choice::Choice)> {
+    for (dev, _) in partitions {
+        if let Some(choice) = recorded_on(&**dev) {
+            return Some((String::from(dev.name()), choice));
+        }
+    }
+    for name in ["ram0", "virtio-blk0", "nvme0"] {
+        if let Some(dev) = crate::drivers::get_block(name) {
+            if let Some(choice) = recorded_on(&*dev) {
+                return Some((String::from(dev.name()), choice));
+            }
+        }
+    }
+    None
+}
+
+/// Read and decode the marker off one device.
+fn recorded_on(dev: &dyn BlockDevice) -> Option<mount_choice::Choice> {
+    let mut sector = [0u8; mount_choice::SECTOR_BYTES];
+    dev.read_block(mount_choice::MARKER_SECTOR, &mut sector)
+        .ok()?;
+    mount_choice::Choice::decode(&sector)
+}
+
+/// Persist the operator's answer on the volume the boot path just mounted.
+///
+/// Called by [`crate::boot::init_fs`] AFTER the mount and the first-boot seeding
+/// succeeded — the marker is the last write of the mount step, so a boot
+/// interrupted before it leaves the question open and asks again instead of
+/// promising an answer that was never recorded (same ordering rule as
+/// `/mnt/etc/pagh-release` in [`crate::provision::seed`]).
+///
+/// `write_once` semantics: the first answer wins. A later boot of the same disk
+/// must not rewrite the history, and a marker that is already there is proof the
+/// question was asked, so rewriting it buys nothing and risks a torn sector.
+pub fn record_choice(dev: &dyn BlockDevice, action: MountAction) -> bool {
+    let mut sector = [0u8; mount_choice::SECTOR_BYTES];
+    if dev
+        .read_block(mount_choice::MARKER_SECTOR, &mut sector)
+        .is_err()
     {
+        crate::warn!(
+            "fs: cannot read the mount-choice sector of {}; the disk menu will ask again",
+            dev.name()
+        );
+        return false;
+    }
+    if mount_choice::Choice::decode(&sector).is_some() {
         return true;
     }
-    crate::drivers::get_block("ram0")
-        .map(|ram| crate::drivers::partition::classify(&*ram) == PartitionContent::PaghVolume)
-        .unwrap_or(false)
+    // The marker sector is LBA 1. On a device that still carries a partition
+    // table that LBA is the GPT header, and writing over it would delete the
+    // operator's layout — the exact class of data loss this boot path exists to
+    // avoid. A mounted volume has no live GPT (the kernel wrote the filesystem
+    // itself), but the check costs one comparison and fails closed.
+    if sector[..8] == *b"EFI PART" {
+        crate::warn!(
+            "fs: {} carries a partition table at LBA 1; refusing to write the mount choice over it",
+            dev.name()
+        );
+        return false;
+    }
+    let Some(choice) = mount_choice::Choice::new(action, dev.name()) else {
+        crate::warn!(
+            "fs: device name {:?} cannot be recorded; the disk menu will ask again",
+            dev.name()
+        );
+        return false;
+    };
+    if !choice.encode(&mut sector)
+        || dev
+            .write_block(mount_choice::MARKER_SECTOR, &sector)
+            .is_err()
+    {
+        crate::warn!(
+            "fs: writing the mount-choice marker to {} failed; the disk menu will ask again",
+            dev.name()
+        );
+        return false;
+    }
+    // Best effort: the marker only has to be durable enough to outlive the next
+    // boot, and a device without a volatile-cache flush is already there.
+    let _ = dev.flush();
+    crate::info!(
+        "fs: mount choice recorded on {} ({})",
+        dev.name(),
+        action.name()
+    );
+    true
 }
 
 /// Every choice the menu offers: the caller's partitions, plus the RAM disk when

@@ -577,6 +577,56 @@ def prepare_usb_menu_disk(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
+def wipe_mount_choice(source: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
+    """Copy `source` and erase the recorded boot mount choice, wherever it is.
+
+    WHY THIS IS THE REPORTED DISK. `#136` skipped the boot disk menu whenever a
+    pagh volume existed, so a disk that arrives already provisioned — every image
+    `tools/mkimage.py --make-disk` writes (GPT + one ext2+WAL partition) and every
+    disk whose first boot went through the old kernel — never showed the mount
+    menu at all ("why do I have NO mount-selection menu, I asked for it once, not
+    4334 times"). Meanwhile the rule before it asked on every single boot. The
+    fix keys the skip on the RECORDED CHOICE (`fs::mount_choice`), so this exact
+    image — volume present, choice never made — must ask once and then never
+    again. Recreating it means removing the marker from a disk that has one.
+
+    The marker sits in the second 512-byte sector of the volume the boot path
+    mounted, which is not a fixed image offset: on a partitioned disk the
+    partition's own start moves it. Searching for the magic is the honest way to
+    find it. EVERY copy has to go, not just the first: the marker sector lies
+    inside ext2 block 0, the WAL journals that block, and a journal replay would
+    otherwise restore the bytes this helper just erased — the reconstructed disk
+    would quietly still carry a choice and the test would prove nothing. The
+    test then proves the wipe worked by requiring the menu on the next boot.
+    """
+    data = bytearray(source.read_bytes())
+    magic = b"PAGH-MNT-CHOICE"  # must match `fs::mount_choice::MAGIC`
+    wiped = 0
+    first = -1
+    search = 0
+    while True:
+        index = data.find(magic, search)
+        if index < 0:
+            break
+        sector = index - index % 512
+        data[sector:sector + 512] = b"\0" * 512
+        if first < 0:
+            first = sector
+        search = sector + 512
+        wiped += 1
+    if wiped == 0:
+        raise HarnessError(
+            f"{rel(source)} carries no recorded mount choice; the first boot of this "
+            f"mode should have written one (fs: mount choice recorded on ...)")
+    if magic in data:
+        raise HarnessError(f"{rel(source)} still carries a mount choice marker after the wipe")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(bytes(data))
+    log(f"usb: mount choice wiped from {rel(dest)} "
+        f"({wiped} marker sector(s), live one at image offset {first:#x})")
+    return dest
+
+
 def _elf_load_ranges(data: bytes) -> list[tuple[int, int]]:
     """File-offset range of every PT_LOAD segment of an ELF64 LSB image.
 
@@ -2031,7 +2081,18 @@ def mode_usb(h: Harness) -> tuple[str, int]:
     4. type `usb` in the shell over the same USB keyboard and assert the driver's
        own evidence: `input: usb: ... 2 HID, kbd N reports`, `xhci: HID device on
        port ...` with protocol=1 (keyboard) and protocol=2 (mouse), and the `usb`
-       command's port table showing both devices connected/enabled at high speed.
+       command's port table showing both devices connected/enabled at high speed;
+    5. reboot the same disk: the menu must NOT come back. `#136` skipped it on a
+       provisioned volume, which is what this boot now proves was the wrong key —
+       the skip must come from the RECORDED CHOICE (`fs::mount_choice`), so the
+       marker has to be on the volume after step 3 and the serial must say
+       `boot disk menu skipped`;
+    6. rebuild the reported disk — the image from step 5 with the recorded choice
+       erased (`wipe_mount_choice`), i.e. "a pagh volume arrives provisioned and
+       nobody ever answered". First boot: the menu SHOWS (the user's bug was that
+       it never did), Enter mounts the volume, `fs: mount choice recorded` lands
+       before the next boot. Second boot of the same disk: `boot disk menu
+       skipped`, no reformat, volume mounted, shell without a menu timeout.
 
     WHY THE REPORT COUNTERS ARE THE PROOF: q35 always emulates i8042 (`ps2: yes`
     in the banner) and QEMU cannot be told to remove it, so a keystroke could in
@@ -2311,6 +2372,95 @@ def mode_usb(h: Harness) -> tuple[str, int]:
                   bool(second_text),
                   "shell banner seen" if second_text else "no banner")
     h.metrics["second boot"] = skip_line or "no skip marker"
+
+    # ── the reported bug: provisioned disk, choice never recorded ──
+    # The second boot above skipped because THIS run answered the question (the
+    # menu formatted p1). The user's disk is the other shape: it carries a pagh
+    # volume but no recorded choice — `#136` skipped the menu on the volume alone,
+    # so it was never shown, and before that it was shown on every boot. Both
+    # halves are tested by wiping the marker and booting twice more.
+    legacy = wipe_mount_choice(disk, CACHE / "e2e_usb_disk_unchosen.img")
+    unchosen_shot = CACHE / "e2e_usb_menu_unchosen.png"
+    after_choice_shot = CACHE / "e2e_usb_menu_unchosen_shell.png"
+    evidence = {"menu_shot": False, "chose_mount": False, "recorded": False,
+                "mounted": False, "skipped": False, "second_mounted": False}
+
+    second.stop()
+    h.guest = None
+    log("usb: first boot of a provisioned disk with NO recorded choice — the menu "
+        "must appear here")
+    h.boot(need_keyboard=False, disk=legacy, net=False)
+    assert h.guest is not None
+    third = h.guest
+    kb3 = QemuShotKeyboard(h.monitor, a.key_delay)
+    kb3.connect(timeout=min(a.boot_timeout, 180.0))
+    if wait_for(third, [rf"part: MBR on {re.escape(device)}: 2 partition\(s\)"], timeout,
+                label="menu on a provisioned disk without a recorded choice") is not None:
+        evidence["menu_shot"] = True
+        time.sleep(0.6)  # let a redrawn frame land before the screenshot
+        kb3.screenshot(unchosen_shot)
+        # Enter on row 1 = the pagh volume: mount, never format, and it is exactly
+        # the one-time answer the operator would give.
+        kb3.key("ret")
+        evidence["chose_mount"] = wait_for(
+            third, [rf"fs: operator chose to mount {re.escape(device)}p1"], timeout,
+            label="the one-time menu choice") is not None
+        evidence["recorded"] = wait_for(
+            third, [rf"fs: mount choice recorded on {re.escape(device)}p1 \(mount\)"], timeout,
+            label="the recorded mount choice") is not None
+        evidence["mounted"] = wait_for(third, [r"ext2 mounted at /mnt"], timeout,
+                                       label="mount after the one-time choice") is not None
+        if wait_for_shell(third, kb3, a, a.boot_timeout):
+            kb3.screenshot(after_choice_shot)
+    third_text = third.serial()
+    ok &= h.check("a provisioned disk with no recorded choice still SHOWS the mount menu",
+                  evidence["menu_shot"], "menu drawn" if evidence["menu_shot"]
+                  else regex_first(r"fs: [^\r\n]*boot[^\r\n]*menu[^\r\n]*", third_text)
+                  or "no menu, no skip line")
+    ok &= h.check("the menu's mount choice went through", evidence["chose_mount"],
+                  regex_first(r"fs: operator chose to mount[^\r\n]*", third_text)
+                  or "no choice line")
+    ok &= h.check("the choice is recorded on the volume before the next boot",
+                  evidence["recorded"],
+                  regex_first(r"fs: mount choice recorded[^\r\n]*", third_text)
+                  or "no record line")
+    ok &= h.check("the volume mounted after the one-time choice", evidence["mounted"],
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", third_text) or "not mounted")
+    ok &= h.check("first boot of the unchosen disk captured",
+                  unchosen_shot.is_file() and unchosen_shot.stat().st_size > 0,
+                  rel(unchosen_shot))
+    ok &= h.check("shell after the one-time choice captured",
+                  after_choice_shot.is_file() and after_choice_shot.stat().st_size > 0,
+                  rel(after_choice_shot))
+
+    third.stop()
+    h.guest = None
+    log("usb: second boot of the SAME disk — the menu must never come back")
+    h.boot(need_keyboard=False, disk=legacy, net=False)
+    assert h.guest is not None
+    fourth = h.guest
+    fourth_text = ""
+    if wait_for(fourth, [r"Welcome to pagh OS Shell!"], a.boot_timeout,
+                label="boot after the choice was recorded") is not None:
+        fourth_text = fourth.serial()
+    evidence["skipped"] = "boot disk menu skipped" in fourth_text
+    evidence["second_mounted"] = "ext2 mounted at /mnt" in fourth_text
+    choice_line = regex_first(r"fs: mount choice already recorded[^\r\n]*", fourth_text)
+    ok &= h.check("the same disk never asks again (menu skipped by the recorded choice)",
+                  evidence["skipped"], choice_line or "no skip marker")
+    ok &= h.check("the second boot of the unchosen disk auto-mounts the volume",
+                  evidence["second_mounted"],
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", fourth_text) or "not mounted")
+    ok &= h.check("the second boot of the unchosen disk does not reformat",
+                  not re.search(r"fs: formatting|operator chose to format", fourth_text),
+                  "format line present" if re.search(r"fs: formatting|operator chose to format",
+                                                     fourth_text) else "none")
+    h.metrics["unchosen disk"] = choice_line or "no skip marker"
+    h.metrics["unchosen disk menu screenshot"] = rel(unchosen_shot)
+    try:
+        kb3.close()
+    except Exception:  # a closed monitor socket at teardown is not a verdict
+        pass
 
     h.metrics.update({
         "keyboard reports (banner)": kbd_before if kbd_before >= 0 else "n/a",
