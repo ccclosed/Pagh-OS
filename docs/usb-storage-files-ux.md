@@ -36,7 +36,7 @@ label), mount disabled с честной причиной «exFAT пока не 
 `ADD fs_class=pagh_ext2`; ядро только публикует события, на hotplug ничего не
 монтирует, boot-mount `/mnt` не меняется.** За kernel-спекой остаются два
 вопроса: отказ устройств с `sector_size != 512`/ёмкостью > 2 TiB (G15) и
-raw-узлы как future; coordination item по auto-mount — G16 (`§10`).
+raw-узлы как future; coordination item по merge kernel-спеки — G19 (`§10`).
 
 ---
 
@@ -251,7 +251,7 @@ host-property там же; композитор держит эти смещен
 | 6 | `kind` | u8 | 1 `ADD`, 2 `REMOVE`, 3 `CHANGE`, 4 `ERROR`, 5 `MOUNTED`, 6 `UNMOUNTED` |
 | 7 | `flags` | u8 | bit0 `removable`, bit1 `read_only`, bit2 `mounted`, bit3 `in_use`, bit4 `safe_to_remove`, bit5 `surprise`, bit6 `unclean`, bit7 `detached` |
 | 8 | `fs_class` | u8 | 0 unknown, 1 pagh-ext2, 2 foreign-ext2, 3 blank, 4 other-fs, 5 no-media |
-| 9 | `error` | u8 | 0 none, 1 io, 2 mount_failed, 3 flush_failed, 4 unsupported_fs, 5 no_media, 6 unsupported_block, 7 capacity_overflow, 8 replay_failed |
+| 9 | `error` | u8 | 0 none, 1 io, 2 mount_failed, 3 flush_failed, 4 unsupported_fs, 5 no_media, 6 unsupported_block, 7 capacity_overflow, 8 replay_failed, **9 bad_mount**; 0–5 не перенумеровываются, 6–9 append-only |
 | 10 | `reserved` | u16 | 0 |
 | 12 | `seq` | u32 | 0 = снимок; далее монотонно |
 | 16 | `sectors` | u64 | ёмкость узла в секторах |
@@ -276,7 +276,7 @@ ASCII-only, не-ASCII → `?`; UI-fallback «USB-накопитель» — ч�
 полем, а не подменой `label`.
 
 **`uuid` — отдельное поле, `mount` сохранён (решение lead 2026-11-19).**
-Kernel-спека dcab282e предлагала заменить `mount[16]` на `uuid[16]` в offset
+Раннее предложение kernel-спеки (dcab282e) заменить `mount[16]` на `uuid[16]` в offset
 44, выводя mount как `"/" + dev`. Lead это отклонил: запись становится **v2 =
 144 B**, `mount[16]` остаётся на 44 (Files берёт mount из события, R-USBF-10),
 а `uuid[16]` добавляется отдельным полем на 128..143. Причины: (а) mount — это
@@ -298,10 +298,11 @@ v1 (128 B), иначе смещения `uuid`/`reserved` читались бы 
 
 **ENFORCE, а не обрезание.** `mount`, который не помещается в 15 символов,
 не начинается с `/usb` или содержит `..`, **не** молча укорачивается:
-композитор помечает строку `state=error`, `reason=bad_mount`, не даёт
+композитор помечает строку `state=error`, `reason=bad_mount` (error 9), не даёт
 навигацию/mount/eject и показывает «Точка монтирования не помещается в ABI
-(15 символов)»; `mount(2)` с таким `target` ядро всё равно отвергнет
-(`EINVAL`). Тот же предикат — в Files до `navigate_to`.
+(15 символов)». `mount(2)` с `target` длиннее 15 символов ядро отвергает
+`ENAMETOOLONG` (лог `bad_mount`, без uevent — состояние не менялось). Тот же
+предикат — в Files до `navigate_to`.
 
 **Состояние устройства = вывод из полей, а не отдельное поле ядра:**
 
@@ -315,13 +316,14 @@ v1 (128 B), иначе смещения `uuid`/`reserved` читались бы 
 | `error == 6` (`unsupported_block`) | `present` | `unsupported_block` — 4K logical block, mount disabled |
 | `error == 7` (`capacity_overflow`) | `present` | `capacity_overflow` — > 2 TiB, mount disabled |
 | `error == 8` (`replay_failed`) | `error` | `replay_failed` — том не восстановлен, mount disabled |
+| `error == 9` (`bad_mount`) | `error` | `bad_mount` — путь не помещается/некорректен, без усечения |
 | `error == 4` (`unsupported_fs`) | `present` | `unsupported_fs` — классификация, не сбой |
 | `error == 5` (`no_media`) | `present` | `no_media` — классификация, не сбой |
 | `fs_class == 2` | `present` | `foreign_volume` |
 | `fs_class == 3` | `present` | `blank` |
 | `fs_class == 4` | `present` | `unsupported_fs` |
 | `fs_class == 5` | `present` | `no_media` |
-| `mount` невалиден (`> 15`, не `/usb…`, `..`) | `error` | `bad_mount` — ABI-нарушение, не «поправим путь» |
+| `mount` невалиден (`> 15`, не `/usb…`, `..`) | `error` | `bad_mount` — тот же error 9; композитор ловит до `mount(2)` |
 | `fs_class == 0` | `present` | `enumeration_failed` |
 
 `MOUNTED`/`UNMOUNTED` применяются как переход (`mounted=1/0`) и затем
@@ -400,7 +402,12 @@ u16 count                       // <= 32 (MAX_DEVICES)
                                 // 7 enumeration_failed, 8 device_gone, 9 no_media,
                                 // 10 read_only, 11 bad_mount, 12 unsupported_block,
                                 // 13 capacity_overflow, 14 replay_failed, 15 unclean
-                                // (in_use — это flags.bit3, не reason)
+                                // (in_use — это flags.bit3, не reason).
+                                // error→reason: 1→io, 2→mount_failed,
+                                // 3→flush_failed, 4→unsupported_fs, 5→no_media,
+                                // 6→unsupported_block, 7→capacity_overflow,
+                                // 8→replay_failed, 9→bad_mount; 0 — reason из
+                                // fs_class/flags (foreign_volume/blank/read_only/…).
   u64 capacity                  // байты; 0 = неизвестно
   string vendor
   string product
@@ -517,9 +524,9 @@ server loop ──device_request──► worker thread ──mount(2)/umount2(2
 
 Следствия, названные явно: без живого root-композитора USB-том не монтируется
 (и список не приходит — Files получает его по PDP), поэтому shell/`/mnt`-путь
-не регрессирует. Kernel-спека dcab282e §11.3 уже фиксирует userspace-driven
-auto-mount (ядро только `ADD`); остаётся обновить её запись 128 B → 144 B
-(mount+uuid, G16). Если
+не регрессирует. Kernel-спека fbec8f8b §11.3 фиксирует userspace-driven auto-mount (ядро
+только `ADD`), а её запись уже v2 144 B (mount+uuid), так что S1 может
+стартовать без ожидания layout-фикса. Если
 композитор не root, авто-mount не выполняется, и первая же попытка даёт
 понятную ошибку прав (`§5.4`, errno-таблица).
 
@@ -538,6 +545,7 @@ Kernel-ошибка не показывается пользователю ко�
 | `EBUSY` | «Том занят: закройте файлы на нём» (или «том уже смонтирован») |
 | `EINVAL` | «Недопустимая операция для этого тома» |
 | `EIO` | «Ошибка ввода-вывода или сброса данных на носитель» |
+| `ENAMETOOLONG` | «Точка монтирования длиннее 15 символов — сократите имя тома» |
 
 ### 5.5 Что меняется в коде (карта)
 
@@ -739,7 +747,8 @@ Files запускает приложение через `launch_targets`-рее
   ASCII-санитайзинг (`0x7F`, `0x00` внутри строки) и NUL-padding; `mount`
   длиннее 15 символов не читается как путь; `label` на offset 108 не путается
   с `product`, `uuid` на 128 — с `reserved` (перестановка полей ловится
-  вектором); v1-запись 128 B отвергается по `version`.
+  вектором); `error=9` (`bad_mount`) парсится; v1-запись 128 B отвергается по
+  `version`.
 * T2 `table_aggregates_partitions` — `usb0` + `usb0p1` + `usb0p2` → одна
   строка `usb0`; представитель: смонтированный > `fs_class`; ёмкость
   представителя (`sectors × sector_size`); `in_use`/`surprise` — OR.
@@ -797,7 +806,8 @@ Files запускает приложение через `launch_targets`-рее
   получает ровно `/usb0p1` (никакого `/mnt/usb0p1`); лексическая нормализация
   `//`, `.`, `..` работает, но корень не переписывается; mount с `..`, не
   `/usb…` или длиннее 15 символов → `state=error reason=bad_mount`, навигации
-  нет, текст ошибки показан (никакого обрезания).
+  нет, текст ошибки показан (никакого обрезания); kernel-путь даёт
+  `ENAMETOOLONG`, композитор переводит его в тот же текст.
 * T22 `requests_go_to_compositor` — каждое действие из меню даёт
   `Command::DeviceRequest`; в `pagh-files` нет вызовов `mount`/`umount2` и нет
   чтения `/dev/uevent` (R-USBF-13); ответ приходит только как
@@ -837,7 +847,7 @@ Files запускает приложение через `launch_targets`-рее
    `HostVfs`, тот же PDP; клики заменены вызовами тех же методов (иначе
    приёмка зависела бы от указателя — см. `§10`, press-routing).
 4. Ассерты в serial-логе (детерминированные маркеры, без времени). Точные строки
-   ядра задаёт `docs/usb-mass-storage-spec.md` (dcab282e; запись — v2 144 B); ниже — контрактные
+   ядра задаёт `docs/usb-mass-storage-spec.md` (fbec8f8b; запись — v2 144 B); ниже — контрактные
    примеры, grep-паттерны фиксируются при реализации: `usb: uevent open ok`;
    `usb: add usb0 vendor=… product=… label=… sectors=… class=1` (ядро только
    классифицирует — **авто-mount в ядре нет**);
@@ -865,7 +875,7 @@ Files запускает приложение через `launch_targets`-рее
    error=replay_failed`), строка остаётся `state=error`, safe_to_remove=0.
 6. Негатив: `usb.img` как чужой ext2 (`mkfs.ext2` с хоста) → `class=2`, mount
    пуст, строка видна, mount disabled; `blank`-образ → `class=3`.
-7. Persistence (совпадает с kernel-приёмкой dcab282e + v2 144 B): файл, оставленный
+7. Persistence (совпадает с kernel-приёмкой fbec8f8b + v2 144 B): файл, оставленный
    `--keep`, читается после `umount2` + `device_del` + `device_add` в той же
    загрузке и после перезагрузки (второй прогон `--verify-only`); тождество
    тома проверяется по `uuid`, не по `usbN`.
@@ -912,7 +922,7 @@ kernel-спекой, запрещает авто-mount и mount чужих то�
 | Этап | Содержание | Зависит от | Гейты |
 |---|---|---|---|
 | **S0** | Эта спека + согласование контракта | — | review lead |
-| **S1** | kernel: `/dev/uevent` (**v2 144 B**, exclusive, `PUEV_IOC_SNAPSHOT`), `mount(2)` 165 / `umount2(2)` 166, flush/SYNCHRONIZE CACHE, surprise-remove, `ROOT_KEEPING_COMPONENTS += "usb"`, **без auto-mount** (только `ADD`), host-property на size/offset/flags/error v2 144 B; `docs/usb-mass-storage-spec.md` | kernel-агент | kernel-гейты (их PR) |
+| **S1** | kernel: `/dev/uevent` (**v2 144 B**, exclusive, `PUEV_IOC_SNAPSHOT`), `mount(2)` 165 / `umount2(2)` 166, flush/SYNCHRONIZE CACHE, surprise-remove, `ROOT_KEEPING_COMPONENTS += "usb"`, **без auto-mount** (только `ADD`), host-property v2 (size==144, offsets, version==2, flags 0..7, error 0..9); `docs/usb-mass-storage-spec.md` | kernel-агент | kernel-гейты (их PR) |
 | **S2** | `pagh-desktop/src/usbdev.rs` + PDP 17–20 + подписка/broadcast + маркеры в serial-логе; **без UI** | S1 (или фейковый reader для тестов) | `cargo test -p pagh-desktop`, `-p pagh-ui` |
 | **S3** | Files: модель устройств, сайдбар, detail, свойства, контекстное меню, состояния; mount/unmount — disabled до S4 (нет worker'а и подтверждений) | S2 | `cargo test -p pagh-files -p pagh-ui`; screenshot |
 | **S4** | mount/unmount/eject: worker + `DeviceOps` + `mount`/`umount2` + **авто-mount pagh по `ADD`** + overlay `removing` + диалоги | S1 (uevent + сисколлы), S3 | crate + `e2e.py usbfiles` |
@@ -951,15 +961,15 @@ crate-тесты затронутых rust-apps; для S4 — `python3 tools/e2
 | G13 | **Хабы не поддерживаются**, только корневые порты | флешка в хабе не появится | kernel-спека; UX ничего не обещает |
 | G14 | **Деградированный `/proc/partitions`** без vendor/fs_class | «USB-накопитель» без деталей | warning в serial; не приёмка |
 | G15 | **Устройства с `sector_size != 512` и ёмкостью > 2 TiB** | том не монтируется | kernel отдаёт `error=unsupported_block` / `error=capacity_overflow`; UI — `present` + причина, mount disabled, без усечения |
-| G16 | **Запись kernel-спеки 128 B ещё не обновлена до v2 144 B** (mount+uuid; lead решил, dcab282e §11.3 уже userspace-driven) | S1 не может стартовать на старом layout; композитор v2 отвергнет v1 | kernel: запись 144 B + host-property size/offset; auto-mount — композитор по `ADD`; boot `/mnt` не меняется |
+| G16 | **ABI v2 144 B финализирован в kernel-спеке fbec8f8b** (mount+uuid, host-property; auto-mount userspace) | закрыт как вопрос; остаётся merge (G19) | ничего не делать в UX; S1 реализует ровно этот layout |
 | G17 | **`mount[16]` = 15 символов** | будущие длинные точки не влезут | ENFORCE: невалидный/длинный `mount` → `error/bad_mount` с внятным текстом; вложенные `usbNpM ≤ 99` влезают; длиннее — ABI v2 |
 | G18 | **`ROOT_KEEPING_COMPONENTS` без `"usb"`** уводит `/usb0p1` в `/mnt/usb0p1` (kernel-правка §11.5 kernel-спеки) | Files/композитор получат `ENOENT`, если правку забыть | S1 обязан добавить `"usb"` + host-свойство; приёмка проверяет `/usb0p1` и `/mnt/usb0p1` (§8.2 шаг 4) |
-| G19 | **Kernel-спека dcab282e ещё не в `origin/dev`** и её запись ждёт 144 B | S1/S4 нельзя начинать до merge + layout-фикса | dependency line; UX-код S2 можно писать на фейковых записях v2 |
+| G19 | **Kernel-спека fbec8f8b (v2 144 B) ещё не в `origin/dev`** | S1/S4 нельзя начинать до merge | dependency line; UX-код S2 можно писать на фейковых записях v2 |
 | G20 | **Read-only носитель** (sense 07/27) и **ro-mount** | auto-mount не выполняется (ext2 mount пишет); тома с защитой от записи видны, но не монтируются | UI: `reason=read_only`, mount disabled; ro-mount — future (kernel §11.3) |
 | G21 | **`uuid` нет у MBR/неизвестной таблицы** (нули) | персистентность по uuid невозможна | честный `""`; fallback `label + capacity + vendor/product` — менее надёжно, UI не хранит `usbN` |
-| G22 | **ABI v2 144 B ещё не в kernel-спеке** (dcab282e пишет 128 B с uuid@44) | без kernel-фикса композитор v2 не с чем сверять | S1: запись 144 B + host-property size/offset/flags/error; v1/v2 не смешиваются |
+| G22 | **Host-property v2 — обязанность S1** (size==144, offsets, version==2, flags 0..7, error 0..9) | без него расхождение парсера и ядра ловится только в e2e | kernel fbec8f8b фиксирует таблицу; композитор дублирует её в `usbdev` host-тесте |
 
-**Зависимости:** `docs/usb-mass-storage-spec.md` dcab282e + запись **v2 144 B**
+**Зависимости:** `docs/usb-mass-storage-spec.md` fbec8f8b (запись **v2 144 B**)
 (S1: uevent, `mount`/`umount2`, `ROOT_KEEPING_COMPONENTS`, userspace auto-mount),
 host-property size/offset/flags/error; OpenPath track B (v2 UX); стабильный
 `dev` (PR base).
@@ -1004,13 +1014,14 @@ host-property size/offset/flags/error; OpenPath track B (v2 UX); стабиль�
    hotplug только публикует `ADD` (`fs_class`), `mount(2)` зовёт композитор;
    boot-mount `/mnt` не меняется. За kernel-спекой остаются два вопроса:
    отказ `sector_size != 512` и > 2 TiB (G15) и raw-узлы как future. Контракт
-   PDP/`devices` от них не меняется. Kernel-спека dcab282e §11.3 уже
-   userspace-driven; coordination item — обновить её запись до v2 144 B
-   (mount+uuid, G16).
+   PDP/`devices` от них не меняется. Kernel-спека fbec8f8b §11.3 уже
+   userspace-driven и уже содержит v2 144 B (mount+uuid); остаётся merge в
+   `dev` (G19).
 8. **O8 — закрыт решением lead: record v2 = 144 B.** `mount[16]` на 44
    сохранён, `uuid[16]` добавлен отдельным полем на 128..143 (не замена);
-   `version=2`, LE, v1 128 B несовместим. Хост-property на size/offset — за
-   kernel-спекой (G22).
+   `version=2`, LE, v1 128 B несовместим. Host-property (size==144, offsets,
+   version==2, flags 0..7, error 0..9) зафиксирован в kernel fbec8f8b; S1
+   дублирует его тестом (G22).
 9. **O9 — force-unmount (`MNT_FORCE`) в UI v1 (рекомендация, ждёт lead).** Kernel
    поддерживает только для dead-устройства, как явное подтверждение потери
    (`unclean=1`, `safe_to_remove=1`). Рекомендация UX: **не** выставлять
