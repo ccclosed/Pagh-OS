@@ -1052,6 +1052,12 @@ class QmpClient:
         key-up plus a settle makes the modifier state deterministic before the
         harness types a command line.
         """
+        # SETTLE FIRST. QMP `send-key` presses the chord and releases it from a
+        # hold-timer in QEMU's main loop; a modifier reset sent immediately after
+        # the command can be delivered BEFORE the chord's own key events. That
+        # cleared Ctrl before `T` arrived (`mods=0x4` at T instead of 0x6) and the
+        # compositor hotkey never fired. 0.5 s is well past the 50 ms hold.
+        time.sleep(0.5)
         # A bare key-up is not enough: QEMU skips a break event for a key it
         # already considers released, so a break the GUEST missed (PS/2 packet
         # loss) stays missed. A full tap (make + break) forces both edges through
