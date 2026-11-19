@@ -142,7 +142,7 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
     `S_ISUID`/`S_ISGID` (`Creds::exec_setid`, как `bprm_fill_uid()` в Linux): `euid`/`egid`
     и соответствующие saved id берутся у владельца образа, real id и дополнительные
     группы не меняются, неудачный exec ids не трогает. Чистые решения живут в
-    `src/arch/x86_64/linux/cred.rs` (host-свойства P56/P59). Инварианты:
+    `src/arch/x86_64/linux/cred.rs` (host-свойства P56/P61). Инварианты:
     * `VfsNode` несёт только метаданные (`mode`/`owner`/`set_mode`/`set_owner`). Никогда не
       добавляйте проверку учётных данных внутрь реализации `VfsNode` — boot provisioning,
       установщик пакетов и shell вызывают VFS напрямую и должны работать без идентичности.
@@ -458,8 +458,8 @@ slice 4; 2.10.0 — procfs slice 3; 2.9.x — правда о памяти и `/
   `getty`/PAM и per-user сессий (`su` из root-сессии пароля не спрашивает, как в Linux;
   shell-встроенные команды остаются ring 0), `login.defs`, блокировок после N неудачных
   попыток, `wheel`-гейта для `su`, аудита попыток входа, ACL/`fsuid`, наборов
-  capabilities/seccomp/LSM, `MS_NOSUID`/`ptrace`/`dumpable` для setuid-модели, проверок
-  sticky-бита и владельца каталога; синтетические узлы (`/dev`, `/proc`, ramfs) не могут
-  сохранить владельца и держат исторический per-process override для `stat`; SMEP —
+  capabilities/seccomp/LSM, `MS_NOSUID`/`ptrace`/`dumpable` для setuid-модели; синтетические
+  узлы (`/dev`, `/proc`) не могут сохранить владельца и держат исторический per-process
+  override для `stat` (ramfs `/tmp` с фазы 2 хранит `mode`/`owner` на узле); SMEP —
   единственная аппаратная митигация (SMAP/KPTI отсутствуют). `access(2)` проверяет real
   ids; `stat` сообщает реальные метаданные inode.
