@@ -12,6 +12,7 @@
 use pagh_desktop::color;
 use pagh_desktop::compositor::Compositor;
 use pagh_desktop::geometry::{Point, Rect};
+use pagh_desktop::netinfo::NetInfo;
 use pagh_desktop::panel;
 use pagh_desktop::png;
 use pagh_desktop::Canvas;
@@ -73,6 +74,8 @@ fn panel_network_icon_is_wired_and_renders() {
     let net = panel::network_rect(Rect::new(0, 0, 1280, 720));
 
     let mut compositor = Compositor::new(1280, 720);
+    // Онлайн-иконка — только по реальному `IFF_RUNNING`: по умолчанию данных нет.
+    compositor.set_network_info(Some(net_sample(true)));
     compositor.render_full();
     png::write_png(dir.join("panel-network.png"), compositor.frame()).expect("PNG панели");
     png::write_png(
@@ -144,7 +147,7 @@ fn panel_network_icon_is_wired_and_renders() {
     assert_eq!(accent, 0, "в иконке сети не должно быть акцентных пикселей");
 
     // Отключённая сеть: тот же глиф в panel_icon_dim плюс диагональ.
-    compositor.set_network_online(false);
+    compositor.set_network_info(Some(net_sample(false)));
     compositor.render_full();
     png::write_png(dir.join("panel-network-offline.png"), compositor.frame()).expect("PNG offline");
     let frame = compositor.frame().snapshot();
@@ -188,6 +191,25 @@ fn panel_app_icons_are_ready_made() {
         .filter(|(x, y)| frame.get(*x, *y) == theme.accent)
         .count();
     assert!(accent > 0, "иконка Paint должна тинтоваться акцентом");
+}
+
+/// Сэмпл интерфейса для иконки: значения реальных полей, линк — параметром.
+fn net_sample(running: bool) -> NetInfo {
+    NetInfo {
+        iface: pagh_desktop::netinfo::IFACE.to_string(),
+        ip: Some("10.0.2.15".parse().expect("IPv4")),
+        prefix: Some(24),
+        mac: Some([0x52, 0x54, 0, 12, 34, 56]),
+        up: true,
+        running,
+        rx_bytes: 4096,
+        tx_bytes: 2048,
+        rx_packets: 20,
+        tx_packets: 10,
+        rx_rate: 1024,
+        tx_rate: 512,
+        at: std::time::Instant::now(),
+    }
 }
 
 /// Вертикальные границы зажжённых пикселей блока сети.

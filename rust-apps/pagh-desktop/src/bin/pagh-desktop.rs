@@ -8,7 +8,9 @@
 use pagh_desktop::bench::{self, MemoryBackend};
 use pagh_desktop::demo;
 use pagh_desktop::fbdev::FbdevBackend;
-use pagh_desktop::server::{InputChoice, LaunchTarget, OutputChoice, Server, ServerOptions};
+use pagh_desktop::server::{
+    InputChoice, LaunchTarget, NetChoice, OutputChoice, Server, ServerOptions,
+};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -78,6 +80,19 @@ fn run() -> io::Result<()> {
             }
             "--evdev" => options.evdev_path = PathBuf::from(value(&mut args, "--evdev")?),
             "--input-trace" => options.input_trace = true,
+            "--net" => {
+                let value = value(&mut args, "--net")?;
+                options.net = match value.as_str() {
+                    "auto" => NetChoice::Auto,
+                    "none" => NetChoice::None,
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("--net принимает auto|none, получено {other:?}"),
+                        ))
+                    }
+                };
+            }
             "--full-render" => options.full_render = true,
             // Однокнопочный режим для QEMU e2e: auto backend/input, демо-окно,
             // ограниченное время жизни и selfcheck. Остальные флаги могут
@@ -284,6 +299,7 @@ fn print_help() {
   pagh-desktop [--socket PATH] [--width N] [--height N]
                [--backend auto|headless|fbdev] [--fbdev PATH]
                [--input auto|none|evdev] [--evdev PATH] [--input-trace]
+               [--net auto|none]
                [--screenshot-dir DIR] [--max-frames N] [--exit-after-ms N]
                [--selfcheck-ms N] [--demo-window] [--e2e] [--full-render]
                [--spawn-demo] [--demo-binary PATH]
@@ -293,7 +309,9 @@ fn print_help() {
                [--bench-label NAME]
 
 По умолчанию: /tmp/pagh-desktop.sock, backend=auto (fbdev, иначе headless),
-input=auto (evdev при fbdev), часы 23:38 / 15.11.2026.
+input=auto (evdev при fbdev), net=auto (/proc/net/dev + SIOCGIF* раз в
+секунду — реальные IP и скорости во флайауте «Сети»; --net none выключает
+опрос для headless-прогонов), часы 23:38 / 15.11.2026.
 fbdev забирает экран у kernel-консоли (takeover односторонний, см.
 docs/desktop-b.md); --input-trace печатает evdev-события в serial.
 --e2e = auto backend/input + demo-окно + exit-after-ms 15000 + selfcheck 3000 +

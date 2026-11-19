@@ -12,6 +12,7 @@ use crate::demo;
 use crate::evdev::{EvdevInput, InputAction};
 use crate::fbdev::FbdevBackend;
 use crate::geometry::Point;
+use crate::netinfo::{self, NetInfo};
 use crate::protocol::{
     self, Decoder, Message, ERR_BAD_MESSAGE, ERR_INTERNAL, ERR_INVALID_SURFACE, ERR_NOT_HELLO,
     ERR_NOT_OWNER, ERR_UNSUPPORTED, VERSION, WELCOME_FORMAT_RGB565, WELCOME_FORMAT_XRGB8888,
@@ -46,6 +47,15 @@ pub enum InputChoice {
     Auto,
     None,
     Evdev,
+}
+
+/// Источник сетевых данных для панели/флайаута.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetChoice {
+    /// Опрашивать `/proc/net/dev` + `SIOCGIF*` раз в секунду.
+    Auto,
+    /// Не трогать сеть (headless-тесты/прогоны без сетевого стека).
+    None,
 }
 
 /// Команда запуска приложения по запросу `LAUNCH` (расширение PDP/1, type 13).
@@ -127,6 +137,8 @@ pub struct ServerOptions {
     pub full_render: bool,
     /// Создать одно демонстрационное окно без AF_UNIX-клиента (fbdev e2e).
     pub demo_window: bool,
+    /// Источник сетевых данных (этап U): реальные `/proc/net/dev` + `SIOCGIF*`.
+    pub net: NetChoice,
     /// Не печатать диагностику подключений.
     pub quiet: bool,
     /// Запускать `pagh-desktop-demo` по запросам панели/меню.
@@ -175,6 +187,7 @@ impl Default for ServerOptions {
             launch_targets: Vec::new(),
             frame_log_every: 0,
             autostart: None,
+            net: NetChoice::Auto,
         }
     }
 }
@@ -434,6 +447,12 @@ pub struct Server {
     demo_started: bool,
     demo_window_created: bool,
     exit_due: Option<Instant>,
+    /// Следующий опрос сети (раз в секунду): счётчики и `SIOCGIF*`.
+    net_due: Instant,
+    /// Предыдущий сэмпл для дельты скоростей; `None` — это первый.
+    net_prev: Option<NetInfo>,
+    /// Стартовая строка `pagh-desktop: net ...` печатается один раз (e2e).
+    net_logged: bool,
     selfcheck_due: Option<Instant>,
     selfcheck_done: bool,
     selfcheck_failed: bool,
@@ -627,6 +646,9 @@ impl Server {
             demo_started: false,
             demo_window_created: false,
             exit_due,
+            net_due: now,
+            net_prev: None,
+            net_logged: false,
             selfcheck_due,
             selfcheck_done: false,
             selfcheck_failed: false,
@@ -700,10 +722,18 @@ impl Server {
         // 60 Hz: один present на интервал, несколько commit'ов в одной итерации
         // цикла сливаются в один damage-набор.
         const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+        /// Период опроса `/proc/net/dev` + `SIOCGIF*`: счётчики ядра меняются
+        /// на пакетном масштабе, а панели нужна скорость за секунду.
+        const NET_POLL: Duration = Duration::from_millis(1000);
         let mut next_frame = Instant::now();
         loop {
             if !self.running.load(Ordering::SeqCst) {
                 break;
+            }
+            let net_now = Instant::now();
+            if net_now >= self.net_due {
+                self.net_due = net_now + NET_POLL;
+                self.poll_network();
             }
             self.poll_input();
             self.accept_pending();
@@ -763,6 +793,55 @@ impl Server {
         } else {
             Ok(())
         }
+    }
+
+    /// Опросить ядро и отдать реальные сетевые данные композитору (этап U).
+    ///
+    /// `/proc/net/dev` даёт байтовые/пакетные счётчики, `SIOCGIFADDR`/
+    /// `SIOCGIFNETMASK`/`SIOCGIFFLAGS`/`SIOCGIFHWADDR` — адрес, маску, флаги и
+    /// MAC. Скорости — дельта счётчиков по времени, поэтому первый сэмпл всегда
+    /// 0 Б/с: истории ещё нет, и выдумывать её нельзя. `set_network_info`
+    /// добавляет damage только при изменении, так что секундный опрос не
+    /// превращается в непрерывную перерисовку панели.
+    fn poll_network(&mut self) {
+        if self.options.net == NetChoice::None {
+            return;
+        }
+        let Some(mut info) = netinfo::read() else {
+            if !self.net_logged {
+                self.net_logged = true;
+                if !self.options.quiet {
+                    println!("pagh-desktop: net unavailable (/proc/net/dev: no eth0)");
+                }
+            }
+            return;
+        };
+        if let Some(prev) = &self.net_prev {
+            let (rx, tx) = netinfo::rates(prev, &info);
+            info.rx_rate = rx;
+            info.tx_rate = tx;
+        }
+        if !self.net_logged {
+            self.net_logged = true;
+            if !self.options.quiet {
+                let addr = match (info.ip, info.prefix) {
+                    (Some(ip), Some(prefix)) => format!("{ip}/{prefix}"),
+                    (Some(ip), None) => ip.to_string(),
+                    _ => "none".to_string(),
+                };
+                let state = match (info.up, info.running) {
+                    (true, true) => "up running",
+                    (true, false) => "up no-link",
+                    _ => "down",
+                };
+                println!(
+                    "pagh-desktop: net iface={} ip={} {}",
+                    info.iface, addr, state
+                );
+            }
+        }
+        self.net_prev = Some(info.clone());
+        self.compositor.set_network_info(Some(info));
     }
 
     /// Создать одно демонстрационное окно без AF_UNIX-клиента (QEMU e2e).
