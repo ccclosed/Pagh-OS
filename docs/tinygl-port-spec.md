@@ -55,7 +55,7 @@ mipmapping, blending-расширения, MSAA. Всё перечисленно
 | `rust-apps/pagh-desktop/src/protocol.rs` | `MAGIC "PDS1"`, `VERSION 1`, `HEADER_LEN 12`, типы 1–16 (`SHM_OFFER 14`, `SHM_READY 15`, `SHM_RELEASE 16`), `WELCOME_SHM_SURFACE = 1<<2` (`protocol.rs:20`, `:22`, `:24`, `:28`–`:47`, `:62`) | путь доставки пикселей без сокета |
 | `rust-apps/pagh-desktop/src/shm.rs` | клиентский memfd (`memfd_create` c `MFD_CLOEXEC`, `shm.rs:80`, `:95`), серверный `map_readonly` (`MAP_SHARED\|PROT_READ`, `shm.rs:186`), `send_message_with_fd`/`recv_with_fds` через `SCM_RIGHTS` (`shm.rs:217`, `:275`) | **сервер** не пишет в клиентскую память — рендерить в memfd может только клиент |
 | `rust-apps/pagh-ui/src/shm.rs` | клиентская сторона: `MappedBuffer::map_shared` = `mmap(MAP_SHARED, PROT_READ\|PROT_WRITE)` (`pagh-ui/src/shm.rs:140`) | **это и есть** буфер, в который рендерит GL |
-| `rust-apps/pagh-desktop/src/surface.rs` | `MAX_SURFACE_DIM 4096`, `MAX_STRIDE_PADDING 4096`, `Xrgb8888` = «`u32` little-endian `0x00RRGGBB`; альфа игнорируется» (`surface.rs:7`, `:9`; вариант и комментарий формата — `surface.rs:16`–`:21`) | формат кадра = формат `PIXEL` в TinyGL 32bpp |
+| `rust-apps/pagh-desktop/src/surface.rs` | `MAX_SURFACE_DIM 4096`, `MAX_STRIDE_PADDING 4096`, `Xrgb8888` = «`u32` little-endian `0x00RRGGBB`; альфа игнорируется» (`surface.rs:7`, `:9`; вариант и комментарий формата — `surface.rs:13`–`:15`) | формат кадра = формат `PIXEL` в TinyGL 32bpp |
 | `rust-apps/pagh-desktop/PROTOCOL.md` §8.1 | ShmSurface: `stride ∈ [width*bpp, width*bpp+4096]`, `data_len == stride*height`, сервер отдаёт монотонный `generation`, старый memfd не переиспользуется (`PROTOCOL.md:316`–`:357`) | контракт поверхности окна |
 | `rust-apps/pagh-desktop/src/fbdev.rs` | `/dev/fb0`: `FBIOGET_VSCREENINFO 0x4600` / `FBIOGET_FSCREENINFO 0x4602`, `FbLayout` (маски → `pack`/`unpack`), `blit_damage` (`fbdev.rs:23`, `:25`, `:148`, `:300`, `:390`) | композитор сам конвертирует XRGB→scanout; GL этого не касается |
 | `rust-apps/pagh-desktop/tests/render_goldens.rs` | пиксельные goldens: FNV-1a 64 по словам пикселей (`render_goldens.rs:18`) | готовый шаблон «pixel checks» для демо (§6.2) |
@@ -339,7 +339,7 @@ impl Context {
 
 | Требование | Источник | Следствие |
 |---|---|---|
-| `stride == width*4`, **без паддинга** | TinyGL `zbuffer.c:28`: `linesize = (xsize*PSZB + 3) & ~3`; при `PSZB=4` это ровно `xsize*4` | PDP/1 разрешает паддинг до +4096 (`PROTOCOL.md:330`), но TinyGL его не выражает → **берём плотный stride**, это легально |
+| `stride == width*4`, **без паддинга** | TinyGL `zbuffer.c:28`: `linesize = (xsize*PSZB + 3) & ~3`; при `PSZB=4` это ровно `xsize*4` | PDP/1 разрешает паддинг до +4096 (`PROTOCOL.md:32`), но TinyGL его не выражает → **берём плотный stride**, это легально |
 | **`width` кратно 4** | `zbuffer.c:94`: `xsize = xsize & ~3` в `ZB_resize` | окно с `width % 4 != 0` молча ужмётся → **валидируем `width % 4 == 0` в демо и в клиентском хелпере**, иначе «правая полоса не рисуется» |
 | Внешний буфер, а не `malloc` | `zbuffer.c:105`–`:113`: `frame_buffer_allocated = 0` при переданном указателе | рендер идёт **прямо в memfd**, `ZB_copyFrameBuffer` не нужен |
 | 32bpp внутренний формат | `zfeatures.h:39` — активное `TGL_FEATURE_RENDER_BITS 16` (по умолчанию!), `:41` — закомментированное `32` | **обязательная** правка при порте: `RENDER_BITS=32` + `TGL_FEATURE_32_BITS`; иначе пиксель будет `u16` и формат не совпадёт |
