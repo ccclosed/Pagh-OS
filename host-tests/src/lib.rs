@@ -713,6 +713,13 @@ mod properties {
     // SIGCONT). Descriptive module name, same reason as `kill_target`.
     mod signal_stop;
 
+    // `SIG_DFL` dispositions without handler work (issue #12): `Ignore` and
+    // `Cont`. The tick delivery path must consume those instead of building an
+    // `rt_sigframe` at handler 0 — the bug that killed the desktop compositor
+    // right after `bg` (pending SIGCONT) and made every later PDP/1 handshake
+    // time out. Direct regression guard for `default_action_is_silent`.
+    mod signal_dfl;
+
     // The apt trust chain (issue #32, contract OPENPGP-VERIFY-CONTRACT.md
     // §5/§6): P54 covers the `Release` parser that binds `Packages` to the
     // signed metadata, P55 covers the per-record `.deb` digest on BOTH parser
