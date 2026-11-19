@@ -843,10 +843,50 @@ impl Server {
                 }
             }
             let events = match action {
-                InputAction::Motion { dx, dy } => self.compositor.pointer_motion_relative(dx, dy),
+                InputAction::Motion { dx, dy } => {
+                    let before = self.compositor.selection_rect();
+                    let events = self.compositor.pointer_motion_relative(dx, dy);
+                    if self.options.input_trace {
+                        if let (Some(before), Some(after)) =
+                            (before, self.compositor.selection_rect())
+                        {
+                            if before != after {
+                                println!(
+                                    "pagh-desktop: selection rect=({}, {}, {}x{})",
+                                    after.x, after.y, after.w, after.h
+                                );
+                            }
+                        }
+                    }
+                    events
+                }
                 InputAction::Wheel { delta } => self.compositor.axis(0, delta),
                 InputAction::Button { button, pressed } => {
-                    self.compositor.pointer_button(button, pressed)
+                    let before = self.compositor.selection_rect();
+                    let events = self.compositor.pointer_button(button, pressed);
+                    // e2e evidence for the rubber-band selection: the trace names
+                    // the drag start and the committed rect; the QEMU screenshot
+                    // is taken between them.
+                    if self.options.input_trace && button == MouseButton::Left {
+                        let after = self.compositor.selection_rect();
+                        if pressed && self.compositor.selection_drag_active() {
+                            println!(
+                                "pagh-desktop: selection drag start pointer=({}, {})",
+                                self.compositor.pointer().x,
+                                self.compositor.pointer().y
+                            );
+                        } else if !pressed {
+                            if let Some(rect) = after {
+                                println!(
+                                    "pagh-desktop: selection committed rect=({}, {}, {}x{})",
+                                    rect.x, rect.y, rect.w, rect.h
+                                );
+                            } else if before.is_some() {
+                                println!("pagh-desktop: selection cleared");
+                            }
+                        }
+                    }
+                    events
                 }
                 InputAction::Key {
                     code,

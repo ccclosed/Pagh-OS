@@ -1046,10 +1046,68 @@ class QemuShotKeyboard:
     def screenshot(self, path: pathlib.Path) -> None:
         self._guard("screendump", self.mon.screendump, pathlib.Path(path))
 
+    def screenshot_raw(self, path: pathlib.Path) -> None:
+        """Capture the framebuffer as binary PPM (raw RGB) for pixel assertions.
+
+        The PNG path above is the human evidence; comparing two PNGs byte-wise
+        cannot tell an overlay from a moved cursor (the cursor alone changed
+        ~250 pixels and produced a false PASS). PPM is header + raw RGB, so a
+        count of changed pixels inside the selection area is exact.
+        """
+        if self.mon is None:
+            raise HarnessError("QEMU monitor not connected")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.qemu_shot.tmp")
+        if tmp.exists():
+            tmp.unlink()
+        cmd = f"screendump {tmp} -f ppm"
+        reply = self._guard("screendump ppm", self.mon.command, cmd)
+        qemu_shot.Monitor._check(reply, cmd)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if tmp.exists() and tmp.stat().st_size > 0:
+                time.sleep(0.2)  # let QEMU finish flushing the file
+                tmp.replace(path)
+                return
+            time.sleep(0.2)
+        raise HarnessError(f"screendump ppm produced no file at {path}")
+
     def close(self) -> None:
         if self.mon is not None:
             self.mon.close()
             self.mon = None
+
+
+def ppm_rgb(path: pathlib.Path) -> tuple[int, int, bytes]:
+    """Decode a binary PPM (P6) framebuffer dump into raw RGB bytes."""
+    data = path.read_bytes()
+    match = re.match(rb"P6\s+(\d+)\s+(\d+)\s+(\d+)\s", data)
+    if not match:
+        raise HarnessError(f"{path}: not a P6 PPM dump")
+    width, height, maxval = (int(v) for v in match.groups())
+    body = data[match.end():]
+    if maxval != 255 or len(body) < width * height * 3:
+        raise HarnessError(f"{path}: unsupported PPM maxval/truncated body")
+    return width, height, body[: width * height * 3]
+
+
+def ppm_changed_inside(a: pathlib.Path, b: pathlib.Path,
+                       x0: int, y0: int, x1: int, y1: int) -> int:
+    """Count changed pixels in a rectangle of two same-size PPM dumps."""
+    wa, ha, ra = ppm_rgb(a)
+    wb, hb, rb = ppm_rgb(b)
+    if (wa, ha) != (wb, hb):
+        raise HarnessError(f"PPM size mismatch: {wa}x{ha} vs {wb}x{hb}")
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(wa, x1), min(ha, y1)
+    changed = 0
+    for y in range(y0, y1):
+        row = y * wa * 3
+        for x in range(x0, x1):
+            off = row + x * 3
+            if ra[off:off + 3] != rb[off:off + 3]:
+                changed += 1
+    return changed
 
 
 # ───────────────────────── serial waiting ─────────────────────────
@@ -2221,6 +2279,39 @@ def mode_usb(h: Harness) -> tuple[str, int]:
     ok &= h.check("shell screenshot captured",
                   shell_shot.is_file() and shell_shot.stat().st_size > 0, rel(shell_shot))
 
+    # ── clean second boot: a provisioned volume must not re-run the menu ──
+    # The disk now carries the pagh volume the menu just formatted. Before the
+    # fix, `boot_menu::run` returned a menu on EVERY boot (20 s timeout, mount
+    # and format rows) — the "first launch" ritual. A second boot must instead
+    # mount the existing volume and go straight to the shell.
+    log("usb: rebooting the same disk (provisioned) to prove the menu is skipped")
+    guest.stop()
+    h.guest = None
+    h.boot(need_keyboard=False, disk=disk, net=False)
+    assert h.guest is not None
+    second = h.guest
+    second_text = ""
+    if wait_for(second, [r"Welcome to pagh OS Shell!"], a.boot_timeout,
+                label="clean second boot") is not None:
+        second_text = second.serial()
+    skipped = "boot disk menu skipped" in second_text
+    skip_line = regex_first(r"fs: [^\r\n]*boot[^\r\n]*menu[^\r\n]*", second_text)
+    ok &= h.check("second boot skips the disk menu on a provisioned volume",
+                  skipped, skip_line or "no skip marker")
+    reformatted = bool(re.search(r"fs: formatting|operator chose to format",
+                                 second_text))
+    ok &= h.check("second boot performs no format/mount ritual", not reformatted,
+                  "format line present" if reformatted else "none")
+    mounted_again = "ext2 mounted at /mnt" in second_text
+    ok &= h.check("second boot auto-mounts the existing pagh volume",
+                  mounted_again,
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", second_text)
+                  or "not mounted")
+    ok &= h.check("second boot reached the shell without a menu timeout",
+                  bool(second_text),
+                  "shell banner seen" if second_text else "no banner")
+    h.metrics["second boot"] = skip_line or "no skip marker"
+
     h.metrics.update({
         "keyboard reports (banner)": kbd_before if kbd_before >= 0 else "n/a",
         "keyboard reports (after `usb`)": int(stats.group(1)) if stats else "n/a",
@@ -3253,6 +3344,71 @@ def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
                        and moved.read_bytes() != desktop.read_bytes())
     ok &= h.check("pointer motion/click repainted the framebuffer",
                   pointer_changed, f"{moved.name} differs={pointer_changed}")
+
+    raw_before = CACHE / "e2e_desktop_pointer.ppm"
+    kb.screenshot_raw(raw_before)
+
+    # Rubber-band selection: LMB press+drag on empty desktop (not a window,
+    # not the panel). PS/2 packets carry an 8-bit delta, so the pointer is
+    # homed and moved in small relative steps (one 1000 px event would be
+    # clamped and could land on the demo window). Screen is 1280x800; the
+    # 640x400 demo window sits at the top-left, so (1000, 640) is empty and
+    # (820, 500) stays clear of it and of the 44 px panel.
+    for _ in range(15):
+        h.qmp.rel(-100, -100)
+        time.sleep(0.02)
+    for _ in range(25):
+        h.qmp.rel(40, 25)
+        time.sleep(0.02)
+    h.qmp.rel(0, 15)
+    time.sleep(0.3)
+    h.qmp.button("left", True)
+    time.sleep(0.2)
+    drag_start = wait_for(guest, [r"pagh-desktop: selection drag start pointer="],
+                          15.0, label="selection drag start")
+    ok &= h.check("LMB on empty desktop starts rubber-band selection",
+                  drag_start is not None, drag_start or "no drag-start trace")
+    for _ in range(6):
+        h.qmp.rel(-45, -35)
+        time.sleep(0.08)
+    h.qmp.button("left", False)
+    committed = wait_for(
+        guest, [r"pagh-desktop: selection committed rect=\(\d+, \d+, \d+x\d+\)"],
+        15.0, label="selection committed")
+    committed_line = regex_first(
+        r"pagh-desktop: selection committed[^\r\n]*", guest.serial()) or ""
+    ok &= h.check("release commits the selection rect", committed is not None,
+                  committed_line or committed or "no commit trace")
+
+    # The committed frame stays visible until the next click, and the TCG
+    # compositor presents at ~1 fps with QEMU exposing the surface later
+    # still. Wait for a settled frame, then prove the overlay by pixel count
+    # inside the committed rect: a byte-compare against `moved` also changes
+    # when only the cursor moved (that false PASS is why PPM is dumped).
+    time.sleep(1.0)
+    raw_after = CACHE / "e2e_desktop_selection.ppm"
+    rect_match = re.search(r"rect=\((\d+), (\d+), (\d+)x(\d+)\)", committed_line)
+    painted = 0
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5)
+        kb.screenshot_raw(raw_after)
+        painted = 0
+        if rect_match and raw_before.is_file() and raw_after.is_file():
+            rx, ry, rw, rh = (int(v) for v in rect_match.groups())
+            painted = ppm_changed_inside(
+                raw_before, raw_after,
+                rx + 2, ry + 2, rx + rw - 2, ry + rh - 2)
+        if painted > 500:
+            break
+    ok &= h.check("selection overlay painted inside the committed rect",
+                  painted > 500, f"{painted} changed pixels (cursor excluded)")
+    selection = CACHE / "e2e_desktop_selection.png"
+    kb.screenshot(selection)
+    selection_changed = (selection.is_file() and moved.is_file()
+                         and selection.read_bytes() != moved.read_bytes())
+    ok &= h.check("QEMU screenshot shows the selection frame",
+                  selection_changed, f"{selection.name} differs={selection_changed}")
 
     # Exit + one-way takeover: shell keeps running on serial, but the kernel
     # console must not repaint the screen over the last desktop frame.
