@@ -360,6 +360,16 @@ pub mod link_walk;
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
 
+// `mount_choice` is the recorded boot-time mount choice — the marker that makes
+// the disk menu a once-per-machine question instead of an every-boot 20 s
+// ritual (or, as the `has_pagh_volume` skip did, a question nobody ever saw).
+// Pure `core`, no I/O: `boot::init_fs` reads and writes one raw sector through
+// `BlockDevice`, so the property is that any damaged, foreign or random sector
+// reads as "no choice" — the failure mode being a silently skipped menu, which
+// decides a mount on the operator's behalf.
+#[path = "../../src/fs/mount_choice.rs"]
+pub mod mount_choice;
+
 // `nvme_prp` is the NVMe driver's pure transfer arithmetic: PRP1/PRP2 and the
 // PRP-list page contents (NVMe Base Spec §3.3.3), LBA-aligned command chunking,
 // and the polled SQ/CQ ring state. `core`-only and self-contained, so the host
@@ -814,6 +824,13 @@ mod properties {
     // effectful fd-table half is covered by the in-QEMU `desktop-b::SCM_RIGHTS`
     // routines.
     mod scm_cmsg;
+
+    // Recorded boot-time mount choice (`src/fs/mount_choice.rs`): the marker
+    // that makes the disk menu a once-per-machine question. Round trip of the
+    // written sector, and — the failure mode that decides a mount on the
+    // operator's behalf — every damaged or foreign sector reads as "no choice",
+    // so the menu is asked again instead of silently skipped.
+    mod mount_choice;
 
     // Demand-paged user buffers on the general `read(2)`/`write(2)` path: the
     // per-page acceptance table (`validate::page_acceptance`) shared by the

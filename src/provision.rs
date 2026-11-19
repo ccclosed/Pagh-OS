@@ -145,6 +145,24 @@ fn seed_identity() -> Result<(), VfsError> {
     Ok(())
 }
 
+/// Записать человекочитаемое зеркало выбора монтирования в
+/// `/mnt/etc/pagh-mount-choice`.
+///
+/// РЕШЕНИЕ принимает не этот файл, а сырой маркер сектора 1 тома
+/// (`crate::fs::mount_choice`): читать `/mnt` до монтирования нельзя, а
+/// монтирование — ровно то, что выбор и решает. Файл нужен оператору: спросить
+/// «почему меню больше не появляется» и получить ответ из `cat`.
+///
+/// `write_once`, как и весь посев: первый ответ остаётся, повтор не переписывает
+/// историю. Ошибка не фатальна — том уже смонтирован, и решение записано в
+/// маркере.
+pub fn record_mount_choice(device: &str, action: &str) {
+    let body = alloc::format!("device={device}\naction={action}\n");
+    if let Err(error) = write_once("/mnt/etc/pagh-mount-choice", body.as_bytes()) {
+        crate::warn!("pagh mount choice record not written: {:?}", error);
+    }
+}
+
 /// Установить release-метаданные, скелет домашнего каталога и примеры при первой
 /// загрузке. Существующие файлы никогда не перезаписываются.
 pub fn seed() {
