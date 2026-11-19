@@ -1114,7 +1114,8 @@ impl Server {
         let reader = stream;
         let _ = reader.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = reader.set_nonblocking(true);
-        thread::spawn(move || read_loop(conn, reader, tx, running));
+        let quiet = self.options.quiet;
+        thread::spawn(move || read_loop(conn, reader, tx, running, quiet));
         self.clients.push(ClientConn {
             id: conn,
             client_id: None,
@@ -2014,7 +2015,13 @@ fn shutdown_stream(writer: &Arc<Mutex<UnixStream>>) {
     }
 }
 
-fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<AtomicBool>) {
+fn read_loop(
+    conn: u64,
+    stream: UnixStream,
+    tx: Sender<Incoming>,
+    running: Arc<AtomicBool>,
+    quiet: bool,
+) {
     let mut decoder = Decoder::new();
     let mut buffer = [0u8; 64 * 1024];
     // memfd'ы приходят ancillary-данными; SHM_OFFER забирает по одному fd.
@@ -2029,9 +2036,11 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                 pending_fds.extend(fds);
                 // Защита от клиента, засыпающего сервер fd'ами без offer'ов.
                 if pending_fds.len() > 8 {
-                    eprintln!(
-                        "pagh-desktop: conn={conn}: слишком много SCM_RIGHTS fd без shm_offer"
-                    );
+                    if !quiet {
+                        eprintln!(
+                            "pagh-desktop: conn={conn}: слишком много SCM_RIGHTS fd без shm_offer"
+                        );
+                    }
                     let _ = tx.send(Incoming::ProtocolError {
                         conn,
                         detail: "слишком много SCM_RIGHTS fd без shm_offer".to_string(),
@@ -2039,7 +2048,9 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                     return;
                 }
                 if let Err(err) = decoder.push(&buffer[..n]) {
-                    eprintln!("pagh-desktop: conn={conn}: decode: {err}");
+                    if !quiet {
+                        eprintln!("pagh-desktop: conn={conn}: decode: {err}");
+                    }
                     let _ = tx.send(Incoming::ProtocolError {
                         conn,
                         detail: err.to_string(),
@@ -2112,7 +2123,9 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
                         }
                         Ok(None) => break,
                         Err(err) => {
-                            eprintln!("pagh-desktop: conn={conn}: decode: {err}");
+                            if !quiet {
+                                eprintln!("pagh-desktop: conn={conn}: decode: {err}");
+                            }
                             let _ = tx.send(Incoming::ProtocolError {
                                 conn,
                                 detail: err.to_string(),
@@ -2127,10 +2140,20 @@ fn read_loop(conn: u64, stream: UnixStream, tx: Sender<Incoming>, running: Arc<A
             {
                 thread::sleep(Duration::from_millis(2));
             }
+            Err(err) if err.kind() == ErrorKind::Interrupted => {
+                // SIGTTOU/SIGCONT и прочие сигналы прерывают recvmsg; это не
+                // потеря клиента — повторяем, а не рвём соединение.
+                thread::sleep(Duration::from_millis(2));
+            }
             Err(err) => {
-                // Молчаливый выход читающего потока — это потеря клиента без
-                // единой строки в логе; печатаем причину всегда.
-                eprintln!("pagh-desktop: read_loop conn={conn} failed: {err}");
+                // Молчаливый выход читающего потока — потеря клиента без
+                // строки в логе, поэтому причину печатаем всегда — КРОМЕ
+                // --quiet: фоновый композитор с --quiet не должен писать в
+                // управляющий терминал (TOSTOP останавливает его SIGTTOU,
+                // и клиенты получают «handshake: timed out»; e2e это ловит).
+                if !quiet {
+                    eprintln!("pagh-desktop: read_loop conn={conn} failed: {err}");
+                }
                 break;
             }
         }
