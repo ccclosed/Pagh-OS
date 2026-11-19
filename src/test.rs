@@ -11052,26 +11052,6 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "linux::tick-delivered signal plan (issue #12)",
             linux_tick_tests::tick_delivery_plan
         ),
-        // Идёт РАНО намеренно: поднимает offscreen-писателя сессии (~1000 кадров
-        // PMM + shadow-буфер в куче). К концу набора PMM бывает вычерпан (это
-        // названо в комментарии выше про `kernel_thread_spawn`), поэтому
-        // размещение в конце сделало бы OOM паникой вместо проверки.
-        //
-        // Терминальная kernel-сессия (desktop-вариант B): offscreen-экземпляр
-        // консоли рисует в свои кадры PMM, `fb_print!`/`with`/`flush`
-        // маршрутизируются по задаче, а boot-консоль остаётся неизменной.
-        (
-            "terminal-session::offscreen console + per-task routing",
-            terminal_session_tests::offscreen_console_and_routing
-        ),
-        (
-            "terminal-session::spawn / vtinput1 / vtfb1 output / exit / reopen",
-            terminal_session_tests::session_spawn_input_output_exit_reopen
-        ),
-        (
-            "terminal-session::nano draws in the session surface and exits on Esc",
-            terminal_session_tests::nano_draws_in_session
-        ),
         // Runs FIRST, not last: it spawns two kernel threads (2 x 64 stack frames)
         // via `kernel_thread_spawn`, which panics on PMM exhaustion, and the rest
         // of the suite consumes >100k frames by the time the last routine runs
@@ -11492,6 +11472,29 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "userbuf::lazy anon read/write through demand paging",
             desktop_b_tests::lazy_anon_user_buffers
+        ),
+        // Терминальная kernel-сессия (desktop-вариант B) — В КОНЦЕ набора, и это
+        // несущий порядок. Рутины поднимают offscreen-писателя (≈1000 кадров
+        // PMM + shadow-буфер в куче) и спавнят kernel-потоки, то есть занимают
+        // новые pid'ы и — при первом попадании стека в новый 2 MiB-слот —
+        // страничные кадры, которые `vmm::unmap` не возвращает по построению.
+        // Ранние PMM-чувствительные рутины (например
+        // `arch::ring-3 #PF kills the task`) сверяют точное число свободных
+        // кадров до/после своего спавна, и сдвинутый ими pid выводил бы их из
+        // равновесия: проверка падала бы на чужом (и вечном) кадре таблицы
+        // страниц, а не на утечке задачи. Последними рутины никого не сдвигают,
+        // а места в PMM здесь с запасом (~111k свободных кадров на 1 GiB).
+        (
+            "terminal-session::offscreen console + per-task routing",
+            terminal_session_tests::offscreen_console_and_routing
+        ),
+        (
+            "terminal-session::spawn / vtinput1 / vtfb1 output / exit / reopen",
+            terminal_session_tests::session_spawn_input_output_exit_reopen
+        ),
+        (
+            "terminal-session::nano draws in the session surface and exits on Esc",
+            terminal_session_tests::nano_draws_in_session
         ),
     ]
 }

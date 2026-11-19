@@ -140,7 +140,11 @@ pub fn take_scancode_for(session: usize) -> Option<u8> {
 /// Есть ли непрочитанный скан-код в кольце указанной сессии.
 pub fn has_scancode_for(session: usize) -> bool {
     if session == crate::drivers::session_route::BOOT_SESSION {
-        return has_scancode();
+        // Именно `has_scancode_raw`, а не `has_scancode`: последний сам
+        // маршрутизируется через эту функцию, и вызов дал бы бесконечную
+        // рекурсию (переполнение стека ядра на первом же тике после промпта —
+        // в живом прогоне это выглядело как «shell перестал принимать ввод»).
+        return has_scancode_raw();
     }
     let Some(ring) = SESSION_RINGS.get(session) else {
         return false;
