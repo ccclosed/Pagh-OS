@@ -716,7 +716,8 @@ long mount(const char *source, const char *target,
 * `mountflags` — 0; `MS_RDONLY`/`MS_REMOUNT`/прочее → `EINVAL` (ro-режим — future).
 * `data` — 0/игнорируется.
 * root-only: `euid != 0` → `EPERM` (как у привилегированных syscall; проверка current
-  creds, не VFS).
+  creds, не VFS). Files может быть non-root: mount/eject заказывает композитор
+  (root) через PDP, а не сам Files.
 * Проверки: устройства нет → `ENODEV`; `!is_pagh_volume` → `EINVAL` (чужой ext2 не
   монтируем, потому что mount пишет); уже смонтировано → `EBUSY`; `mount_at` занят
   другим устройством → `EBUSY`.
@@ -948,6 +949,10 @@ kind; `kind=ERROR` — явный сигнал, но не единственны
   claim/release читателя.
 * `usb_storage`-поток вызывает `uevent::push` на ADD/REMOVE/CHANGE/MOUNTED/UNMOUNTED/
   ERROR.
+* Lock-дисциплина snapshot: список устройств собрать под `DeviceManager`, **отпустить**
+  его, и только затем класть записи в ring под локом `uevent`. Держать оба лока сразу
+  нельзя: `usb-storage` берёт `DeviceManager` при регистрации, и обратный порядок дал бы
+  дедлок (спинлоки не реентерабельны).
 * `/proc/partitions` — отдельный procfs-файл, рендер из `DeviceManager`.
 
 ### 14.6. Контракт с композитором/Files
