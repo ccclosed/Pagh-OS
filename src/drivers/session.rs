@@ -118,6 +118,97 @@ pub fn unbind(pid: u64) {
     }
 }
 
+/// Сколько fd устройств сессии открыто (суммарно по `vtfb1` и `vtinput1`).
+///
+/// «Последний close — reap»: пока счётчик > 0, окно живо; на переходе в 0
+/// сессия получает запрос выхода. Счётчик сбрасывается при выходе сессии, чтобы
+/// close «просроченных» fd прошлой генерации не убил новую (см. [`exit`]).
+static OPEN_FDS: AtomicU32 = AtomicU32::new(0);
+
+/// Сессия, которую должен подхватить следующий [`session_entry`].
+///
+/// `kernel_thread_spawn_named` принимает `fn()` без аргументов, поэтому номер
+/// сессии передаётся через слот. Спавн сериализован (одна сессия, один CPU):
+/// слот пишется непосредственно перед спавном и читается в его начале.
+static PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Открыт ли какой-нибудь fd устройств сессии (для диагностики/тестов).
+pub fn open_fds() -> u32 {
+    OPEN_FDS.load(Ordering::Relaxed)
+}
+
+/// Учесть `open` устройства сессии: поднять сессию, если она ещё не запущена.
+///
+/// Первый `open` любого из двух устройств (`/dev/vtfb1`, `/dev/vtinput1`)
+/// спавнит задачу shell-сессии: поверхность аллоцируется **здесь**, в контексте
+/// открывающего, чтобы `mmap`/`ioctl` сразу после `open` видели готовую
+/// геометрию. `false` — сессию поднять нельзя (нет фреймбуфера/PMM), и `open`
+/// обязан ответить `ENODEV`, а не отдать fd на мёртвое окно.
+pub fn note_open(session: usize) -> bool {
+    if session == session_route::BOOT_SESSION || session >= MAX_SESSIONS {
+        return false;
+    }
+    if !live(session) && !start(session) {
+        return false;
+    }
+    OPEN_FDS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Учесть `close` устройства сессии; на последнем — запросить выход.
+///
+/// Счётчик не может уйти ниже нуля: close fd, пережившего `exit` сессии,
+/// видит 0 (счётчик сброшен выходом) и ничего не делает, поэтому не может
+/// «дожать» до reap только что поднятую новую сессию.
+pub fn note_close(session: usize) {
+    if session == session_route::BOOT_SESSION || session >= MAX_SESSIONS {
+        return;
+    }
+    let mut cur = OPEN_FDS.load(Ordering::Relaxed);
+    loop {
+        if cur == 0 {
+            return;
+        }
+        match OPEN_FDS.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                if cur == 1 {
+                    request_reap(session);
+                }
+                return;
+            }
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Поднять сессию: offscreen-консоль плюс задача `shell_main_session`.
+fn start(session: usize) -> bool {
+    if !crate::drivers::framebuffer::init_session(session) {
+        return false;
+    }
+    clear_reap(session);
+    PENDING.store(session as u64, Ordering::Relaxed);
+    // Инвариант 6: путь спавна идёт с замаскированными прерываниями — тик не
+    // должен увидеть задачу раньше, чем её владелец записан (иначе первый же
+    // баннер ушёл бы в boot-консоль). Поэтому `set_owner` — в той же секции.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let pid = crate::task::scheduler::kernel_thread_spawn_named(session_entry, "shell-term");
+        set_owner(session, pid);
+    });
+    true
+}
+
+/// Точка входа задачи сессии: подхватить номер из [`PENDING`] и запустить REPL.
+fn session_entry() {
+    let session = PENDING.load(Ordering::Relaxed) as usize;
+    // Владелец записан спавнером под маскированными прерываниями; повторная
+    // запись делает задачу владельцем и в вырожденном случае (pid переиспользован
+    // после неудачного старта). Reap НЕ снимается: close, случившийся между
+    // спавном и этим моментом, должен остаться в силе.
+    set_owner(session, crate::task::scheduler::current_pid());
+    crate::shell::shell_main_session(session)
+}
+
 /// Запрошен ли reap сессии (последний fd закрыт).
 static REAP_REQUESTED: [AtomicBool; MAX_SESSIONS] =
     [const { AtomicBool::new(false) }; MAX_SESSIONS];
@@ -148,6 +239,9 @@ pub fn clear_reap(session: usize) {
 /// команды `exit`). `scheduler::exit_current` — штатный путь выхода kernel-потока:
 /// задача уступает CPU и снимается тиком, стек освобождает reaper.
 pub fn exit(session: usize) -> ! {
+    // Забыть fd прошлой генерации: их close придёт позже и не должен
+    // сосчитаться как закрытие будущей сессии (см. [`note_close`]).
+    OPEN_FDS.store(0, Ordering::Relaxed);
     reset(session);
     crate::drivers::framebuffer::reset_session(session);
     crate::task::scheduler::exit_current()

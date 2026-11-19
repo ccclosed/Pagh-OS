@@ -17,6 +17,21 @@ use proptest::prelude::*;
 
 use crate::fb_surface::{chunk_at, geometry, PAGE};
 use crate::session_route::{route, BOOT_SESSION, MAX_SESSIONS};
+use crate::vtfb_abi::{
+    decode_info, encode_info, pixel_bytes, read_plan, read_size, VtfbInfo, VTFB_INFO_SIZE,
+};
+
+fn vtfb_info() -> impl Strategy<Value = VtfbInfo> {
+    (1u32..4096, 1u32..2048, 0u64..u64::MAX)
+        .prop_map(|(width, height, generation)| VtfbInfo {
+            width,
+            height,
+            // Шаг поверхности = width * 4 (XRGB), как у offscreen-писателя.
+            stride: width.saturating_mul(4),
+            bpp: 32,
+            generation,
+        })
+}
 
 fn owners() -> impl Strategy<Value = [u64; MAX_SESSIONS]> {
     prop::array::uniform(0u64..=8)
@@ -97,6 +112,42 @@ proptest! {
         prop_assert!(in_page + chunk <= PAGE);
         prop_assert!(chunk <= len);
         prop_assert_eq!(chunk == 0, len == 0);
+    }
+
+    /// Заголовок `VTFBIOGET_INFO` — 24 байта и переживает round trip: клиент,
+    /// прочитавший поля, видит ровно то, что ядро записало (порядок и ширина
+    /// полей — часть контракта).
+    #[test]
+    fn vtfb_info_round_trip(info in vtfb_info()) {
+        let bytes = encode_info(&info);
+        prop_assert_eq!(bytes.len(), VTFB_INFO_SIZE);
+        prop_assert_eq!(decode_info(&bytes), Some(info));
+        // Усечённый заголовок не декодируется: клиент не должен увидеть
+        // полуправду.
+        prop_assert_eq!(decode_info(&bytes[..VTFB_INFO_SIZE - 1]), None);
+    }
+
+    /// Логический размер `read`-файла = 24 + stride*height; пиксельная часть —
+    /// ровно произведение.
+    #[test]
+    fn vtfb_read_size(info in vtfb_info()) {
+        prop_assert_eq!(pixel_bytes(&info), info.stride as u64 * info.height as u64);
+        prop_assert_eq!(read_size(&info), VTFB_INFO_SIZE as u64 + pixel_bytes(&info));
+    }
+
+    /// План `read` не теряет и не выдумывает байты: заголовочная и пиксельная
+    /// части складываются в `min(count, total - offset)`, а пиксельное смещение
+    /// никогда не выходит за пиксельную часть.
+    #[test]
+    fn vtfb_read_plan_is_exact(info in vtfb_info(), offset_seed in 0u64..1_000_000, count_seed in 0u64..8192) {
+        let total = read_size(&info);
+        let offset = offset_seed % (total + 1);
+        let count = count_seed.min(4096);
+        let (header, pixel_off, pixels) = read_plan(&info, offset, count);
+        let expected = count.min(total - offset);
+        prop_assert_eq!(header + pixels, expected);
+        prop_assert!(header <= VTFB_INFO_SIZE as u64);
+        prop_assert!(pixel_off + pixels <= pixel_bytes(&info));
     }
 
     /// Полный обход поверхности: куски складываются ровно в длину, номера

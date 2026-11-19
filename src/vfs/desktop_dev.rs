@@ -201,6 +201,84 @@ impl VfsNode for VtInputDevice {
     }
 }
 
+/// `/dev/vtfb1` — read-only пиксельная поверхность терминальной сессии 1.
+///
+/// Композитор терминального окна читает её через `ioctl(VTFBIOGET_INFO)` +
+/// `mmap(PROT_READ, MAP_SHARED)` (или `read(2)`-fallback с 24-байтным
+/// заголовком). Содержимое живёт в [`crate::drivers::offscreen`]; узел только
+/// сообщает геометрию/поколение/кадры. Запись запрещена: пиксели публикует
+/// kernel-shell сессии.
+pub struct TerminalFramebufferDevice;
+
+impl VfsNode for TerminalFramebufferDevice {
+    fn name(&self) -> &str {
+        "vtfb1"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+    fn is_vtfb1(&self) -> bool {
+        true
+    }
+    fn vtfb_info(&self) -> Option<crate::drivers::vtfb_abi::VtfbInfo> {
+        crate::drivers::offscreen::info(1)
+    }
+    fn vtfb_page(&self, index: u64) -> Option<u64> {
+        crate::drivers::offscreen::page(1, index)
+    }
+    fn size(&self) -> u64 {
+        // Логический размер `read(2)`-файла: заголовок плюс пиксели.
+        self.vtfb_info()
+            .map(|i| crate::drivers::vtfb_abi::read_size(&i))
+            .unwrap_or(0)
+    }
+    fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        let Ok(offset) = usize::try_from(offset) else {
+            return Ok(0);
+        };
+        Ok(crate::drivers::offscreen::read_snapshot(1, offset, buf))
+    }
+    fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
+        Err(super::VfsError::NotSupported)
+    }
+    /// `root:tty 0660`: пиксели окна могут содержать секреты (вывод команд),
+    /// поэтому читает только root или член группы `tty` — как `vtconsole0`.
+    fn mode(&self) -> u32 {
+        0o660
+    }
+    fn owner(&self) -> (u32, u32) {
+        (0, gid::TTY)
+    }
+}
+
+/// `/dev/vtinput1` — write-only приём VT-байтов терминальной сессии 1.
+pub struct TerminalInputDevice;
+
+impl VfsNode for TerminalInputDevice {
+    fn name(&self) -> &str {
+        "vtinput1"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+    fn is_vtinput1(&self) -> bool {
+        true
+    }
+    /// `root:input 0660`: ввод окна — sensitive, как evdev и `vtinput`.
+    fn mode(&self) -> u32 {
+        0o660
+    }
+    fn owner(&self) -> (u32, u32) {
+        (0, gid::INPUT)
+    }
+    fn read(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Err(super::VfsError::NotSupported)
+    }
+    fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        Ok(crate::drivers::vtinput::write_session(1, buf))
+    }
+}
+
 /// `/dev/vtconsole0` как `Arc<dyn VfsNode>`.
 pub fn vtconsole0() -> Arc<dyn VfsNode> {
     Arc::new(VtConsoleDevice) as Arc<dyn VfsNode>
@@ -209,4 +287,14 @@ pub fn vtconsole0() -> Arc<dyn VfsNode> {
 /// `/dev/vtinput` как `Arc<dyn VfsNode>`.
 pub fn vtinput() -> Arc<dyn VfsNode> {
     Arc::new(VtInputDevice) as Arc<dyn VfsNode>
+}
+
+/// `/dev/vtfb1` как `Arc<dyn VfsNode>`.
+pub fn vtfb1() -> Arc<dyn VfsNode> {
+    Arc::new(TerminalFramebufferDevice) as Arc<dyn VfsNode>
+}
+
+/// `/dev/vtinput1` как `Arc<dyn VfsNode>`.
+pub fn vtinput1() -> Arc<dyn VfsNode> {
+    Arc::new(TerminalInputDevice) as Arc<dyn VfsNode>
 }

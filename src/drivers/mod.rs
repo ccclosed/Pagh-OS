@@ -41,6 +41,8 @@ pub mod vt;
 pub mod vt_abi;
 /// Чистый переводчик VT-байтов `/dev/vtinput` в PS/2 set-1.
 pub mod vt_keys;
+/// Чистый ABI `/dev/vtfb1` (24-байтный `VTFBIOGET_INFO` + план `read`).
+pub mod vtfb_abi;
 /// `/dev/vtinput`: VT-байты → вход kernel-shell.
 pub mod vtinput;
 /// Разделяемая VT-поверхность (публикация из shell/VT, mmap/read).

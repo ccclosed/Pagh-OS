@@ -62,6 +62,11 @@ pub mod session_route;
 #[path = "../../src/drivers/fb_surface.rs"]
 pub mod fb_surface;
 
+// ABI пиксельной поверхности `/dev/vtfb1` (24-байтный `VTFBIOGET_INFO` и план
+// `read(2)`-снимка): кодирование/декодирование и раскладка «заголовок + пиксели».
+#[path = "../../src/drivers/vtfb_abi.rs"]
+pub mod vtfb_abi;
+
 // Ancillary data (`cmsg`) AF_UNIX SCM_RIGHTS: разметка msghdr/cmsghdr,
 // разбор control-буфера отправки и план доставки fd на приёме. Модуль
 // `core`+`alloc`-only, поэтому host-свойства исполняют ровно тот исходник,

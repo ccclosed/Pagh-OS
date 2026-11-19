@@ -1627,6 +1627,26 @@ pub(super) fn cmd_chown(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
+/// `exit`: завершить терминальную сессию окна.
+///
+/// Только у сессии окна есть что завершать: boot-shell — это ядро, и его выход
+/// оставил бы машину без консоли. Задача сессии выходит штатным путём
+/// (`scheduler::exit_current`), то есть уступает CPU и снимается тиком; никакого
+/// асинхронного kill'а, который мог бы застать задачу с чужим ресурсом.
+pub(super) fn cmd_exit(_ctx: &mut ShellCtx, args: &[&str]) {
+    if !args.is_empty() {
+        shell_println("exit: usage: exit");
+        return;
+    }
+    let session = crate::drivers::session::current();
+    if session == crate::drivers::session_route::BOOT_SESSION {
+        shell_println("exit: this is the boot shell; close the terminal window instead");
+        return;
+    }
+    shell_println("logout");
+    crate::drivers::session::exit(session);
+}
+
 /// `sleep <seconds>`: заблокировать shell на заданное целое число секунд,
 /// засыпая между тиками таймера вместо busy-spin.
 pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {

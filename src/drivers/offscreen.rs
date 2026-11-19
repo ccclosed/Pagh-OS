@@ -123,6 +123,51 @@ pub fn free(session: usize) {
     }
 }
 
+/// Информация о поверхности для `VTFBIOGET_INFO`/`mmap`-клиента.
+///
+/// `None` — поверхность не аллоцирована (сессия не запущена, окно не
+/// открывалось), и `open`/`ioctl` обязаны ответить `ENODEV`.
+pub fn info(session: usize) -> Option<super::vtfb_abi::VtfbInfo> {
+    let geometry = geometry(session)?;
+    Some(super::vtfb_abi::VtfbInfo {
+        width: geometry.width as u32,
+        height: geometry.height as u32,
+        stride: geometry.stride as u32,
+        bpp: 32,
+        generation: generation(session),
+    })
+}
+
+/// `read(2)`-снимок поверхности: 24-байтный заголовок, затем пиксели.
+///
+/// Заголовок собирается на момент чтения (в нём `generation`), пиксели — из
+/// кадров. План раскладки — чистая [`super::vtfb_abi::read_plan`], поэтому
+/// границы заголовка/пикселей не дублируются здесь руками.
+pub fn read_snapshot(session: usize, offset: usize, out: &mut [u8]) -> usize {
+    let Some(info) = info(session) else {
+        return 0;
+    };
+    let (header_bytes, pixel_offset, pixel_bytes) =
+        super::vtfb_abi::read_plan(&info, offset as u64, out.len() as u64);
+    if header_bytes + pixel_bytes == 0 {
+        return 0;
+    }
+    let mut done = 0usize;
+    if header_bytes > 0 {
+        let header = super::vtfb_abi::encode_info(&info);
+        let from = offset.min(super::vtfb_abi::VTFB_INFO_SIZE);
+        let take = header_bytes as usize;
+        out[..take].copy_from_slice(&header[from..from + take]);
+        done += take;
+    }
+    if pixel_bytes > 0 {
+        let take = pixel_bytes as usize;
+        let got = read_at(session, pixel_offset as usize, &mut out[done..done + take]);
+        done += got;
+    }
+    done
+}
+
 /// Геометрия поверхности сессии, если она аллоцирована.
 pub fn geometry(session: usize) -> Option<Geometry> {
     let index = slot(session)?;
