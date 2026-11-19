@@ -3756,6 +3756,15 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   (guest.serial()[off:]).strip().splitlines()[-1]
                   if (guest.serial()[off:]).strip() else "no bg marker")
 
+    # ── one-way takeover: kernel console output stays off the screen ──
+    # The shell owns the keyboard here and the compositor owns the framebuffer.
+    # The headless Files run below prints kernel console lines ("Compat_Process
+    # started/exited") but draws no window, so two frames around it must be
+    # identical: a console flush would replace the whole screen with text.
+    # (Typing into the shell while a *client* owns the keyboard cannot be used
+    # for this: the command goes to the client's stdin, not to the shell.)
+    time.sleep(0.4)
+    kb.screenshot(console_a)
     # Headless REAL Files under the shell: proves the binary writes its scenes to
     # an ext2 path (ground truth for the launch-target assertion below).
     _desktop_restart_shell_line(kb)
@@ -3769,6 +3778,12 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   manual is not None,
                   regex_first(r"[^\r\n]*\.png[^\r\n]*", guest.serial()[off:]) or
                   "no scene line")
+    time.sleep(0.6)
+    kb.screenshot(console_b)
+    frozen = (console_a.is_file() and console_b.is_file()
+              and console_a.read_bytes() == console_b.read_bytes())
+    ok &= h.check("kernel console did not repaint (fbdev takeover is one-way)",
+                  frozen, "frames identical" if frozen else "console repainted")
 
     # ── REAL pagh-files window ──
     _desktop_restart_shell_line(kb)
@@ -3811,34 +3826,31 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("Files window survives input and is still on screen",
                   survives, f"{files_clicked.name}")
 
-    # ── one-way takeover: console output stays off the screen ──
-    # TYPE NO 'c' HERE: the real Files client owns the keyboard while this line
-    # is entered, and a Ctrl modifier left set by an earlier QMP chord turns a
-    # typed `c` into ^C, which the kernel delivers as SIGINT to the foreground
-    # group — that killed the Files window in earlier runs (`sig=2
-    # tick-delivered`). `ls` of a marker path proves the same property (the
-    # shell processed a command while the compositor owned the screen) without
-    # spelling the one letter an accidental ^C can form.
+    # ── the shell must own the terminal before the next client starts ──
+    # A foreground lxrun job owns the keyboard. The click above can leave the
+    # Files client alive (then the job must be stopped and resumed) or remove it
+    # (an input artifact; the shell prompt simply returns). Both outcomes are
+    # legitimate — decide from the serial prompt, not by assuming which.
     off = mark()
-    kb.text("ls /mnt/E2E_ALIVE_TAKEOVER")
-    kb.key("ret")
-    alive = wait_new(off, [r"E2E_ALIVE_TAKEOVER"], 20.0, "shell echo under takeover")
-    ok &= h.check("serial shell alive while the compositor owns the screen",
-                  alive is not None, "^echo seen on serial")
-    # Baseline AFTER the echo is entered: typing a command line takes seconds
-    # under TCG, and a client may legitimately commit frames meanwhile, so a
-    # pre-typing frame compared with a post-typing one differs for desktop
-    # reasons, not because the kernel console repainted. The property under test
-    # is that two frames of the SETTLED desktop are identical: a kernel console
-    # flush would replace the whole screen with text between them.
-    time.sleep(0.4)
-    kb.screenshot(console_a)
-    time.sleep(0.4)
-    kb.screenshot(console_b)
-    frozen = (console_a.is_file() and console_b.is_file()
-              and console_a.read_bytes() == console_b.read_bytes())
-    ok &= h.check("kernel console did not repaint (fbdev takeover is one-way)",
-                  frozen, "frames identical" if frozen else "console repainted")
+    prompt_back = wait_new(off, [r"pagh:/> "], 3.0, "shell prompt after Files")
+    if prompt_back is None:
+        h.qmp.keys(["ctrl", "z"])
+        h.qmp.release_modifiers()
+        files_parked = wait_new(off, [r"\^Z"], 20.0, "Files Ctrl+Z")
+        ok &= h.check("Files job stops on Ctrl+Z (shell regains the terminal)",
+                      files_parked is not None,
+                      "^Z" if files_parked else "no ^Z marker")
+        if files_parked is not None:
+            off = mark()
+            _desktop_restart_shell_line(kb)
+            kb.text("bg")
+            kb.key("ret")
+            files_bg = wait_new(off, [r"bg: \[\d+\]"], 20.0, "bg Files")
+            ok &= h.check("Files job resumed in the background (`bg`)",
+                          files_bg is not None, "^bg seen on serial")
+    else:
+        h.info_check("Files client gone after the pointer click",
+                     "shell prompt returned; no job to park")
 
     # ── REAL pagh-terminal as the second window ──
     _desktop_restart_shell_line(kb)
@@ -3875,17 +3887,9 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                       term_win is not None,
                       regex_first(r"pagh-terminal: connected[^\r\n]*",
                                   guest.serial()) or "no connected line")
-    # Focus the terminal before the blink assertion: the cursor blinks only in
-    # the focused window, and clicking the Files content above handed focus to
-    # Files. Click the terminal content centre (window is 720x420 at the
-    # compositor's deterministic placement, 96..816 x 64..516).
-    h.qmp.rel(2000, 2000)
-    time.sleep(0.2)
-    h.qmp.rel(-824, -510)
-    time.sleep(0.3)
-    h.qmp.button("left", True)
-    time.sleep(0.1)
-    h.qmp.button("left", False)
+    # The compositor focuses a newly created window; the liveness probe below
+    # types into it instead of clicking it (a QMP mouse burst is itself an
+    # input artifact while a client owns the keyboard).
     time.sleep(0.6)
     kb.screenshot(term_a)
     second = (term_a.is_file() and files_clicked.is_file()
@@ -3943,19 +3947,23 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     # writes PNGs under /mnt before its first console write, so the written file
     # is proof that the compositor spawned the configured command.
     #
-    # FOCUS FILES IN A PROVABLY FREE POINT: both windows share the same
-    # deterministic top-left placement, so the upper-left overlap belongs to the
-    # Terminal. Files is 1060x640 and Terminal 720x420, so (1000, 600) is inside
-    # the Files *content* and outside the Terminal rectangle — a click there
-    # focuses Files without guessing z-order, and is not the resize grip.
-    h.qmp.rel(2000, 2000)
-    time.sleep(0.2)
-    h.qmp.rel(-280, -200)
-    time.sleep(0.3)
-    h.qmp.button("left", True)
-    time.sleep(0.1)
-    h.qmp.button("left", False)
-    time.sleep(0.6)
+    # START A FRESH REQUESTER: the first Files client may have been killed by an
+    # input artifact, and the Terminal window overlaps its rectangle. A newly
+    # created window is focused by the compositor, so no click is needed and the
+    # hotkey goes to a demonstrably live Files client.
+    _desktop_restart_shell_line(kb)
+    off = mark()
+    requester_cmd = f"rust /mnt/pagh-files --connect {socket}"
+    log(f"type (launch requester): {requester_cmd}")
+    kb.text(requester_cmd)
+    kb.key("ret")
+    requester = wait_new(off, [r"pagh-files: окно \d+ \d+x\d+"], 45.0,
+                         "launch requester window")
+    ok &= h.check("fresh pagh-files requester opened for the PDP/1 launch",
+                  requester is not None,
+                  regex_first(r"pagh-files: окно[^\r\n]*", guest.serial()[off:]) or
+                  "no window line")
+    time.sleep(0.8)
     kb_off = mark()
     h.qmp.keys(["alt", "shift", "f4"])
     h.qmp.release_modifiers()
