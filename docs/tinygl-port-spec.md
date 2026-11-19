@@ -20,8 +20,8 @@ AGENTS.md, «Версионирование»).
    релизом. 640×480, кадры по счёту, бюджет ≤ 5 минут на сценарий.
 6. Depth/маски — **строго upstream 0.4.1** в v1, никакого форка/расширений.
 7. Selection mode — **отложен** (демо он не нужен).
-8. Версия: docs-only без bump; MINOR — в PR, который **выпускает** фичу, не в 2.24.0 и
-   не в этой спеке.
+8. Версия: docs-only без bump; MINOR — **только в финальном acceptance PR6** (не в этой
+   спеке, не в PR1-probe, не в PR2–PR5, не в 2.24.0).
 
 **Не-цели этой волны:** GPU/DRM/NVIDIA, современный OpenGL (2.0+, GLSL, FBO/ARB),
 EGL/GLX/Wayland, Mesa, аппаратный растеризатор, мультиконтекстная потокобезопасность,
@@ -271,7 +271,7 @@ build-probe'ом.
 | Z-буфер | `ZB_Z_BITS 16`, `ZB_POINT_Z_FRAC_BITS 14` (`zbuffer.h:10`, `:12`) | 16-битный Z, фиксированная точка | оставляем (память/скорость); 24/32-битный Z — не цель |
 | Цвета | 32bpp: `PIXEL = 0x00RRGGBB` (`zbuffer.h:60`–`:64`) | проверено пробой (§5.2) | наш путь — 32bpp |
 | Текстуры | `glGenTextures`, `glBindTexture`, `glDeleteTextures`, `glTexImage2D`, `glTexEnvi`, `glTexParameteri`, `glTexCoord2f/2fv/4f` | `glTexImage2D` — только RGB+`GL_UNSIGNED_BYTE`, внутренний ресайз в **256×256**, mipmap нет, `glTexEnvi` только `GL_DECAL`, фильтры только `GL_NEAREST`, wrap только `GL_REPEAT`, `glTexCoord` не прогоняется через матрицу | используем как есть; ограничения — в README крейта |
-| Массивы | `glEnableClientState`, `glDisableClientState`, `glVertexPointer`, `glNormalPointer`, `glColorPointer`, `glTexCoordPointer`, `glArrayElement` | `TGL_FEATURE_ARRAYS 1`; **`glDrawArrays`/`glDrawElements` отсутствуют** (`grep -rn "DrawArrays\|DrawElements" src/ include/ examples/` → пусто); индексация через `glArrayElement` из `glBegin/glEnd` | v1: демо на immediate mode; arrays включаем, но **проверяем на x86_64 отдельно** (предупреждение upstream README о 64-битных указателях; в коде указатели идут через `.p`, `arrays.c:133` — выглядит корректно, но это проверяем, а не предполагаем) |
+| Массивы | `glEnableClientState`, `glDisableClientState`, `glVertexPointer`, `glNormalPointer`, `glColorPointer`, `glTexCoordPointer`, `glArrayElement` | `TGL_FEATURE_ARRAYS 1`; **`glDrawArrays`/`glDrawElements` отсутствуют** (`grep -rn "DrawArrays\|DrawElements" src/ include/ examples/` → пусто); индексация через `glArrayElement` из `glBegin/glEnd` | **v1: ТОЛЬКО immediate mode** — client arrays в v1 не используются и не обещаются. Client arrays — **отдельный PR после v1** с проверкой под **UBSan/ASan** на x86_64 (upstream README сам предупреждает о 64-битных указателях; в коде они идут через `.p`, `arrays.c:133`, но это проверяем, а не предполагаем). Никаких авансов «arrays работают» в доках v1 |
 | Display lists | `glNewList`/`glEndList`/`glCallList`/`glGenLists`/`glDeleteLists`/`glIsList` | есть (`TGL_FEATURE_DISPLAYLISTS`) | батчинг в демо — через них (VBO нет) |
 | Selection mode | `glRenderMode(GL_SELECT)`, `glSelectBuffer`, `glInitNames`, `glPushName/glPopName`, `glLoadName` | полный handling | **ОТЛОЖЕНО** (решение lead): в v1 не входит, демо не используют |
 | Прочее | `glCullFace`, `glFrontFace`, `glPolygonMode`, `glLineWidth`, `glPointSize`, `glPolygonOffset`, `glPolygonStipple`, `glBlendFunc`, `glFog*`, `glHint`, `glFlush`, `glPixelStorei`, `glRasterPos2f`, `glEdgeFlag` | часть — реально, часть — пустые/«only API»: `glPolygonOffset` не реализован, `glHint`/`glFlush` игнорируются, `glPixelStorei` только byte-aligned | экспортируем как есть (клиентский код линкуется), честно пишем «not implemented» |
@@ -292,6 +292,8 @@ BeOS-обвязка. Новый backend — наш `pagh-gl-demo` поверх P
 * **Никакого GPU**: только CPU-растеризация. GPU/NVIDIA/DRM/KMS — вне спеки.
 * **Никакого 8-битного paletted режима** и dithering (`TGL_FEATURE_8_BITS` выключен
   физически, §5.3), color index mode отсутствует.
+* **Client arrays — не в v1**: v1 — только immediate mode (`glBegin`/`glVertex*`/
+  `glColor*`); `gl*Pointer`/`glArrayElement` приходят отдельным PR с UBSan/ASan.
 * Ни MSAA, ни HDR/гаммы, ни стерео, ни user clip planes (в 0.4.1 нет).
 * Никакого fallback «через Mesa», если демо медленное.
 
@@ -429,7 +431,7 @@ static-pie и позвать его из Rust — **до** любой интег
 2. `build.rs` только этого крейта: `cc::Build::new()` + список из 23 файлов +
    `-fno-strict-aliasing` + `-Wno-implicit-fallthrough` (иначе 3 предупреждения в `get.c`,
    проверено) + `-O2`. Цель берётся из `TARGET`/`HOST`.
-3. **Детекция C-компилятора** (её и проверяем): `CC_x86_64_unknown_linux_musl` →
+3. **Детекция C-компилятора** (**ОБЯЗАТЕЛЬНАЯ часть PR1**, не опция): `CC_x86_64_unknown_linux_musl` →
    `x86_64-unknown-linux-musl-gcc` → `musl-gcc` → `clang --target=x86_64-unknown-linux-musl`
    (с `--sysroot`, если задан) → **внятная ошибка** с инструкцией
    (`apt install musl-tools`, либо `clang` + sysroot) вместо `cc not found`.
@@ -451,7 +453,7 @@ static-pie и позвать его из Rust — **до** любой интег
 | 3 | FFI работает | проба печатает `digest`, `center`, `corner` |
 | 4 | Формат = XRGB8888 | центр ≠ 0 и старший байт = `0x00` |
 | 5 | Детерминизм | два прогона → один дайджест |
-| 6 | Совпадение с host-gcc эталоном | ожидается `digest=0x3f7e5ece33386f9b`, `center=0x003c4c7a`, `corner=0x00000000`; расхождение — не FAIL, а известное отклонение: записать оба дайджеста в `UPSTREAM.md` и выбрать эталоном musl-значение |
+| 6 | Совпадение с host-gcc эталоном — **строгое** | детерминированный `triangle` **обязан** дать `digest=0x3f7e5ece33386f9b`, `center=0x003c4c7a`, `corner=0x00000000`. Любое расхождение **БЛОКИРУЕТ PR1** до классификации: допускается **только доказанная FP-reassociation при идентичной геометрии** (тот же `center`, та же закрашенная площадь, тот же набор цветов; меняются лишь младшие биты интерполяции), и это фиксируется в `UPSTREAM.md` вместе с обоими дайджестами. Расхождение **геометрии** (другой `center`, другая площадь/форма, другой цвет) = **FAIL**, а не «известное отклонение» |
 | 7 | Ничего не сломано | 6/6 гейтов зелёные |
 
 **Почему эталон есть заранее:** пробный рендер уже выполнен на этом дереве фактов —
@@ -459,9 +461,11 @@ gcc `-O2 -fno-strict-aliasing`, 23 файла, `-lm`; результат ста�
 `digest=0x3f7e5ece33386f9b center=0x003c4c7a corner=0x00000000`. Это и есть «известный
 ответ» для PR1 (и заодно доказательство, что `0x00RRGGBB` — правда, а не предположение).
 
-**Если PR1 FAIL** (toolchain не заводится): PR закрывается с записанным выводом; порядок
-дальнейших действий — `clang --target=…-musl` с sysroot, затем `zig cc`, и только если всё
-провалилось — вопрос lead'у про пересмотр решения (тогда и только тогда обсуждается B).
+**Если PR1 FAIL**: PR **не мержится** и закрывается с записанным выводом (какой компилятор,
+какая ошибка, полный лог). Порядок дальнейших действий — сначала `clang --target=…-musl` с
+sysroot, затем `zig cc`; всё это остаётся внутри A. **Самовольно включать вариант B
+(переписывание C→Rust) нельзя** — только явное решение lead'а после отчёта. Аналогично
+критерий 6: расхождение дайджеста без классификации = стоп и отчёт, не «приняли и записали».
 
 ### 5.3 Точный минимальный патч upstream (проверен пробой)
 
@@ -566,8 +570,9 @@ CLI: `pagh-gl-demo <triangle|cube|gears> [--connect /tmp/pagh-desktop.sock]
    пустой/фоновый, в serial-логе есть `TINYGL … digest=0x…`.
 2. **Pixel checks PASS.** Дайджесты host-рендера == дайджесты из QEMU-гостя для `triangle`,
    `cube` (статические позы), `gears` (фиксированные углы).
-3. **Frame time измерен** и напечатан (`min/med/max ms`) на **640×480** (и, если успеваем
-   по бюджету, на 1280×800) в том же прогоне.
+3. **Frame time измерен** и напечатан (`min/med/max ms`) на **640×480** в том же прогоне.
+   `1280×800` — **только опционально** и только если укладываемся в бюджет e2e (≤ 5 мин);
+   это **не** критерий приёмки: отсутствие замера на 1280×800 приёмку не блокирует.
 4. **Нет регрессий:** `pagh-files` и `pagh-terminal` в том же сеансе работают (окна, ввод,
    Alt+Shift+F4 launch).
 5. **Гейты 6/6** (§8.0) + `cargo test` затронутых userspace-крейтов.
@@ -648,14 +653,15 @@ python3 tools/check_agents_md.py
 |---|---|---|---|
 | 1 | `tinygl: build-probe for upstream C 0.4.1 (musl + FFI)` | `rust-apps/tinygl/`: `c_src/` (23 файла), `build.rs` только этого крейта, детекция musl C-компилятора, `ffi.rs`-минимум, `tinygl-probe`, `LICENSE-TinyGL`, `THIRD_PARTY_NOTICES.md`, `UPSTREAM.md`, `PATCHES.md`, static-pie/`INTERP`-гейт | **PASS-критерии §5.2**: сборка под musl, нет `INTERP`, дайджест `0x3f7e5ece33386f9b`, детерминизм, 6/6 |
 | 2 | `tinygl: FFI core (context, matrices, viewport, clear, triangles, depth)` | безопасная обёртка §3.3, `Surface`-валидация, host-тесты §8.1 (матрицы/clear/треугольник/depth) | `cargo test` крейта зелёный, 6/6, никакого композитора |
-| 3 | `tinygl: textures, display lists, arrays` | биндинги + host-тесты текстур (RGB/UNSIGNED_BYTE/256×256/NEAREST/REPEAT/DECAL), display lists как батчинг, arrays с проверкой на x86_64 | свойства + дайджесты сцен с текстурой |
+| 3 | `tinygl: textures + display lists` | биндинги + host-тесты текстур (RGB/UNSIGNED_BYTE/256×256/NEAREST/REPEAT/DECAL), display lists как способ батчинга | свойства + дайджесты сцен с текстурой |
 | 4 | `pagh-gl-demo: PDP/1 ShmSurface (memfd → SHM_OFFER → рендер → COMMIT)` | крейт демо: клиент, memfd/mmap/offer/commit/damage, resize через новый `SHM_OFFER`, честная ошибка без ShmSurface | live-прогон в QEMU: окно с треугольником, `TINYGL` маркеры |
 | 5 | `pagh-gl-demo: triangle, cube, gears + pixel checks + frame time` | три сцены, дайджесты, замеры, `--hash` | дайджесты стабильны, frame time напечатан |
 | 6 | `docs+e2e: GL phase, acceptance, ограничения` | `_desktop_gl_phase()`, README крейта + корневой README (ограничения), прогон acceptance §7 | **Acceptance §7 целиком**, 6/6 |
+| — | **после v1:** `tinygl: client arrays (UBSan/ASan)` | биндинги `gl*Pointer`/`glArrayElement` + проверка 64-битных указателей под UBSan/ASan | отдельный PR; до него client arrays в доках не обещаны |
 | — | **отдельно, после спеки:** `ci: run userspace crate tests` | job/шаг `cargo test` по затронутым `rust-apps/*` + синхронная правка AGENTS.md | 6/6 и `check_agents_md.py` зелёный |
 
-Правила: base = `dev`; ветки удаляются после мержа; версия — **MINOR в PR, который
-выпускает фичу** (§0.8), не в этой спеке и не в 2.24.0.
+Правила: base = `dev`; ветки удаляются после мержа; версия — **MINOR только в PR6**
+(финальный acceptance; §0.8): ни эта спека, ни PR1-probe, ни PR2–PR5 версию не меняют.
 
 ---
 
@@ -665,7 +671,7 @@ python3 tools/check_agents_md.py
 |---|---|---|---|
 | **Нет C-компилятора для musl** на dev-машинах/CI (на машине фактов нет ни `musl-gcc`, ни `clang`) | высокая | PR1 не собирается | PR1 и существует, чтобы это выяснить: детекция + инструкция (`musl-tools`), затем `clang --target`+sysroot, затем `zig cc`; при полном провале — вопрос lead'у (не самовольный переход к B) |
 | **64-битные указатели в float-массивах** (upstream README сам предупреждает; upstream тестировал 32-бит x86 и sparc) | средняя | тихая порча геометрии при client arrays | v1 демо — immediate mode; arrays включаются отдельным PR с проверкой на x86_64 (+ по желанию UBSan); указатели в коде идут через `.p` (`arrays.c:133`) — выглядит корректно, но проверяем |
-| **Пиксельные расхождения host↔musl/clang** (f32/FP-contract) | средняя | «дайджест не тот» | эталон — musl-значение; host-эталон фиксируем рядом; расхождение документируем, а не прячем; `-ffast-math` не включаем |
+| **Пиксельные расхождения host↔musl/clang** (f32/FP-contract) | средняя | **PR1 блокируется** | критерий 6 §5.2: совпадение обязательно; допускается только доказанная FP-reassociation при идентичной геометрии (тот же `center`/площадь/цвета), иначе стоп и отчёт lead'у; оба дайджеста документируются; `-ffast-math` не включаем |
 | **CPU-растеризация в QEMU TCG медленная** | высокая | демо «выглядит сломанным» | 640×480, кадры по счёту (не по времени), бюджет e2e ≤ 5 мин, честная формулировка в отчётах |
 | **Тулчейн/линковка тянет системную зависимость** (libm/libc musl) | низкая | порча static-pie | `INTERP`-гейт в `build-rust-app.sh`; `nm -u` уже проверен — только libc/libm |
 | **`zbuffer.c` требует `w*4` и `w%4==0`** | высокая (классика) | «правая полоса не рисуется» | валидация в `Surface::new` с внятной ошибкой + host-свойства |
@@ -682,7 +688,7 @@ python3 tools/check_agents_md.py
 
 | # | Вопрос | Решение |
 |---|---|---|
-| 1 | Версия | docs-only **без bump**; MINOR — в PR, который выпускает фичу (не 2.24.0, не спека) |
+| 1 | Версия | docs-only **без bump**; MINOR — только в финальном acceptance **PR6** (не 2.24.0, не спека, не PR1) |
 | 2 | A vs B | **A**: upstream C 0.4.1 + тонкая Rust FFI; B — только будущее решение после провала A и нового review |
 | 3 | Дерево | `rust-apps/tinygl/` (C + FFI + notices) и `rust-apps/pagh-gl-demo/`; имени «pagh-gl» не заводить |
 | 4 | CI | явный `cargo test` для затронутых userspace-крейтов; правка AGENTS.md + `check_agents_md.py` — **отдельный PR** |
@@ -693,10 +699,10 @@ python3 tools/check_agents_md.py
 **Оставшиеся follow-up'ы (не блокируют спеку):**
 
 1. CI-PR с `cargo test` по userspace-крейтам + синхронная правка AGENTS.md.
-2. Решение по client arrays, если PR3 покажет проблему на x86_64 (включить/отложить).
-3. Порог MINOR-bump: какой именно PR считается «выпускающим» фичу (PR5 или PR6).
-4. Нужен ли `--size 1280x800` в acceptance сверх 640×480 (сейчас — «если успеваем по
-   бюджету»).
+2. Отдельный PR по client arrays (после v1) — с UBSan/ASan; заранее ничего не обещаем.
+
+Решено и закрыто: MINOR = PR6; `1280×800` — опция по бюджету, не acceptance; расхождение
+дайджеста в PR1 — блок до классификации (не «записали и приняли»).
 
 ---
 
