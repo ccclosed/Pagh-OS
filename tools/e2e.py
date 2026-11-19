@@ -3977,8 +3977,7 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     kb.text("ls /mnt/launch-evidence")
     kb.key("ret")
     evidence = wait_new(off, [r"[^\s/]+\.png"], 20.0, "launch-target evidence")
-    ok &= h.check("launch_targets spawned the configured --launch-target "
-                  "(compositor hotkey path)",
+    ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
                   evidence is not None,
                   regex_first(r"[^\r\n]*\.png[^\r\n]*",
                               guest.serial()[off:]) or "no PNG written")
