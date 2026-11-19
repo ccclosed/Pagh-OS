@@ -3756,26 +3756,6 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   (guest.serial()[off:]).strip().splitlines()[-1]
                   if (guest.serial()[off:]).strip() else "no bg marker")
 
-    # ── launch_targets spawn a REAL binary (compositor hotkey path) ──
-    # Ctrl+Alt+T goes through Compositor::key_event -> HostEvent::Launch ->
-    # Server::launch() -> spawn_target(), the same registry entry that PDP/1
-    # `launch` (type 13) resolves. The configured terminal target is the real
-    # pagh-files binary in headless mode; it writes PNGs under
-    # /mnt/launch-evidence before its first console write, so the file proves a
-    # real spawn. This runs without any client, so a client-input artifact
-    # cannot remove the requester (the type-13 leg from pagh-files is tracked
-    # separately in the PR's honest notes).
-    time.sleep(0.4)
-    launch_mark = mark()
-    h.qmp.keys(["ctrl", "alt", "t"])
-    h.qmp.release_modifiers()
-    time.sleep(8.0)
-    launch_text = guest.serial()[launch_mark:]
-    died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
-    if died:
-        h.info_check("launch target client died with EMSGSIZE",
-                     "pagh-files: Message too large (os error 90) after hotkey launch")
-
     # ── one-way takeover: kernel console output stays off the screen ──
     # The shell owns the keyboard here and the compositor owns the framebuffer.
     # The headless Files run below prints kernel console lines ("Compat_Process
@@ -3964,6 +3944,34 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("serial shell alive after both real applications ran",
                   alive is not None, "^echo seen on serial")
 
+    # ── REAL PDP/1 launch (type 13): requester -> launch_app -> spawn target ──
+    # This is the original check and it is EXPECTED TO FAIL on this kernel
+    # version: a client-started Files requester has never produced the evidence
+    # PNG (the same failure is present on unmodified dev, see the PR body). It is
+    # kept visible rather than replaced, because another stimulus would not cover
+    # the PDP `launch` (type 13) leg.
+    _desktop_restart_shell_line(kb)
+    off = mark()
+    requester_cmd = f"rust /mnt/pagh-files --connect {socket}"
+    log(f"type (PDP launch requester): {requester_cmd}")
+    kb.text(requester_cmd)
+    kb.key("ret")
+    requester = wait_new(off, [r"pagh-files: окно \d+ \d+x\d+"], 45.0,
+                         "launch requester window")
+    ok &= h.check("fresh pagh-files requester opened for the PDP/1 launch",
+                  requester is not None,
+                  regex_first(r"pagh-files: окно[^\r\n]*", guest.serial()[off:]) or
+                  "no window line")
+    time.sleep(0.8)
+    kb_off = mark()
+    h.qmp.keys(["alt", "shift", "f4"])
+    h.qmp.release_modifiers()
+    time.sleep(6.0)
+    launch_text = guest.serial()[kb_off:]
+    died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
+    if died:
+        h.info_check("PDP launch: requesting pagh-files client died with EMSGSIZE",
+                     "pagh-files: Message too large (os error 90) after type-13 launch")
     _desktop_restart_shell_line(kb)
     off = mark()
     kb.text("ls /mnt/launch-evidence")
@@ -3977,6 +3985,44 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("launched target is the REAL binary (headless Files PNG on /mnt)",
                   "pagh-desktop-demo" not in guest.serial() and evidence is not None,
                   "pagh-files headless output")
+
+    # ── separate: launch_targets spawn from the compositor hotkey ──
+    # NOT a substitute for the type-13 leg above: this proves the server-side
+    # registry/spawn_target path only (no PDP message, no requester). The
+    # evidence directory is cleared first so the two checks are independent.
+    # The requester may have survived the hotkey, in which case the shell still
+    # needs the terminal back before it can run `rm`.
+    off = mark()
+    if wait_new(off, [r"pagh:/> "], 2.0, "shell prompt after requester") is None:
+        h.qmp.keys(["ctrl", "z"])
+        h.qmp.release_modifiers()
+        if wait_new(off, [r"\^Z"], 20.0, "requester Ctrl+Z") is not None:
+            off = mark()
+            _desktop_restart_shell_line(kb)
+            kb.text("bg")
+            kb.key("ret")
+            wait_new(off, [r"bg: \[\d+\]"], 20.0, "bg requester")
+    _desktop_restart_shell_line(kb)
+    off = mark()
+    kb.text("rm -r /mnt/launch-evidence")
+    kb.key("ret")
+    wait_new(off, [r"/mnt/launch-evidence|rm:"], 10.0, "evidence dir removal")
+    time.sleep(0.3)
+    hotkey_off = mark()
+    h.qmp.keys(["ctrl", "alt", "t"])
+    h.qmp.release_modifiers()
+    time.sleep(8.0)
+    _desktop_restart_shell_line(kb)
+    off = mark()
+    kb.text("ls /mnt/launch-evidence")
+    kb.key("ret")
+    hotkey_evidence = wait_new(off, [r"[^\s/]+\.png"], 20.0,
+                               "compositor-hotkey evidence")
+    ok &= h.check("launch_targets spawn the configured target via the compositor "
+                  "hotkey (server-side registry, not PDP type 13)",
+                  hotkey_evidence is not None,
+                  regex_first(r"[^\r\n]*\.png[^\r\n]*", guest.serial()[off:]) or
+                  "no PNG written")
 
     text = guest.serial()
     crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE|SIGSEGV|Segmentation fault", text)
