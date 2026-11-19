@@ -5,6 +5,14 @@ name: release
 #   stable      vX.Y.Z       must be reachable from `main`  -> Release
 #   pre-release vX.Y.Z-rc.N  must be reachable from `dev` AND not from `main`
 #                            -> Pre-release (release-candidate lane only)
+#   demo        X.Y.Z-demo   NOT handled here on purpose: the guard below refuses the
+#                            `-demo` suffix, and a bare `X.Y.Z-demo` tag never matches the
+#                            `v*` trigger, so a demo release is published BY HAND — and it
+#                            MUST be created with `--prerelease` (never Latest; the rule is
+#                            in AGENTS.md, the checklist in RELEASING.md). If this guard
+#                            ever grows a `-demo` lane, extend the `prerelease:` expression
+#                            of the last step in the same change, or a demo tag would
+#                            silently publish as a full release.
 #
 # Anything else (`X.Y.Z`, `-pre.N`, a suffix after `-rc.N`, arbitrary spellings)
 # is refused by the format guard. Historical bare-numeric tags stay in the
