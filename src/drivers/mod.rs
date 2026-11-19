@@ -8,18 +8,27 @@ pub mod earlyfb;
 pub mod evdev;
 /// Чистый ABI `fbdev` (`struct fb_var/fix_screeninfo`), host-тестируемый.
 pub mod fb_abi;
+/// Чистая арифметика offscreen-поверхности (геометрия, разбиение по страницам),
+/// host-тестируемая.
+pub mod fb_surface;
 pub mod framebuffer;
 /// Чистый кодек `struct input_event` + set-1 → Linux keycodes, host-тестируемый.
 pub mod input_event;
 pub mod memdisk;
 pub mod nvme;
 pub mod nvme_prp;
+/// Пиксельная поверхность offscreen-сессии терминального окна.
+pub mod offscreen;
 pub mod partition;
 pub mod pci;
 pub mod ps2_kbd;
 pub mod ps2_mouse;
 pub mod scrollback;
 pub mod serial;
+/// Реестр консольных сессий: чья задача владеет каким экземпляром консоли.
+pub mod session;
+/// Чистая маршрутизация «задача → консольная сессия» (host-тестируемая).
+pub mod session_route;
 pub mod tty;
 pub mod usb_desc;
 pub mod usb_hid;

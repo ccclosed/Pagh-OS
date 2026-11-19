@@ -114,6 +114,15 @@ static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static CURRENT_PID: Spinlock<u64> = Spinlock::new(0);
 
+/// Зеркало текущего pid для путей, которым лок планировщика брать нельзя.
+///
+/// `current_pid()` берёт `Spinlock`, а маршрутизация консоли (`fb_print!`,
+/// `flush`, чтение скан-кода) зовётся из-под чужих спинлоков и из контекстов,
+/// где второй лок запрещён (нереентерабельность, инвариант 3). Зеркало
+/// обновляется ровно в одном месте — [`set_current_pid`], то есть на каждом
+/// переключении, — и читается атомарно.
+static CURRENT_PID_ATOMIC: AtomicU64 = AtomicU64::new(0);
+
 /// Pid'ы, запросившие выход, но ещё не снятые тиком.
 ///
 /// Планировщик хранит текущую задачу только как `CURRENT_PID` и пересобирает её
@@ -652,9 +661,19 @@ pub fn next_pid() -> u64 {
 }
 pub fn set_current_pid(pid: u64) {
     *CURRENT_PID.lock() = pid;
+    CURRENT_PID_ATOMIC.store(pid, Ordering::Relaxed);
 }
 pub fn current_pid() -> u64 {
     *CURRENT_PID.lock()
+}
+
+/// Текущий pid без взятия лока планировщика (см. [`CURRENT_PID_ATOMIC`]).
+///
+/// Читается путями маршрутизации консоли; значение обновляется на каждом
+/// переключении задачи, поэтому это тот же pid, что вернул бы [`current_pid`], —
+/// но без риска дедлока там, где лок уже держится (или держать его нельзя).
+pub fn current_pid_atomic() -> u64 {
+    CURRENT_PID_ATOMIC.load(Ordering::Relaxed)
 }
 
 /// Число задач, которые могут выполняться прямо сейчас: ready-очередь плюс

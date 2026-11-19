@@ -53,6 +53,15 @@ pub mod io;
 #[path = "../../src/arch/x86_64/linux/abi.rs"]
 pub mod abi;
 
+// Маршрут «задача → консольная сессия» и арифметика offscreen-поверхности:
+// чистые (`core`-only) половины второй shell-сессии терминального окна. Ядро
+// компилирует ровно эти файлы, host-тесты исполняют их же.
+#[path = "../../src/drivers/session_route.rs"]
+pub mod session_route;
+
+#[path = "../../src/drivers/fb_surface.rs"]
+pub mod fb_surface;
+
 // Ancillary data (`cmsg`) AF_UNIX SCM_RIGHTS: разметка msghdr/cmsghdr,
 // разбор control-буфера отправки и план доставки fd на приёме. Модуль
 // `core`+`alloc`-only, поэтому host-свойства исполняют ровно тот исходник,
@@ -839,6 +848,12 @@ mod properties {
     // that `PROT_NONE`/out-of-region stay refused. The end-to-end half is the
     // in-QEMU `userbuf::lazy_anon_read_write` routine.
     mod user_buffer_paging;
+
+    // Терминальная kernel-сессия (desktop-вариант B, второй shell): маршрут
+    // «задача → консоль» (владелец окна сильнее привязки compat-ребёнка) и
+    // арифметика offscreen-поверхности (шаг/размер/страницы, кусок никогда не
+    // пересекает границу кадра PMM). `p65` — AF_UNIX delivery, поэтому это `p66`.
+    mod p66;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

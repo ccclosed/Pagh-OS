@@ -10743,11 +10743,148 @@ mod desktop_b_tests {
     }
 }
 
+// ============================================================================
+// Терминальная kernel-сессия (desktop-вариант B, второй shell): in-QEMU половина.
+// ============================================================================
+//
+// Чистые половины (маршрут «задача → консоль» и арифметика offscreen-поверхности)
+// проверяются host-свойством P66. Здесь — то, что требует настоящего ядра:
+// писатель сессии действительно рисует в **свои** кадры PMM, `fb_print!`
+// маршрутизируется по задаче, а boot-консоль при этом не меняется.
+//
+// NON-DESTRUCTIVE: рутина временно делает текущую задачу владельцем сессии 1,
+// поднимает её offscreen-писателя, проверяет пиксели/поколение/маршрут и
+// возвращает всё назад: писатель погашен, поверхность освобождена (кадры
+// возвращаются в PMM — иначе `selftest 2` увидел бы расходящийся ledger),
+// владелец сброшен. Boot-писатель не трогается вообще.
+mod terminal_session_tests {
+    use crate::drivers::{framebuffer, offscreen, session, session_route};
+    use crate::task::scheduler;
+
+    /// Снять текстовую сетку конкретного писателя (не текущей задачи).
+    fn snapshot(writer: &framebuffer::FbWriter) -> Option<alloc::vec::Vec<(u8, u32, u32)>> {
+        writer.with(|w| w.text_snapshot()).map(|s| s.cells)
+    }
+
+    /// Этап 1: offscreen-экземпляр консоли + маршрутизация по задаче.
+    pub fn offscreen_console_and_routing() {
+        let pid = scheduler::current_pid();
+        assert_eq_kernel!(
+            session::current(),
+            session_route::BOOT_SESSION,
+            "task is in the boot session before the test"
+        );
+
+        // Boot-экземпляр — тот же писатель, что и до появления сессий: он готов и
+        // его текстовая модель не должна измениться от работы сессии.
+        let (boot_w, boot_h) = framebuffer::writer_for(0).dimensions();
+        let boot_cells = snapshot(framebuffer::writer_for(0));
+
+        // Сделать ТЕКУЩУЮ задачу владельцем сессии 1: маршрут обязан переехать.
+        session::set_owner(1, pid);
+        assert_eq_kernel!(session::current(), 1, "owner pid routes to its session");
+        assert_kernel!(session::live(1), "session 1 is live once it has an owner");
+
+        // Никаких `assert!`: panic=abort убил бы машину, а набор обязан печатать
+        // FAIL и продолжать (`assert_kernel!`). Если поверхность не поднялась
+        // (например, PMM пуст), дальнейшие проверки бессмысленны, но cleanup ниже
+        // всё равно выполняется.
+        let up = framebuffer::init_session(1);
+        assert_kernel!(up, "offscreen console initializes (PMM has frames)");
+        assert_kernel!(
+            up && framebuffer::writer_for(1).is_ready(),
+            "session writer is ready"
+        );
+
+        // Окно имеет размер экрана по контракту vtfb1; маршрутизированный
+        // `dimensions()` теперь отвечает геометрией сессии.
+        assert_eq_kernel!(
+            framebuffer::dimensions(),
+            (boot_w, boot_h),
+            "session console has the same geometry as boot"
+        );
+
+        // Пиксель: заливка прямоугольника уходит в кадры поверхности, а не в
+        // shadow-буфер boot-консоли. Цвет BGR в памяти (XRGB little-endian).
+        let generation_before = offscreen::generation(1);
+        framebuffer::with(|fb| fb.fill_rect(0, 0, 8, 8, 0x0012_3456));
+        framebuffer::flush();
+        let generation_after = offscreen::generation(1);
+        assert!(
+            generation_after > generation_before,
+            "a session flush bumps the surface generation"
+        );
+        let mut px = [0u8; 3];
+        assert_eq_kernel!(
+            offscreen::read_at(1, 0, &mut px),
+            3,
+            "pixel readback from the session surface"
+        );
+        assert_eq_kernel!(
+            px,
+            [0x56, 0x34, 0x12],
+            "surface holds XRGB red=0x12 green=0x34 blue=0x56"
+        );
+
+        // Текст через `fb_print!` маршрутизируется в сессию: её сетка получает
+        // символ, boot-сетка остаётся байт-в-байт прежней.
+        crate::fb_print!("S");
+        let session_cells = snapshot(framebuffer::writer_for(1)).expect("session snapshot");
+        assert_eq_kernel!(
+            session_cells.first().map(|c| c.0),
+            Some(b'S'),
+            "fb_print! wrote into the session console"
+        );
+        assert_eq_kernel!(
+            snapshot(framebuffer::writer_for(0)),
+            boot_cells,
+            "the boot console model is untouched by session output"
+        );
+
+        // Погасить сессию: писатель снят, кадры возвращены в PMM, владелец сброшен.
+        framebuffer::reset_session(1);
+        assert!(
+            !framebuffer::writer_for(1).is_ready(),
+            "session writer is gone"
+        );
+        session::reset(1);
+        offscreen::free(1);
+        assert_eq_kernel!(
+            session::current(),
+            session_route::BOOT_SESSION,
+            "routing returns to the boot session"
+        );
+        // Boot-консоль после всего этого — прежняя (размер и модель).
+        assert_eq_kernel!(
+            framebuffer::writer_for(0).dimensions(),
+            (boot_w, boot_h),
+            "boot console still reports its geometry"
+        );
+        assert_eq_kernel!(
+            snapshot(framebuffer::writer_for(0)),
+            boot_cells,
+            "boot console exits the test unchanged"
+        );
+    }
+}
+
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
         (
             "linux::tick-delivered signal plan (issue #12)",
             linux_tick_tests::tick_delivery_plan
+        ),
+        // Идёт РАНО намеренно: поднимает offscreen-писателя сессии (~1000 кадров
+        // PMM + shadow-буфер в куче). К концу набора PMM бывает вычерпан (это
+        // названо в комментарии выше про `kernel_thread_spawn`), поэтому
+        // размещение в конце сделало бы OOM паникой вместо проверки.
+        //
+        // Терминальная kernel-сессия (desktop-вариант B): offscreen-экземпляр
+        // консоли рисует в свои кадры PMM, `fb_print!`/`with`/`flush`
+        // маршрутизируются по задаче, а boot-консоль остаётся неизменной.
+        (
+            "terminal-session::offscreen console + per-task routing",
+            terminal_session_tests::offscreen_console_and_routing
         ),
         // Runs FIRST, not last: it spawns two kernel threads (2 x 64 stack frames)
         // via `kernel_thread_spawn`, which panics on PMM exhaustion, and the rest
