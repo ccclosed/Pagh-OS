@@ -2,19 +2,38 @@
 //!
 //! Modes:
 //!
+//! * `--socket PATH` (default windowed mode): attach to the **kernel shell
+//!   session** — blit `/dev/vtfb1` pixels into the window and forward keys to
+//!   `/dev/vtinput1`.  The kernel owns the shell: commands, echo, line editing
+//!   and scrollback are its, the client only renders and forwards input.
 //! * `--headless` (default without a socket): parse a script or built-in demo,
 //!   print the text and/or write a PNG.
-//! * `--socket PATH`: connect to the desktop compositor, create a window,
-//!   upload frames and process input events.
-//! * `--vt PATH`: read snapshots from the proposed kernel VT console shared
-//!   surface and send input to `/dev/vtinput` (ABI v1, see TERMINAL.md).
+//! * `--vt PATH`: read snapshots from the kernel VT console shared text surface
+//!   and send input to `/dev/vtinput` (ABI v1, see TERMINAL.md).  With
+//!   `--socket` this is the legacy window paths: `--mirror-vt` mirrors the boot
+//!   VT, otherwise the private userspace shell session starts.
+//! * `--pipe-shell` / `--demo-shell`: explicit test/fallback window modes (the
+//!   private userspace shell over pipes, and the built-in demo shell).
+//!
+//! The mmap/ioctl glue for the kernel-session devices lives in the `devfs`
+//! submodule: the library crate forbids `unsafe`, so every unsafe call sits here.
+
+// Explicit path: cargo auto-discovers every `*.rs` directly under `src/bin/` as
+// a binary target, so the module lives in the `pagh-terminal/` subdirectory and
+// is named here instead of being a second (empty) bin.
+#[path = "pagh-terminal/devfs.rs"]
+mod devfs;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use pagh_terminal::client::{close_name, error_name, Event, SurfaceClient};
+use pagh_terminal::client::{close_name, error_name, Event, ShmFrame, SurfaceClient};
 use pagh_terminal::demo::{self, DemoShell};
+use pagh_terminal::kernelsession::{
+    is_missing_device, is_session_end, render_notice, Draw, FileInput, KernelFrame, KeyForwarder,
+    VtFbError,
+};
 use pagh_terminal::keys::{self, KeyModes};
 use pagh_terminal::protocol::{buttons, InputEvent};
 use pagh_terminal::render::{
@@ -28,12 +47,28 @@ use pagh_terminal::Terminal;
 
 const VERSION: &str = "0.1.0";
 
+/// Kernel shell-session pixel surface (mode default).
+const KERNEL_FB: &str = "/dev/vtfb1";
+/// Kernel shell-session input device.
+const KERNEL_INPUT: &str = "/dev/vtinput1";
+/// Boot VT text surface (legacy `--vt`/`--mirror-vt`).
+const MIRROR_VT: &str = "/dev/vtconsole0";
+/// Boot VT input device (legacy mirror).
+const MIRROR_INPUT: &str = "/dev/vtinput";
+/// Сколько держать в окне честное сообщение «сессия завершена/ошибка» перед
+/// закрытием окна.
+const NOTICE_HOLD: Duration = Duration::from_millis(1500);
+
 #[derive(Debug)]
 struct Args {
     headless: bool,
     socket: Option<String>,
     vt: Option<String>,
-    vt_input: String,
+    /// Input device override; per-mode default (`/dev/vtinput` for the boot-VT
+    /// mirror, `/dev/vtinput1` for the kernel session) when absent.
+    vt_input: Option<String>,
+    /// Pixel surface of the kernel shell session (default `/dev/vtfb1`).
+    vt_fb: String,
     size: (u32, u32),
     cols: Option<usize>,
     rows: Option<usize>,
@@ -57,8 +92,13 @@ struct Args {
     /// `--shell-child` mode). Used to drive a real shell once one exists.
     shell_cmd: Option<PathBuf>,
     /// Keep the old windowed behaviour: mirror the kernel boot VT instead of
-    /// starting a private shell session.
+    /// attaching to the kernel shell session.
     mirror_vt: bool,
+    /// Explicit window mode: the private userspace shell over two pipes
+    /// (fallback/test path of the kernel-session mode).
+    pipe_shell: bool,
+    /// Explicit window mode: the built-in demo shell (screenshots, `--feed`).
+    demo_shell: bool,
     help: bool,
     version: bool,
 }
@@ -69,7 +109,8 @@ impl Default for Args {
             headless: false,
             socket: None,
             vt: None,
-            vt_input: "/dev/vtinput".to_string(),
+            vt_input: None,
+            vt_fb: KERNEL_FB.to_string(),
             size: (900, 600),
             cols: None,
             rows: None,
@@ -93,9 +134,23 @@ impl Default for Args {
             shell_child: false,
             shell_cmd: None,
             mirror_vt: false,
+            pipe_shell: false,
+            demo_shell: false,
             help: false,
             version: false,
         }
+    }
+}
+
+impl Args {
+    /// Where the boot-VT mirror writes VT input bytes.
+    fn mirror_input(&self) -> &str {
+        self.vt_input.as_deref().unwrap_or(MIRROR_INPUT)
+    }
+
+    /// Where the kernel-session mode writes VT input bytes.
+    fn kernel_input(&self) -> &str {
+        self.vt_input.as_deref().unwrap_or(KERNEL_INPUT)
     }
 }
 
@@ -133,8 +188,28 @@ fn run() -> Result<(), String> {
     if let Some(vt) = &args.vt {
         return run_vt(&args, vt);
     }
-    if let Some(socket) = &args.socket {
+    // `--mirror-vt` without an explicit `--vt` path means the boot VT console.
+    if args.mirror_vt {
+        return run_vt(&args, MIRROR_VT);
+    }
+    // Explicit non-default window modes (tests, screenshots, A/B comparison).
+    if args.demo_shell || args.feed.is_some() {
+        let socket = args
+            .socket
+            .as_deref()
+            .ok_or("--demo-shell/--feed require --socket")?;
         return run_client(&args, socket);
+    }
+    if args.pipe_shell {
+        let socket = args
+            .socket
+            .as_deref()
+            .ok_or("--pipe-shell requires --socket")?;
+        return run_shell_session(&args, socket);
+    }
+    if let Some(socket) = &args.socket {
+        // Default windowed mode: attach to the kernel shell session.
+        return run_kernel_session(&args, socket);
     }
     run_headless(&args)
 }
@@ -565,10 +640,13 @@ fn run_vt(args: &Args, path: &str) -> Result<(), String> {
                     let bytes = keys::encode_key(code, pressed, modifiers, &modes);
                     if !bytes.is_empty() {
                         if let Err(error) =
-                            pagh_terminal::vtconsole::send_input(&args.vt_input, &bytes)
+                            pagh_terminal::vtconsole::send_input(args.mirror_input(), &bytes)
                         {
                             if !input_error_reported {
-                                eprintln!("pagh-terminal: cannot write {}: {error}", args.vt_input);
+                                eprintln!(
+                                    "pagh-terminal: cannot write {}: {error}",
+                                    args.mirror_input()
+                                );
                                 input_error_reported = true;
                             }
                         }
@@ -889,6 +967,383 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
     }
 }
 
+/// Оконный режим по умолчанию: сессия ядра (`/dev/vtfb1` + `/dev/vtinput1`).
+///
+/// Ядро владеет shell'ем целиком — командами, эхом, редактированием строки,
+/// history и scrollback'ом; клиент блитит пиксели его поверхности и передаёт
+/// клавиатуру VT-байтами.  Ни одна команда здесь не имитируется: если
+/// устройство не отвечает, окно говорит об этом прямо.
+///
+/// Поведение при отказе:
+///
+/// * `/dev/vtfb1` (или `/dev/vtinput1`) отсутствует — старое ядро: честная
+///   строка в stderr и откат на прежнюю pipe-сессию с userspace-shell'ом;
+/// * устройство есть, но ioctl/mmap/read/write не работают — честное сообщение
+///   **в окне** и выход с кодом 2, без отката в демо;
+/// * `exit` в сессии (`ENODEV`): сообщение «сессия завершена», окно закрывается.
+///   Реконнект — повторный запуск окна: первый `open` спавнит новую сессию.
+fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
+    let fb_path = args.vt_fb.as_str();
+    let input_path = args.kernel_input();
+
+    let source = match devfs::open_frame_source(fb_path) {
+        Ok(source) => source,
+        Err(devfs::OpenError::Missing) => {
+            eprintln!(
+                "pagh-terminal: {fb_path} is not present (kernel without the shell-session \
+                 surface); falling back to the private userspace shell session"
+            );
+            return run_shell_session(args, socket);
+        }
+        Err(devfs::OpenError::Failed(reason)) => return fail_with_notice(args, socket, &reason),
+    };
+    let key_sink = match FileInput::open(input_path) {
+        Ok(sink) => sink,
+        Err(error) if is_missing_device(&error) => {
+            eprintln!(
+                "pagh-terminal: {input_path} is not present (kernel without the shell-session \
+                 input); falling back to the private userspace shell session"
+            );
+            return run_shell_session(args, socket);
+        }
+        Err(error) => return fail_with_notice(args, socket, &format!("{input_path}: {error}")),
+    };
+    let mut frame = match KernelFrame::open(source) {
+        Ok(frame) => frame,
+        Err(error) => return fail_with_notice(args, socket, &error.message()),
+    };
+    let info = frame.info();
+    eprintln!(
+        "pagh-terminal: kernel session {}x{} (stride {}, generation {}) on {fb_path}",
+        info.width, info.height, info.stride, info.generation
+    );
+
+    let mut client = SurfaceClient::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
+    let welcome = client
+        .handshake("pagh-terminal", Duration::from_secs(5))
+        .map_err(|e| format!("handshake: {e}"))?;
+    eprintln!(
+        "pagh-terminal: kernel session connected (client {}, screen {}x{})",
+        welcome.client_id, welcome.screen_width, welcome.screen_height
+    );
+    client
+        .create_window(args.window_id, args.size.0, args.size.1, &args.title)
+        .map_err(|e| format!("create_window: {e}"))?;
+    // Ядро игнорирует SO_RCVTIMEO (см. TERMINAL.md), поэтому окно обязано
+    // опрашивать сокет неблокирующе и само возвращаться к кадру поверхности.
+    client
+        .set_nonblocking(true)
+        .map_err(|e| format!("nonblocking: {e}"))?;
+
+    let theme = Theme::default();
+    let mut width = args.size.0.max(64);
+    let mut height = args.size.1.max(32);
+    // ShmSurface: блит пишется прямо в общий mmap, по сокету идут только
+    // damage-прямоугольники. Для пиксельной поверхности сессии это не
+    // оптимизация, а разница между «окно оживает» и «3 МиБ на кадр в QEMU-TCG».
+    let mut shm = match client.enable_shm(width, height) {
+        Ok(shm) => shm,
+        Err(error) => {
+            eprintln!("pagh-terminal: shm unavailable ({error}); full frames");
+            None
+        }
+    };
+    let mut fallback: Option<Canvas> = if shm.is_none() {
+        Some(Canvas::new(width as usize, height as usize, theme.bg))
+    } else {
+        None
+    };
+    let mut tracker = pagh_ui::damage::DamageTracker::new(
+        pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32),
+        pagh_ui::damage::DEFAULT_TILE,
+    );
+    let mut forwarder = KeyForwarder::new(key_sink);
+    let mut dirty = true;
+    let mut last_commit = Instant::now();
+    let mut input_error_reported = false;
+    let trace = std::env::var_os("PAGH_TERMINAL_KERNEL_TRACE").is_some();
+
+    loop {
+        // 1. Кадр сессии: перерисовываем окно только когда ядро опубликовало
+        //    новый generation — иначе простой не жжёт CPU на блит.
+        {
+            let canvas = canvas_mut(&mut shm, &mut fallback);
+            match frame.draw_if_changed(canvas, &theme) {
+                Ok(Draw::Drawn { generation }) => {
+                    if trace {
+                        eprintln!("pagh-terminal: kernel frame generation {generation}");
+                    }
+                    dirty = true;
+                }
+                Ok(Draw::Unchanged) => {}
+                Err(VtFbError::Ended) => {
+                    return end_kernel_session(
+                        &mut client,
+                        &mut shm,
+                        &theme,
+                        width,
+                        height,
+                        ENDED_NOTICE,
+                    );
+                }
+                Err(error) => {
+                    let message = error.message();
+                    let lines = [
+                        "[kernel session] the device failed; nothing is simulated instead",
+                        "",
+                        message.as_str(),
+                        "",
+                        "Close this window and relaunch pagh-terminal to retry.",
+                    ];
+                    let _ =
+                        end_kernel_session(&mut client, &mut shm, &theme, width, height, &lines);
+                    return Err(message);
+                }
+            }
+        }
+
+        // 2. Отправка кадра — не чаще 60 Гц: полный кадр на каждое изменение
+        //    generation не оставляет времени на чтение ввода.
+        if dirty && last_commit.elapsed() >= Duration::from_millis(16) {
+            // `retry_full`: кадр не ушёл, нужен полный блит в новый холст.
+            let mut retry_full = false;
+            if let Some(shm_frame) = shm.as_mut() {
+                let damage = tracker.update(&shm_frame.canvas);
+                match client.commit_shm(shm_frame, damage) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        // Поколение поверхности устарело (композитор пересоздал
+                        // memfd): дальше — полный кадр, как legacy-клиент.
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                        // Новый холст — нужен полный блит, даже если generation
+                        // поверхности не менялась.
+                        retry_full = true;
+                    }
+                    Err(error) => return Err(format!("commit_shm: {error}")),
+                }
+            } else if let Some(canvas) = fallback.as_mut() {
+                commit_blocking(&mut client, canvas)?;
+            }
+            if retry_full {
+                frame.invalidate();
+            }
+            dirty = retry_full;
+            last_commit = Instant::now();
+        }
+
+        // 3. События окна. Клавиши → VT-байты в `/dev/vtinput1`; колесо и
+        //    протяжка не транслируются: scrollback и selection живут в ядре.
+        //    Нулевой дедлайн: ядро игнорирует SO_RCVTIMEO, поэтому «чтение с
+        //    таймаутом» на блокирующем сокете означало бы вечное ожидание, а
+        //    окно обязано возвращаться к кадру поверхности.
+        for event in client
+            .poll_events(Duration::ZERO)
+            .map_err(|e| format!("poll: {e}"))?
+        {
+            match event {
+                Event::Configure(configure) => {
+                    width = configure.width.max(64);
+                    height = configure.height.max(32);
+                    let same_size = shm.as_ref().is_some_and(|frame| {
+                        frame.canvas.width == width as usize
+                            && frame.canvas.height == height as usize
+                    });
+                    if same_size {
+                        frame.invalidate();
+                        dirty = true;
+                        continue;
+                    }
+                    let resized = match shm.as_mut() {
+                        Some(frame) => client.resize_shm(frame, width, height).unwrap_or(false),
+                        None => false,
+                    };
+                    if resized {
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                    } else {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                    }
+                    // Масштаб под новый content rect меняется — полный блит.
+                    frame.invalidate();
+                    dirty = true;
+                }
+                Event::ShmRelease {
+                    window_id,
+                    generation,
+                } => {
+                    if window_id == args.window_id
+                        && shm
+                            .as_ref()
+                            .is_some_and(|frame| frame.generation == generation)
+                    {
+                        if let Some(stale) = shm.take() {
+                            let _ = client.release_shm(&stale);
+                        }
+                        fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                        frame.invalidate();
+                        dirty = true;
+                    }
+                }
+                Event::ShmReady { .. } => {}
+                Event::Input(InputEvent::Key {
+                    code,
+                    pressed,
+                    modifiers,
+                }) => match forwarder.handle_key(code, pressed, modifiers) {
+                    Ok(_) => {}
+                    Err(error) if is_session_end(&error) => {
+                        // Сессия закончилась между кадром и нажатием: следующий
+                        // опрос поверхности вернёт ENODEV и закроет окно честно.
+                        if !input_error_reported {
+                            eprintln!(
+                                "pagh-terminal: session ended while forwarding a key ({error})"
+                            );
+                            input_error_reported = true;
+                        }
+                    }
+                    Err(error) => {
+                        if !input_error_reported {
+                            eprintln!("pagh-terminal: cannot write {input_path}: {error}");
+                            input_error_reported = true;
+                        }
+                    }
+                },
+                Event::Focus { .. } => {
+                    // Курсор рисует ядро в пикселях: подсветка фокуса здесь не наша.
+                }
+                Event::Input(InputEvent::Axis { .. }) | Event::Input(InputEvent::Button { .. }) => {
+                    // Скроллбек и selection принадлежат сессии ядра; у окна нет
+                    // доступа к её сетке, поэтому событие честно игнорируется.
+                }
+                Event::Input(InputEvent::Motion { .. }) => {}
+                Event::Close { reason, .. } => {
+                    eprintln!(
+                        "pagh-terminal: server closed the window ({})",
+                        close_name(reason)
+                    );
+                    return Ok(());
+                }
+                Event::Error { code, message } => {
+                    eprintln!(
+                        "pagh-terminal: server error {} ({}): {}",
+                        error_name(code),
+                        code,
+                        message
+                    );
+                }
+                Event::Ping(_) | Event::Pong(_) => {}
+            }
+        }
+
+        // Простой: не крутим CPU, но и не спим дольше одного кадра. Сессия
+        // ядра флашит generation на каждую операцию shell'а, поэтому 6 мс —
+        // это ≤ ~160 проверок ioctl/с, дешевле любой перерисовки.
+        std::thread::sleep(Duration::from_millis(6));
+    }
+}
+
+/// Что показать в окне, когда `exit` в сессии ядра завершил её (`ENODEV`).
+const ENDED_NOTICE: &[&str] = &[
+    "[kernel session] the shell session has ended.",
+    "",
+    "The kernel starts a fresh session on the next open, so relaunch",
+    "pagh-terminal to reconnect. Nothing is simulated in the meantime.",
+];
+
+/// Получить текущий холст окна (общий mmap или локальный fallback).
+fn canvas_mut<'a>(
+    shm: &'a mut Option<ShmFrame>,
+    fallback: &'a mut Option<Canvas>,
+) -> &'a mut Canvas {
+    match shm.as_mut() {
+        Some(frame) => &mut frame.canvas,
+        None => fallback
+            .as_mut()
+            .expect("fallback canvas exists whenever shm is absent"),
+    }
+}
+
+/// Финальный кадр с честным сообщением: отдать его окну и закрыть клиент.
+///
+/// ShmSurface отпускается, кадр уходит полным `commit` — сообщение должно
+/// дойти даже если memfd уже невалиден.
+fn end_kernel_session(
+    client: &mut SurfaceClient,
+    shm: &mut Option<ShmFrame>,
+    theme: &Theme,
+    width: u32,
+    height: u32,
+    lines: &[&str],
+) -> Result<(), String> {
+    show_notice(client, shm, theme, width, height, lines)?;
+    let _ = client.close();
+    eprintln!("pagh-terminal: kernel session ended (the shell exited); window closed");
+    Ok(())
+}
+
+/// Нарисовать сообщение клиента в окне и подержать его `NOTICE_HOLD`.
+fn show_notice(
+    client: &mut SurfaceClient,
+    shm: &mut Option<ShmFrame>,
+    theme: &Theme,
+    width: u32,
+    height: u32,
+    lines: &[&str],
+) -> Result<(), String> {
+    if let Some(stale) = shm.take() {
+        let _ = client.release_shm(&stale);
+    }
+    let mut canvas = Canvas::new(width.max(64) as usize, height.max(32) as usize, theme.bg);
+    render_notice(&mut canvas, theme, lines);
+    commit_blocking(client, &canvas)?;
+    std::thread::sleep(NOTICE_HOLD);
+    Ok(())
+}
+
+/// Устройство есть, но работать с ним нельзя: честное сообщение в окне.
+///
+/// Окно создаётся только чтобы сказать правду (запуск из шелла без дисплея
+/// просто получит ошибку в stderr). Никакого отката в демо-шелл: пользователь
+/// должен видеть, что сессии ядра нет.
+fn fail_with_notice(args: &Args, socket: &str, reason: &str) -> Result<(), String> {
+    eprintln!("pagh-terminal: kernel session unavailable: {reason}");
+    let mut client = SurfaceClient::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
+    client
+        .handshake("pagh-terminal", Duration::from_secs(5))
+        .map_err(|e| format!("handshake: {e}"))?;
+    client
+        .create_window(args.window_id, args.size.0, args.size.1, &args.title)
+        .map_err(|e| format!("create_window: {e}"))?;
+    let theme = Theme::default();
+    let lines = [
+        "[kernel session] the kernel shell-session devices are not usable",
+        "",
+        reason,
+        "",
+        "The window renders the kernel's shell session over",
+        "/dev/vtfb1 + /dev/vtinput1; it does not simulate commands.",
+    ];
+    let mut no_shm = None;
+    show_notice(
+        &mut client,
+        &mut no_shm,
+        &theme,
+        args.size.0,
+        args.size.1,
+        &lines,
+    )?;
+    let _ = client.close();
+    Err(reason.to_string())
+}
+
 fn render_frame(screen: &pagh_terminal::Screen, theme: &Theme, width: u32, height: u32) -> Canvas {
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
@@ -936,7 +1391,8 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             "--headless" => out.headless = true,
             "--socket" => out.socket = Some(next_value(&mut args, "--socket")?),
             "--vt" => out.vt = Some(next_value(&mut args, "--vt")?),
-            "--vt-input" => out.vt_input = next_value(&mut args, "--vt-input")?,
+            "--vt-input" => out.vt_input = Some(next_value(&mut args, "--vt-input")?),
+            "--vt-fb" => out.vt_fb = next_value(&mut args, "--vt-fb")?,
             "--size" => out.size = parse_size(&next_value(&mut args, "--size")?)?,
             "--cols" => out.cols = Some(parse_usize(&next_value(&mut args, "--cols")?)?),
             "--rows" => out.rows = Some(parse_usize(&next_value(&mut args, "--rows")?)?),
@@ -962,6 +1418,8 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                 out.shell_cmd = Some(PathBuf::from(next_value(&mut args, "--shell-cmd")?))
             }
             "--mirror-vt" => out.mirror_vt = true,
+            "--pipe-shell" => out.pipe_shell = true,
+            "--demo-shell" => out.demo_shell = true,
             "--help" | "-h" => out.help = true,
             "--version" | "-V" => out.version = true,
             other => return Err(format!("unknown argument {other:?}; try --help")),
@@ -1022,10 +1480,24 @@ USAGE:
   pagh-terminal --headless [--demo NAME|--script FILE] [--cols N --rows N]
                 [--out FILE.png] [--print|--print-full] [--window|--no-window]
                 [--scroll N] [--select R1,C1:R2,C2] [--dump-selection]
-  pagh-terminal --socket PATH [--size WxH] [--title TITLE] [--feed FILE]
+  pagh-terminal --socket PATH [--size WxH] [--title TITLE]
+                [--vt-fb /dev/vtfb1] [--vt-input /dev/vtinput1]
   pagh-terminal --vt /dev/vtconsole0 [--socket PATH] [--vt-input /dev/vtinput]
                 [--mirror-vt]
   pagh-terminal --screenshots DIR
+
+WINDOW (default with --socket): KERNEL SHELL SESSION
+  The window attaches to the kernel's own shell session: it blits the pixels of
+  /dev/vtfb1 into the window and forwards window keys as VT bytes to
+  /dev/vtinput1.  Commands (df, ps, ppkg, lxrun, disk, nano, history, line
+  editing, scrollback) are the kernel's — the client renders and forwards input
+  only, and simulates nothing.
+  --vt-fb PATH      session pixel surface (default /dev/vtfb1)
+  --vt-input PATH   session input device (default /dev/vtinput1)
+  If the devices are missing (kernel without the session surface) the window
+  says so on stderr and falls back to the private userspace shell session.  If
+  the devices exist but fail, the window shows the honest error and exits; it
+  never pretends to be a shell.
 
 HEADLESS:
   --demo NAME      01-welcome, 02-colors, 03-scrollback, 04-unicode
@@ -1038,17 +1510,28 @@ HEADLESS:
 LIVE:
   --socket PATH    AF_UNIX control socket of pagh-desktop
   --size WxH       initial window content size (default 900x600)
-  --feed FILE      preload terminal output into the demo shell
   --window-id N    client-chosen window id (default 101)
-  --vt PATH        kernel VT shared surface (ABI v1): with --socket the window
-                   now starts its own shell session; without --socket this
-                   prints a snapshot (diagnostics)
-  --vt-input PATH  where the VT mirror writes input bytes (default /dev/vtinput)
-  --mirror-vt      keep mirroring the boot VT in the window instead of starting
-                   the session (diagnostics; the boot VT is held by lxrun)
+  --feed FILE      preload terminal output into the demo shell
+  --demo-shell     explicit demo-shell window (screenshots, A/B comparison)
+  --pipe-shell     explicit userspace shell over two pipes (fallback/test mode;
+                   minimal built-in commands, not the kernel shell)
+  --vt PATH        kernel VT console shared surface (ABI v1): with --socket the
+                   window mirrors the boot VT; without --socket it prints one
+                   snapshot (diagnostics)
+  --vt-input PATH  input device override for --vt/--mirror-vt (default
+                   /dev/vtinput) and for the kernel session (default
+                   /dev/vtinput1)
+  --mirror-vt      mirror the boot VT in the window (diagnostics; the boot VT is
+                   held by lxrun).  Without --vt the path defaults to
+                   /dev/vtconsole0
   --shell-child    internal: run as the session's shell process (pipes)
   --shell-cmd PATH child program for the session (default: this binary with
                    --shell-child; use a real shell when the image has one)
+
+NOT IN THIS STAGE (honest gaps): no PTY/termios, no TIOCGWINSZ/SIGWINCH (the
+kernel owns the shell size), no terminal job control, and the pixel surface
+carries no DEC private modes — arrow keys are always sent in normal mode.  One
+kernel session per window; scrollback and selection stay in the kernel.
 
 SCREENSHOTS:
   --screenshots DIR  regenerate the committed demo PNG fixtures
