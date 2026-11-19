@@ -3900,7 +3900,8 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("REAL pagh-terminal connected as a second PDP/1 window "
                   "(/dev/vtconsole0 + /dev/vtinput)",
                   term_win is not None,
-                  regex_first(r"pagh-terminal: connected[^\r\n]*", guest.serial()) or
+                  regex_first(r"pagh-terminal: (?:session )?connected[^\r\n]*",
+                              guest.serial()) or
                   "no connected line")
     vt_error = re.search(r"pagh-terminal: PGVT I/O error: ([^\r\n]+)", guest.serial())
     if vt_error:
@@ -4008,9 +4009,13 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
                   evidence,
                   "PNG written" if evidence else "no PNG after 90 s of polling")
+    # `_wait_launch_png` returns a bool, so `is not None` was always true and the
+    # check passed vacuously when no PNG appeared at all. Require the evidence
+    # itself: a launch that produced nothing must FAIL here too.
     ok &= h.check("launched target is the REAL binary (headless Files PNG on /mnt)",
-                  "pagh-desktop-demo" not in guest.serial() and evidence is not None,
-                  "pagh-files headless output")
+                  "pagh-desktop-demo" not in guest.serial() and evidence is True,
+                  "pagh-files headless output" if evidence
+                  else "no PNG: launch produced no evidence")
 
     # ── separate: launch_targets spawn from the compositor hotkey ──
     # NOT a substitute for the type-13 leg above: this proves the server-side
