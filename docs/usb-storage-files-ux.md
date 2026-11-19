@@ -151,7 +151,7 @@ raw-узлы как future (`§10`, G15/G16).
 | [UDisks2 `Filesystem.Mount`](https://storaged.org/doc/udisks2-api/latest/gdbus-org.freedesktop.UDisks2.Filesystem.html) | `mount_path` — подкаталог `/run/media/$USER`; mount возвращает путь; mount/unmount — отдельные операции с результатом. Наш `/usb0p1` — тот же контракт «операция возвращает точку» | D-Bus/поликит |
 | [UDisks2 через udisks-обёртку](https://pub.dev/documentation/udisks/latest/udisks/UDisksClient-class.html) | Модель «список + поток добавлений/удалений + отдельные стримы на каждое устройство» — соответствует `devices` snapshot + `device_result` | Реализация |
 | [USB in a Nutshell](https://www.beyondlogic.org/usbnutshell/usb1.shtml) | VID/PID выбирает драйвер; manufacturer/product — из дескрипторов; hotplug штатен | Электрофизика |
-| [Ventoy: disk layout](https://www.ventoy.net/en/doc_disk_layout.html) | Первый раздел по умолчанию exFAT, с 1.0.11 его можно переформатировать в exFAT/FAT32/NTFS/UDF/XFS/**Ext2/3/4**; второй — VTOYEFI (FAT). Отсюда реальная проверка на железе (решение lead): exFAT-раздел Pagh не монтирует, ext2-раздел — «чужой» (`fs_class=2`); оба видны, mount disabled, read/write на них не заявляется (`§8.3`) | Ничего из кода Ventoy |
+| [Ventoy: disk layout](https://www.ventoy.net/en/doc_disk_layout.html) | Первый раздел по умолчанию exFAT, с 1.0.11 его можно переформатировать в exFAT/FAT32/NTFS/UDF/XFS/**Ext2/3/4**; второй — VTOYEFI (FAT); с 1.0.14 можно зарезервировать место под Part3/Part4. Отсюда реальная проверка на железе (решение lead): exFAT-раздел Pagh не монтирует, ext2-раздел — «чужой» (`fs_class=2`); оба видны, mount disabled, read/write на них не заявляется; Pagh-том для read/write — отдельная флешка или Part3/Part4 из reserved space (`§8.3`) | Ничего из кода Ventoy |
 
 ---
 
@@ -693,7 +693,8 @@ vendor/product/ёмкость соответствуют дескриптора�
 строку убирает физическое отключение. Несмонтированное foreign-устройство
 **остаётся видимым** в Files.
 
-**Что проверяется на томе Pagh:** вторая флешка (или reserved-раздел Ventoy),
+**Что проверяется на томе Pagh:** вторая флешка или Part3/Part4 из reserved
+space Ventoy (с 1.0.14; создаётся пользователем в свободном месте),
 отформатированная самой Pagh при первой загрузке → `fs_class=1`, авто-mount в
 `/usb0p1`, реальный листинг, запись и чтение файла, unmount, safe removal,
 исчезновение из списка. Это единственное место, где v1 заявляет read/write.
