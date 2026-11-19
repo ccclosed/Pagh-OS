@@ -3420,6 +3420,34 @@ def mode_groups(h: "Harness") -> tuple[str, int]:
                   crashes[0] if crashes else "none")
     h.metrics["probe modes"] = "root, drop, dropvideo, file"
     return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+def _wait_launch_png(guest: "Guest", kb: "QemuShotKeyboard",
+                     timeout: float = 90.0) -> bool:
+    """Poll `ls /mnt/launch-evidence` until a PNG appears.
+
+    The launched pagh-files renders six 1280x800 scenes before it prints the first
+    line; under TCG that takes longer than a fixed 6-8 s nap, and its first
+    console write is then stopped by TOSTOP (it runs in the compositor's
+    background group). The PNG is written before the print, so polling the
+    directory is the reliable evidence; a missing file after the timeout is a
+    real failure, not a slow frame.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        off = len(guest.serial())
+        _desktop_restart_shell_line(kb)
+        kb.text("ls /mnt/launch-evidence")
+        kb.key("ret")
+        # Give `ls` a moment to answer, then look only at the bytes written
+        # after this command (an old `files-main` line elsewhere on serial is
+        # not evidence for this launch).
+        end = time.time() + 6.0
+        while time.time() < end:
+            if re.search(r"[^\s/]+\.png", guest.serial()[off:]):
+                return True
+            time.sleep(0.3)
+    return False
+
+
 def _desktop_restart_shell_line(kb: "QemuShotKeyboard") -> None:
     """Discard any keys the compositor/evdev left in the shell line editor.
 
@@ -3978,15 +4006,10 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     if died:
         h.info_check("PDP launch: requesting pagh-files client died with EMSGSIZE",
                      "pagh-files: Message too large (os error 90) after type-13 launch")
-    _desktop_restart_shell_line(kb)
-    off = mark()
-    kb.text("ls /mnt/launch-evidence")
-    kb.key("ret")
-    evidence = wait_new(off, [r"[^\s/]+\.png"], 20.0, "launch-target evidence")
+    evidence = _wait_launch_png(guest, kb)
     ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
-                  evidence is not None,
-                  regex_first(r"[^\r\n]*\.png[^\r\n]*",
-                              guest.serial()[off:]) or "no PNG written")
+                  evidence,
+                  "PNG written" if evidence else "no PNG after 90 s of polling")
     ok &= h.check("launched target is the REAL binary (headless Files PNG on /mnt)",
                   "pagh-desktop-demo" not in guest.serial() and evidence is not None,
                   "pagh-files headless output")
@@ -4017,17 +4040,11 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     h.qmp.keys(["ctrl", "alt", "t"])
     h.qmp.release_modifiers()
     time.sleep(8.0)
-    _desktop_restart_shell_line(kb)
-    off = mark()
-    kb.text("ls /mnt/launch-evidence")
-    kb.key("ret")
-    hotkey_evidence = wait_new(off, [r"[^\s/]+\.png"], 20.0,
-                               "compositor-hotkey evidence")
+    hotkey_evidence = _wait_launch_png(guest, kb)
     ok &= h.check("launch_targets spawn the configured target via the compositor "
                   "hotkey (server-side registry, not PDP type 13)",
-                  hotkey_evidence is not None,
-                  regex_first(r"[^\r\n]*\.png[^\r\n]*", guest.serial()[off:]) or
-                  "no PNG written")
+                  hotkey_evidence,
+                  "PNG written" if hotkey_evidence else "no PNG after 90 s of polling")
 
     text = guest.serial()
     crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE|SIGSEGV|Segmentation fault", text)
