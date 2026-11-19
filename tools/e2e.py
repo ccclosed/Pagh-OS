@@ -913,26 +913,6 @@ class Keyboard:
         for ch in text:
             self.key(key_name(ch))
 
-    def release_modifiers(self) -> None:
-        """Force key-up for Ctrl/Shift/Alt after a chord.
-
-        QMP `send-key` holds a chord and releases it on a timer; under TCG load
-        the release can be lost or reordered relative to HMP `sendkey`
-        characters (two monitor paths into one emulated keyboard). A stuck Ctrl
-        turns a later `c` into the terminal's ^C: the kernel's PS/2 tracker
-        sends SIGINT to the *foreground* group, which killed the real Files
-        client right after its window appeared (serial:
-        `[signal] pid=9 sig=2 tick-delivered default-terminate`). An explicit
-        key-up plus a settle makes the modifier state deterministic before the
-        harness types a command line.
-        """
-        for qcode in ("ctrl", "shift", "alt"):
-            self._input([{
-                "type": "key",
-                "data": {"down": False, "key": {"type": "qcode", "data": qcode}},
-            }])
-        time.sleep(0.5)
-
     def close(self) -> None:
         if self.sock is not None:
             try:
@@ -1058,6 +1038,26 @@ class QmpClient:
         })
         if "return" not in reply:
             raise HarnessError(f"QMP send-key refused: {reply}")
+
+    def release_modifiers(self) -> None:
+        """Force key-up for Ctrl/Shift/Alt after a chord.
+
+        QMP `send-key` holds a chord and releases it on a timer; under TCG load
+        the release can be lost or reordered relative to HMP `sendkey`
+        characters (two monitor paths into one emulated keyboard). A stuck Ctrl
+        turns a later `c` into the terminal's ^C: the kernel's PS/2 tracker
+        sends SIGINT to the *foreground* group, which killed the real Files
+        client right after its window appeared (serial:
+        `[signal] pid=9 sig=2 tick-delivered default-terminate`). An explicit
+        key-up plus a settle makes the modifier state deterministic before the
+        harness types a command line.
+        """
+        for qcode in ("ctrl", "shift", "alt"):
+            self._input([{
+                "type": "key",
+                "data": {"down": False, "key": {"type": "qcode", "data": qcode}},
+            }])
+        time.sleep(0.5)
 
     def close(self) -> None:
         if self.sock is not None:
