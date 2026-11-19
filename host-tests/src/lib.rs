@@ -250,6 +250,13 @@ pub mod kill;
 #[path = "../../src/arch/x86_64/linux/tty.rs"]
 pub mod tty;
 
+// `net_if_abi` — чистый ABI `SIOCGIF*`: 40-байтный `ifreq` (name 16 @0,
+// union @16), `sockaddr_in`/`sockaddr` для адреса/маски/MAC и номера запросов
+// из Linux UAPI. `core`-only, без `super::`-зависимостей, поэтому host-свойство
+// `net_if_abi` кодирует/декодирует ровно тот источник, что компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/net_if_abi.rs"]
+pub mod net_if_abi;
+
 // `regs` is the pure 15-GPR syscall frame contract (`repr(C)`, `rax` at offset
 // 112) — `core`-only and self-contained, included here so the tick-path frame
 // mirror below can be asserted against the REAL struct rather than a copy.
@@ -565,6 +572,10 @@ mod properties {
     // дословно как в Linux, строка `%6s:` + 16 колонок в фиксированном порядке,
     // нули в не ведущихся колонках, u64 без обрезки.
     mod net_dev;
+    // `ifreq`/`sockaddr` ABI для `SIOCGIF*` (этап K2): точные константы Linux
+    // UAPI, раскладка/смещения, round-trip имени и `sockaddr_in`/`sockaddr`,
+    // байтовый порядок порта и адреса.
+    mod net_if_abi;
     // procfs (issue #11, contract `docs/procfs.md` §7): meminfo columns + the
     // libuv `strstr`/`sscanf` substrings; cpuinfo block/`\t: ` separators and the
     // truthfulness of the `flags` line against the CPUID bits; uptime arithmetic

@@ -6300,6 +6300,317 @@ mod linux_tty_tests {
     }
 }
 
+// ─── Сетевые данные для userspace (этап K), в госте ─────────────────────────
+//
+// `/proc/net/dev` и `SIOCGIF*` — два независимых входа к одному состоянию.
+// Host-свойства (`net_counters`, `net_dev`, `net_if_abi`) проверяют чистые
+// кодировщики; здесь проверяется ядерная связка на настоящем стеке: ioctl
+// вызывается напрямую с mapped-страницей (как в `linux_tty_tests::*`), потому
+// что `sys_ioctl` требует compat-fd, а суть — в `net_if_sys::if_ioctl`.
+//
+// Инварианты: неизвестный запрос — `ENOTTY` (не расширяем ioctl-поверхность
+// молча); непригодный указатель — `EFAULT` до записи; отсутствие канала —
+// `ENODEV`; ответы `SIOCGIFADDR/NETMASK` совпадают с `net::ip_config()`,
+// `SIOCGIFFLAGS` несёт IFF_UP и IFF_RUNNING ровно тогда, когда линк поднят,
+// `SIOCGIFHWADDR` — MAC канала, а строки `/proc/net/dev` не убывают между
+// чтениями (счётчики монотонны).
+mod netdata_tests {
+    use crate::arch::x86_64::linux::errno::Errno;
+    use crate::arch::x86_64::linux::net_if_abi::{
+        ARPHRD_ETHER, IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, IFREQ_SIZE, SIOCGIFADDR,
+        SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFNETMASK,
+    };
+    use crate::arch::x86_64::linux::net_if_sys::if_ioctl;
+    use crate::memory::{pmm, vmm};
+    use crate::vfs::VfsNode;
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// USER_ACCESSIBLE scratch-страница под 40-байтный `ifreq` (свой адрес, не
+    /// общий с `linux_tty_tests`, чтобы модули не мешали друг другу).
+    const SCRATCH_VA: u64 = 0x0000_4002_0000_0000;
+
+    fn map_scratch() -> Option<u64> {
+        if vmm::virt_to_phys(SCRATCH_VA).is_some() {
+            return None;
+        }
+        let frame = pmm::alloc_frame()?;
+        // SAFETY: кадр только что выделен и доступен через HHDM.
+        unsafe {
+            core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        vmm::map(frame, SCRATCH_VA, flags).ok()?;
+        Some(frame)
+    }
+
+    fn unmap_scratch(frame: Option<u64>) {
+        if let Some(frame) = frame {
+            let _ = vmm::unmap(SCRATCH_VA);
+            pmm::free_frame(frame);
+        }
+    }
+
+    /// Нулевой `ifreq` с записанным `ifr_name`.
+    fn put_name(name: &str) {
+        // SAFETY: SCRATCH_VA отображена writable на время теста.
+        unsafe {
+            core::ptr::write_bytes(SCRATCH_VA as *mut u8, 0, IFREQ_SIZE);
+            let bytes = name.as_bytes();
+            let n = bytes.len().min(15);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), SCRATCH_VA as *mut u8, n);
+        }
+    }
+
+    /// Записать `int` в union (`ifr_ifindex`/`ifr_mtu` — вход `SIOCGIFNAME`).
+    fn put_i32(value: i32) {
+        // SAFETY: union лежит в отображённой странице.
+        unsafe {
+            core::ptr::write_unaligned((SCRATCH_VA + 16) as *mut i32, value);
+        }
+    }
+
+    fn get_i16(off: u64) -> i16 {
+        // SAFETY: читаем в пределах отображённой scratch-страницы.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + off) as *const i16) }
+    }
+
+    fn get_i32(off: u64) -> i32 {
+        // SAFETY: то же — чтение внутри 40-байтного буфера.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + off) as *const i32) }
+    }
+
+    fn get_bytes<const N: usize>(off: u64) -> [u8; N] {
+        let mut out = [0u8; N];
+        // SAFETY: `off + N <= 40`, оба конца внутри отображённой страницы.
+        unsafe {
+            core::ptr::copy_nonoverlapping((SCRATCH_VA + off) as *const u8, out.as_mut_ptr(), N);
+        }
+        out
+    }
+
+    /// Имя из `ifr_name` после ответа `SIOCGIFNAME`.
+    fn read_out_name() -> alloc::string::String {
+        let bytes = get_bytes::<16>(0);
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(16);
+        alloc::string::String::from_utf8_lossy(&bytes[..len]).into_owned()
+    }
+
+    pub fn if_ioctl_reports_live_interface() {
+        // `None` — страница уже отображена прошлым проходом (selftest 2) либо
+        // аллокация не удалась; в обоих случаях освобождать нечего, как в
+        // `linux_tty_tests::map_scratch`.
+        let frame = map_scratch();
+
+        // Чужие запросы не обслуживаются этим слоем: прежний ENOTTY.
+        assert_eq_kernel!(
+            if_ioctl(0x5413, SCRATCH_VA),
+            Err(Errno::ENOTTY),
+            "netdata: a non-SIOCGIF request stays ENOTTY"
+        );
+        // Непригодный указатель отвергается ДО записи.
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFADDR, 1),
+            Err(Errno::EFAULT),
+            "netdata: an unmapped ifreq pointer is EFAULT"
+        );
+
+        let stats = match crate::net::iface_stats() {
+            Some(s) => s,
+            None => {
+                unmap_scratch(frame);
+                crate::skip_kernel!(
+                    "netdata",
+                    "netdata: no network channel in this boot (iface_stats = None)"
+                );
+                return;
+            }
+        };
+
+        // ── имя интерфейса: индекс 1 → eth0, чужой индекс → ENODEV ─────────
+        put_i32(1);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFNAME, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFNAME(1) succeeds"
+        );
+        assert_eq_kernel!(
+            read_out_name().as_str(),
+            stats.name,
+            "netdata: SIOCGIFNAME reports the interface name"
+        );
+        put_i32(9);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFNAME, SCRATCH_VA),
+            Err(Errno::ENODEV),
+            "netdata: SIOCGIFNAME of an unknown index is ENODEV"
+        );
+
+        // ── SIOCGIFADDR: реальный адрес из net::ip_config() ────────────────
+        put_name(stats.name);
+        match if_ioctl(SIOCGIFADDR, SCRATCH_VA) {
+            Ok(0) => {
+                let family = get_i16(16);
+                let addr = get_bytes::<4>(20);
+                assert_eq_kernel!(
+                    family,
+                    2,
+                    "netdata: SIOCGIFADDR sockaddr_in family is AF_INET"
+                );
+                assert_eq_kernel!(
+                    get_i16(18),
+                    0,
+                    "netdata: SIOCGIFADDR sin_port is 0 for an interface"
+                );
+                match crate::net::ip_config() {
+                    Some(cfg) => assert_eq_kernel!(
+                        addr,
+                        cfg.addr.addr.0,
+                        "netdata: SIOCGIFADDR equals net::ip_config()"
+                    ),
+                    None => {
+                        assert_kernel!(false, "netdata: SIOCGIFADDR succeeded without ip_config")
+                    }
+                }
+                crate::kprintln!(
+                    "NETDATA ioctl iface={} addr={}.{}.{}.{}",
+                    stats.name,
+                    addr[0],
+                    addr[1],
+                    addr[2],
+                    addr[3]
+                );
+            }
+            other => assert_eq_kernel!(
+                other,
+                Err(Errno::EADDRNOTAVAIL),
+                "netdata: SIOCGIFADDR without a lease is EADDRNOTAVAIL"
+            ),
+        }
+
+        // ── SIOCGIFNETMASK: маска префикса, family тоже AF_INET ────────────
+        if let Some(cidr) = stats.cidr {
+            put_name(stats.name);
+            assert_eq_kernel!(
+                if_ioctl(SIOCGIFNETMASK, SCRATCH_VA),
+                Ok(0),
+                "netdata: SIOCGIFNETMASK succeeds when an address exists"
+            );
+            assert_eq_kernel!(get_i16(16), 2, "netdata: SIOCGIFNETMASK family is AF_INET");
+            assert_eq_kernel!(
+                get_bytes::<4>(20),
+                cidr.mask_octets(),
+                "netdata: SIOCGIFNETMASK equals the prefix mask"
+            );
+        }
+
+        // ── SIOCGIFFLAGS: UP всегда, RUNNING — по линку ────────────────────
+        put_name(stats.name);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFFLAGS, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFFLAGS succeeds"
+        );
+        let flags = get_i16(16);
+        assert_kernel!(flags & IFF_UP != 0, "netdata: flags carry IFF_UP");
+        assert_kernel!(
+            flags & IFF_BROADCAST != 0 && flags & IFF_MULTICAST != 0,
+            "netdata: flags carry IFF_BROADCAST|IFF_MULTICAST"
+        );
+        assert_eq_kernel!(
+            (flags & IFF_RUNNING != 0),
+            stats.running,
+            "netdata: IFF_RUNNING mirrors link::running()"
+        );
+        crate::kprintln!("NETDATA flags={:#06x} running={}", flags, stats.running);
+
+        // ── SIOCGIFHWADDR: ARPHRD_ETHER + MAC канала ──────────────────────
+        put_name(stats.name);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFHWADDR, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFHWADDR succeeds"
+        );
+        assert_eq_kernel!(
+            get_i16(16),
+            ARPHRD_ETHER as i16,
+            "netdata: SIOCGIFHWADDR family is ARPHRD_ETHER"
+        );
+        assert_eq_kernel!(
+            get_bytes::<6>(18),
+            stats.mac.0,
+            "netdata: SIOCGIFHWADDR reports the channel MAC"
+        );
+
+        // ── MTU и INDEX ────────────────────────────────────────────────────
+        put_name(stats.name);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFMTU, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFMTU succeeds"
+        );
+        assert_eq_kernel!(
+            get_i32(16),
+            stats.mtu as i32,
+            "netdata: SIOCGIFMTU reports the interface MTU"
+        );
+        put_name(stats.name);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFINDEX, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFINDEX succeeds"
+        );
+        assert_eq_kernel!(get_i32(16), 1, "netdata: SIOCGIFINDEX is 1 (eth0)");
+
+        // ── неизвестное имя — ENODEV, а не ответ про eth0 ─────────────────
+        put_name("lo");
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFFLAGS, SCRATCH_VA),
+            Err(Errno::ENODEV),
+            "netdata: SIOCGIFFLAGS with an unknown name is ENODEV"
+        );
+
+        // ── /proc/net/dev: счётчики не убывают между чтениями ─────────────
+        let first = read_net_dev_row(stats.name);
+        let second = read_net_dev_row(stats.name);
+        if let (Some(a), Some(b)) = (first, second) {
+            for i in 0..16 {
+                assert_kernel!(
+                    b[i] >= a[i],
+                    "netdata: /proc/net/dev counters are monotonic"
+                );
+            }
+            crate::kprintln!("NETDATA procdev rx_bytes={} tx_bytes={}", b[0], b[8]);
+        } else {
+            assert_kernel!(false, "netdata: /proc/net/dev row is missing");
+        }
+
+        unmap_scratch(frame);
+    }
+
+    /// Разобрать строку `eth0` из `/proc/net/dev` в 16 чисел.
+    fn read_net_dev_row(name: &str) -> Option<[u64; 16]> {
+        let node = crate::vfs::lookup_path("/proc/net/dev").ok()?;
+        let mut buf = alloc::vec![0u8; 512];
+        let n = node.read(0, &mut buf).ok()?;
+        buf.truncate(n);
+        let text = core::str::from_utf8(&buf).ok()?;
+        let prefix = alloc::format!("{:>6}:", name);
+        let row = text.lines().find(|l| l.starts_with(prefix.as_str()))?;
+        let rest = row.strip_prefix(prefix.as_str())?;
+        let mut out = [0u64; 16];
+        for (i, field) in rest.split_whitespace().enumerate() {
+            if i >= 16 {
+                return None;
+            }
+            out[i] = field.parse().ok()?;
+        }
+        Some(out)
+    }
+}
+
 // ─── Состояние планировщика SIGSTOP/SIGCONT, в госте (issue #12) ────────────
 //
 // Proves on the real machine what the host properties (`signal_stop`,
@@ -10412,6 +10723,13 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "procfs::maps file identity (slice 7)",
             procfs_tests::maps_file_identity
+        ),
+        // Сетевые данные для userspace (этап K): `SIOCGIF*` на mapped `ifreq`
+        // (адрес = net::ip_config, UP/RUNNING, MAC, MTU, INDEX, NAME, ENODEV) и
+        // монотонные счётчики `/proc/net/dev`. Без канала — NETDATA SKIP.
+        (
+            "netdata::SIOCGIF* and /proc/net/dev live data",
+            netdata_tests::if_ioctl_reports_live_interface
         ),
         ("pmm::total_frames > 0", pmm_tests::total_frames),
         ("pmm::alloc+free cycle", pmm_tests::alloc_free),
