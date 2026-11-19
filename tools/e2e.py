@@ -913,6 +913,26 @@ class Keyboard:
         for ch in text:
             self.key(key_name(ch))
 
+    def release_modifiers(self) -> None:
+        """Force key-up for Ctrl/Shift/Alt after a chord.
+
+        QMP `send-key` holds a chord and releases it on a timer; under TCG load
+        the release can be lost or reordered relative to HMP `sendkey`
+        characters (two monitor paths into one emulated keyboard). A stuck Ctrl
+        turns a later `c` into the terminal's ^C: the kernel's PS/2 tracker
+        sends SIGINT to the *foreground* group, which killed the real Files
+        client right after its window appeared (serial:
+        `[signal] pid=9 sig=2 tick-delivered default-terminate`). An explicit
+        key-up plus a settle makes the modifier state deterministic before the
+        harness types a command line.
+        """
+        for qcode in ("ctrl", "shift", "alt"):
+            self._input([{
+                "type": "key",
+                "data": {"down": False, "key": {"type": "qcode", "data": qcode}},
+            }])
+        time.sleep(0.5)
+
     def close(self) -> None:
         if self.sock is not None:
             try:
@@ -3706,6 +3726,10 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     # ── put the compositor in the background; TOSTOP-safe because --quiet ──
     off = mark()
     h.qmp.keys(["ctrl", "z"])
+    # The chord must not leave Ctrl down: a stuck Ctrl turns the `c` of a later
+    # `--connect` line into ^C, and the kernel delivers SIGINT to the
+    # foreground group (it killed the real Files window in earlier runs).
+    h.qmp.release_modifiers()
     parked = wait_new(off, [r"\^Z"], 20.0, "Ctrl+Z stop marker")
     ok &= h.check("compositor stops on Ctrl+Z (shell gets the terminal back)",
                   parked is not None,
@@ -3755,12 +3779,14 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("Files window is drawn on the QEMU framebuffer",
                   files_drawn, f"{files_shot.name} vs {desktop_ref.name}")
 
-    # Input into the live window: click the empty bottom-right grid area (a click
-    # on a toolbar action could legitimately launch the terminal, which is the
-    # *next* check and would confound this one).
+    # Input into the live window: click empty CONTENT, not the bottom-right
+    # resize grip (a grip press starts a resize and repaints the desktop, which
+    # confounds the console-freeze check below) and not a toolbar action (it
+    # could legitimately launch the terminal, the *next* check). The window is
+    # 1060x640 at a deterministic placement; the content centre is empty grid.
     h.qmp.rel(2000, 2000)
     time.sleep(0.2)
-    h.qmp.rel(-150, -130)
+    h.qmp.rel(-680, -400)
     time.sleep(0.3)
     h.qmp.button("left", True)
     time.sleep(0.1)
@@ -3822,6 +3848,17 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                       term_win is not None,
                       regex_first(r"pagh-terminal: connected[^\r\n]*",
                                   guest.serial()) or "no connected line")
+    # Focus the terminal before the blink assertion: the cursor blinks only in
+    # the focused window, and clicking the Files content above handed focus to
+    # Files. Click the terminal content centre (window is 720x420 at the
+    # compositor's deterministic placement, 96..816 x 64..516).
+    h.qmp.rel(2000, 2000)
+    time.sleep(0.2)
+    h.qmp.rel(-824, -510)
+    time.sleep(0.3)
+    h.qmp.button("left", True)
+    time.sleep(0.1)
+    h.qmp.button("left", False)
     time.sleep(0.6)
     kb.screenshot(term_a)
     second = (term_a.is_file() and files_clicked.is_file()
@@ -3840,6 +3877,7 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     # ── stop the terminal, prove the shell still works, then check crashes ──
     off = mark()
     h.qmp.keys(["ctrl", "z"])
+    h.qmp.release_modifiers()
     term_parked = wait_new(off, [r"\^Z"], 12.0, "Terminal Ctrl+Z")
     if term_parked is not None:
         ok &= h.check("Terminal job stops on Ctrl+Z", True, "^Z")
@@ -3865,19 +3903,24 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     # Files' global Alt+Shift+F4 asks the compositor to launch app "terminal".
     # The configured target is the real pagh-files binary in headless mode; it
     # writes PNGs under /mnt before its first console write, so the written file
-    # is proof that the compositor spawned the configured command. The Terminal
-    # window has focus by now, so move the pointer to the Files-only bottom-right
-    # area (relative motion saturates at the screen edge) and click to focus it.
+    # is proof that the compositor spawned the configured command.
+    #
+    # FOCUS FILES IN A PROVABLY FREE POINT: both windows share the same
+    # deterministic top-left placement, so the upper-left overlap belongs to the
+    # Terminal. Files is 1060x640 and Terminal 720x420, so (1000, 600) is inside
+    # the Files *content* and outside the Terminal rectangle — a click there
+    # focuses Files without guessing z-order, and is not the resize grip.
     h.qmp.rel(2000, 2000)
     time.sleep(0.2)
-    h.qmp.rel(-150, -130)
+    h.qmp.rel(-280, -200)
     time.sleep(0.3)
     h.qmp.button("left", True)
     time.sleep(0.1)
     h.qmp.button("left", False)
-    time.sleep(0.4)
+    time.sleep(0.6)
     kb_off = mark()
     h.qmp.keys(["alt", "shift", "f4"])
+    h.qmp.release_modifiers()
     time.sleep(6.0)
     launch_text = guest.serial()[kb_off:]
     died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
