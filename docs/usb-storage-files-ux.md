@@ -16,7 +16,7 @@ SCSI, block, mount, WARN/flush) — в `docs/usb-mass-storage-spec.md` (аген
 
 **Согласование контракта:** 2026-11-19, цикл review через координатора `agent-4`
 (`usb-files-spec` ↔ `usb-kernel-spec`). Согласовано и финализировано: block-имена `usb0`/`usb0pN`,
-mount point `/usb0p1`, `/dev/uevent` fixed-record **128 B** с точными
+mount point `/usb0p1`, `/dev/uevent` fixed-record **v2 = 144 B** с точными
 смещениями (`§5.2`) + `/proc/partitions` fallback, `mount(2)` 165 /
 `umount2(2)` 166 root-only, политика «авто-mount только pagh-томов — userspace-композитор»,
 видимость всех устройств независимо от mount, `removing` — overlay
@@ -55,7 +55,7 @@ raw-узлы как future; coordination item по auto-mount — G16 (`§10`).
 | Free space | `statfs(2)` (nr 137) уже есть; P2, в acceptance v1 не входит |
 | Mount point | `/usb0p1` (Phase 1), в UI не показывается как имя устройства |
 
-Требования — `R-USBF-1…13` (`§4`). Приёмка — `§8`. Честные пробелы — `§10`.
+Требования — `R-USBF-1…14` (`§4`). Приёмка — `§8`. Честные пробелы — `§10`.
 
 ---
 
@@ -180,14 +180,15 @@ flush на kernel-стороне, mount-политика (это `docs/usb-mass-
 | **R-USBF-3** | Устройство видно **в любом** состоянии, включая несмонтированное и foreign; исчезает только по `REMOVE` от ядра | T2, T10, T12, T13 |
 | **R-USBF-4** | Клик по смонтированному устройству открывает его точку через существующий `navigate_to`; клик по несмонтированному — честное пояснение, не переход в пустоту | T11, T12 |
 | **R-USBF-5** | Mount доступен только `fs_class=1 && !mounted && !read_only` (in_use — подсказка, не условие); foreign/other/blank — disabled с причиной; format отсутствует; запрос уходит композитору | T14, T16, T22 |
-| **R-USBF-6** | Unmount и safe removal — через контекстное меню и подтверждение; выполняет root-композитор; «можно отключать» только после `safe_to_remove`, ошибка flush оставляет том смонтированным | T15, T16, T22; `§8.2` |
+| **R-USBF-6** | Unmount и safe removal — через контекстное меню и подтверждение; выполняет root-композитор; «можно отключать» только после `safe_to_remove`, ошибка flush оставляет том смонтированным; surprise даёт `unclean`/`safe_to_remove=0` | T15, T16, T22, T24; `§8.2` |
 | **R-USBF-7** | `removing` — overlay композитора на время операции; ядро не сообщает transient-состояний | T16 |
 | **R-USBF-8** | Листинг после mount — реальный `read_dir` того же `Vfs`; никаких синтетических записей, «пусто» и «ошибка» различаются | T11; `§8.2` шаг 3 |
 | **R-USBF-9** | Событийный канал не теряет состояние: композитор держит полный снимок, `seq`-разрыв вызывает resync; поздно подключившийся клиент получает полный список | T3, T5, T8 |
 | **R-USBF-10** | Files не хардкодит mount path: берёт `mount` из события как есть, без переписывания корня; путь валидируется (`/usb…`, без `..`) — иначе `ENOENT` из-за `ROOT_KEEPING_COMPONENTS` | T10, T17, T21 |
-| **R-USBF-11** | Ошибки показываются текстом с причиной (io/mount_failed/flush_failed/unsupported_fs/foreign/blank/no_media/read_only/bad_mount/gone; `in_use` — флаг, текст приходит из `device_result`); молчаливых отказов нет | T9, T12, T13 |
+| **R-USBF-11** | Ошибки показываются текстом с причиной (io/mount_failed/flush_failed/unsupported_fs/unsupported_block/capacity_overflow/replay_failed/foreign/blank/no_media/read_only/unclean/bad_mount/gone; `in_use` — флаг, текст приходит из `device_result`); молчаливых отказов нет | T9, T12, T13, T24 |
 | **R-USBF-12** | Открытие файла остаётся `OpenPath` (track B); устройство-специфичного открытия в v1 нет | `§7` |
 | **R-USBF-13** | Files — non-root клиент: не вызывает `mount`/`umount2` и не читает `/dev/uevent`; любое действие — только `device_request` композитору | T22; `§5.4` |
+| **R-USBF-14** | `uuid` — единственная персистентная идентичность тома; `usbN` не сохраняется между загрузками; нулевой uuid — честный `""` | T23; `§8.2` шаг 7 |
 
 ---
 
@@ -214,7 +215,7 @@ flush на kernel-стороне, mount-политика (это `docs/usb-mass-
 ### 5.2 Ядро → композитор: `/dev/uevent`
 
 **Контракт финализирован kernel-агентом (2026-11-19).** Char-устройство,
-fixed-record **ровно 128 байт**, `read()` возвращает одну запись, `poll` как у
+fixed-record **ровно 144 байта (v2)**, `read()` возвращает одну запись, `poll` как у
 `/dev/input/event0`, кольцо 256 записей, монотонный `seq`.
 
 **Открытие эксклюзивное.** `open(/dev/uevent)` — единственный reader; второй
@@ -224,14 +225,14 @@ fixed-record **ровно 128 байт**, `read()` возвращает одну
 `ENOENT`/`ENODEV`.
 
 **Initial snapshot.** На `open` ядро кладёт в кольцо `ADD` для каждого уже
-перечисленного устройства с текущими `mount`/`flags`/`fs_class`/`error`;
+перечисленного устройства с текущими `mount`/`uuid`/`flags`/`fs_class`/`error`;
 `seq = 0` помечает записи снимка. Live-записи продолжают `seq++` (u32, wrap).
 Разрыв монотонности или `PUEV_IOC_SNAPSHOT`-ioctl → re-seed: композитор
 перечитывает снимок и перестраивает таблицу с нуля (закрывать/открывать
 устройство не нужно и нельзя — оно занято им же).
 
-**Чтение.** `read(count)`: `count >= 128` — ровно одна запись (128 байт);
-`count < 128` — `EINVAL`; пусто при `O_NONBLOCK` — `EAGAIN`; пусто в blocking-режиме
+**Чтение.** `read(count)`: `count >= 144` — ровно одна запись (144 байта);
+`count < 144` — `EINVAL`; пусто при `O_NONBLOCK` — `EAGAIN`; пусто в blocking-режиме
 — yield-цикл (композитор открывает `O_NONBLOCK`); сигнал → `EINTR`; `poll` —
 `POLLIN`. `sectors` — логические блоки размера `sector_size` (Phase 1 — 512), а
 не 512-байтовые единицы: формула `capacity = sectors × sector_size` переживёт 4K
@@ -246,11 +247,11 @@ host-property там же; композитор держит эти смещен
 | Смещение | Поле | Тип | Смысл |
 |---:|---|---|---|
 | 0 | `magic` | u32 | `PUEV` = `0x56455550` |
-| 4 | `version` | u16 | 1 |
+| 4 | `version` | u16 | **2** (v2 = 144 B; v1 = 128 B несовместим — читатель v2 отвергает v1 и наоборот, без «дочитаем как получится») |
 | 6 | `kind` | u8 | 1 `ADD`, 2 `REMOVE`, 3 `CHANGE`, 4 `ERROR`, 5 `MOUNTED`, 6 `UNMOUNTED` |
-| 7 | `flags` | u8 | bit0 `removable`, bit1 `read_only`, bit2 `mounted`, bit3 `in_use`, bit4 `safe_to_remove`, bit5 `surprise` |
+| 7 | `flags` | u8 | bit0 `removable`, bit1 `read_only`, bit2 `mounted`, bit3 `in_use`, bit4 `safe_to_remove`, bit5 `surprise`, bit6 `unclean`, bit7 `detached` |
 | 8 | `fs_class` | u8 | 0 unknown, 1 pagh-ext2, 2 foreign-ext2, 3 blank, 4 other-fs, 5 no-media |
-| 9 | `error` | u8 | 0 none, 1 io, 2 mount_failed, 3 flush_failed, 4 unsupported_fs, 5 no_media |
+| 9 | `error` | u8 | 0 none, 1 io, 2 mount_failed, 3 flush_failed, 4 unsupported_fs, 5 no_media, 6 unsupported_block, 7 capacity_overflow, 8 replay_failed |
 | 10 | `reserved` | u16 | 0 |
 | 12 | `seq` | u32 | 0 = снимок; далее монотонно |
 | 16 | `sectors` | u64 | ёмкость узла в секторах |
@@ -261,13 +262,36 @@ host-property там же; композитор держит эти смещен
 | 76 | `product` | 32 | ASCII, NUL-padded |
 | 108 | `label` | 16 | метка тома: ext2 `s_volume_name`, если прочитана; иначе пусто (foreign/exFAT — пусто, драйвера нет) |
 | 124 | `reserved` | 4 | 0 |
+| 128 | `uuid` | 16 | stable id тома (ext2 `s_uuid` / GPT unique partition GUID; нули = нет) |
+
+Итого **144 байта** (`9 × 16`). Смещения 0..127 совпадают с v1, поэтому
+host-property фиксирует и `size=144`, и каждое смещение; `version=2` —
+единственный признак, по которому читатель понимает, что `uuid` существует.
 
 Ёмкость = `sectors × sector_size` (Phase 1 `sector_size = 512`). Строки
 ASCII-only, не-ASCII → `?`; UI-fallback «USB-накопитель» — честный пробел, а не
 недосмотр. `label` — метка **тома**, а не устройства: для foreign/blank она
 пуста (exFAT-метку Phase 1 не читает), и UI берёт vendor/product. `serial`
 (VPD 0x80) в Phase 1 не читается и в ABI не входит — это ABI v2, отдельным
-полем, а не подменой `label`. `mount[16]` — жёсткий лимит 15 символов: Phase 1 top-level
+полем, а не подменой `label`.
+
+**`uuid` — отдельное поле, `mount` сохранён (решение lead 2026-11-19).**
+Kernel-спека dcab282e предлагала заменить `mount[16]` на `uuid[16]` в offset
+44, выводя mount как `"/" + dev`. Lead это отклонил: запись становится **v2 =
+144 B**, `mount[16]` остаётся на 44 (Files берёт mount из события, R-USBF-10),
+а `uuid[16]` добавляется отдельным полем на 128..143. Причины: (а) mount — это
+то, что реально смонтировано, и UI не должен реконструировать путь из имени
+устройства; (б) `uuid` — ключ персистентности между reboot (`usbN` не
+стабилен), а не замена пути. Версия ABI — 2: читатель v2 не смешивает записи
+v1 (128 B), иначе смещения `uuid`/`reserved` читались бы как чужие поля.
+
+`uuid` — stable id тома: pagh-ext2 `s_uuid` суперблока (идентичность ФС; при
+переформатировании меняется — ожидаемо); иначе GPT unique partition GUID
+(байты 16..32 записи GPT); MBR/unknown — нули. Нулевой uuid в PDP передаётся
+пустой строкой; UI не хранит `usbN` между загрузками и не считает его
+идентичностью.
+
+`mount[16]` — жёсткий лимит 15 символов: Phase 1 top-level
 `/usb0p1` влезает, будущие вложенные `/<dir>/usbNpM` тоже влезают при
 `N, M ≤ 99` (например `/media/usb99p99` = 15 символов, ровно лимит); если
 понадобится длиннее — это новый ABI, а не «допишем в строку».
@@ -285,8 +309,12 @@ ASCII-only, не-ASCII → `?`; UI-fallback «USB-накопитель» — ч�
 |---|---|---|
 | `flags.mounted && mount != ""` | `mounted` | `none`, либо `error`-код, если пришёл `ERROR` |
 | `fs_class == 1 && !mounted && flags.read_only` | `present` | `read_only` — auto-mount не выполняется, mount disabled |
+| `fs_class == 1 && !mounted && flags.unclean` | `unmounted` | `unclean` — WAL не проверен; mount разрешён (запустит replay), safe_to_remove=0 |
 | `fs_class == 1 && !mounted` | `unmounted` | `none` |
 | `error ∈ {io, mount_failed, flush_failed}` | `error` | `io` / `mount_failed` / `flush_failed` |
+| `error == 6` (`unsupported_block`) | `present` | `unsupported_block` — 4K logical block, mount disabled |
+| `error == 7` (`capacity_overflow`) | `present` | `capacity_overflow` — > 2 TiB, mount disabled |
+| `error == 8` (`replay_failed`) | `error` | `replay_failed` — том не восстановлен, mount disabled |
 | `error == 4` (`unsupported_fs`) | `present` | `unsupported_fs` — классификация, не сбой |
 | `error == 5` (`no_media`) | `present` | `no_media` — классификация, не сбой |
 | `fs_class == 2` | `present` | `foreign_volume` |
@@ -302,6 +330,26 @@ ASCII-only, не-ASCII → `?`; UI-fallback «USB-накопитель» — ч�
 смонтированным, UI не имеет права говорить «можно отключать».
 `safe_to_remove` — флаг успешного `umount2`; `surprise` — физическое
 выдёргивание без извлечения.
+
+**`safe_to_remove` — не «флаг успеха», а обещание, что данные уже на носителе.**
+Таблица (совпадает с kernel §11.4/§14.3):
+
+| Событие | `mounted` | `unclean` | `detached` | `safe_to_remove` |
+|---|---:|---:|---:|---:|
+| `MOUNTED` (replay ok) | 1 | 0 | 0 | 0 |
+| `UNMOUNTED` clean (`flags=0`, устройство живо) | 0 | 0 | 1 | 1 |
+| `UNMOUNTED` surprise (`flags=0`, dead) — `EIO` | 0 | 1 | 1 | **0** |
+| `UNMOUNTED` `MNT_FORCE` (dead, явное подтверждение потери) | 0 | 1 | 1 | 1 |
+| `REMOVE` смонтированного/незакрытого тома | 0 | 1 | 1 | **0** |
+| `REMOVE` чистого тома | 0 | 0 | 0 | 0 |
+
+UI: «можно отключать» показывается **только** при `safe_to_remove=1`. При
+`unclean=1 && !mounted` — предупреждение «том не был извлечён корректно; WAL
+будет восстановлен при следующем монтировании», mount разрешён (replay),
+safe_to_remove остаётся 0. При `error=replay_failed` — «том не восстановлен, не
+монтируйте» (fail-closed), mount disabled. `detached` — «VFS-точка снята»,
+само по себе не ошибка (он же 1 после чистого unmount). `surprise` — физическое
+выдёргивание без извлечения; вместе с `unclean` даёт worst-case сообщение.
 
 **Агрегация разделов — правило композитора.** Ядро сообщает **блочные узлы**
 (`usb0`, `usb0p1`, `usb0p2`, …). Files показывает **одну строку на физическое
@@ -345,17 +393,20 @@ u16 count                       // <= 32 (MAX_DEVICES)
   u8 state                      // 1 present, 2 unmounted, 3 mounted, 4 removing, 5 error
   u8 fs_class                   // 0..5, как в uevent
   u8 flags                      // биты как в uevent: bit0 removable, bit1 read_only,
-                                // bit2 mounted, bit3 in_use, bit4 safe_to_remove, bit5 surprise
+                                // bit2 mounted, bit3 in_use, bit4 safe_to_remove,
+                                // bit5 surprise, bit6 unclean, bit7 detached
   u8 reason                     // 0 none, 1 unsupported_fs, 2 foreign_volume, 3 blank,
                                 // 4 io, 5 mount_failed, 6 flush_failed,
                                 // 7 enumeration_failed, 8 device_gone, 9 no_media,
-                                // 10 read_only, 11 bad_mount
+                                // 10 read_only, 11 bad_mount, 12 unsupported_block,
+                                // 13 capacity_overflow, 14 replay_failed, 15 unclean
                                 // (in_use — это flags.bit3, не reason)
   u64 capacity                  // байты; 0 = неизвестно
   string vendor
   string product
   string mount                  // "" если не смонтирован
   string label                  // метка тома (ext2 s_volume_name), "" если нет
+  string uuid                   // stable id тома (ext2 s_uuid/GPT GUID); "" если нули
 ```
 
 Ограничения: `count ≤ 32`; каждая строка ≤ 255 байт; при переполнении
@@ -396,15 +447,22 @@ root-only (`euid == 0`), Linux-сигнатуры.
   (совпадает с source); `/mnt`, `/proc`, `/dev`, `/tmp`, `/media`
   зарезервированы → `EINVAL`; `fstype` — только `"ext2"` в Phase 1; `flags = 0`;
   `data = 0`.
-* `umount2(target, flags)`: `flags = 0`; `MNT_FORCE`/`MNT_DETACH` → `EINVAL`.
+* `umount2(target, flags)`: `flags ∈ {0, MNT_FORCE=1}`; `MNT_DETACH` и прочее →
+  `EINVAL`. `MNT_FORCE` допустим **только** для dead-устройства (на живом —
+  `EINVAL`): это явное подтверждение возможной потери; если такой путь вообще
+  выставляется в UI, он обязан спросить (O9: в Phase 1 force-кнопки нет).
 * **Eject = `umount2(target, 0)`** (отдельного сисколла нет). `EBUSY`, если под
   точкой есть открытые fd; иначе WAL-flush + SCSI `SYNCHRONIZE CACHE (10)`
   (0x35); ошибка flush → `EIO`, том **остаётся смонтированным**, приходит
-  `ERROR error=flush_failed`; успех → detach + `CHANGE mounted=0,
-  safe_to_remove=1`. Порт Phase 1 не обесточивается: «безопасное извлечение» =
-  flush+detach, физически выдёргивает пользователь.
-* **Surprise removal:** dead-флаг, I/O → `EIO`, `REMOVE surprise=1`; WAL
-  replay при следующем mount.
+  `ERROR error=flush_failed`; успех → detach + `UNMOUNTED mounted=0,
+  unclean=0, safe_to_remove=1`. Порт Phase 1 не обесточивается: «безопасное
+  извлечение» = flush+detach, физически выдёргивает пользователь.
+* **Surprise (dead):** `flags=0` → detach разрешён, но возврат `EIO` и
+  `UNMOUNTED mounted=0, unclean=1, detached=1, safe_to_remove=0`; новые записи
+  запрещены, открытые fd получают `EIO`. Это **не** clean unmount, UI не
+  говорит «можно отключать». `MNT_FORCE` → detach, `unclean=1`, но
+  `safe_to_remove=1` — только после явного подтверждения потери (O9: в Phase 1
+  force-кнопки нет, путь остаётся kernel/e2e).
 
 **Unmount vs «Безопасно извлечь».** Для смонтированного тома обе кнопки
 вызывают один и тот же `umount2`, разница только в UX: «Отмонтировать» — без
@@ -459,9 +517,9 @@ server loop ──device_request──► worker thread ──mount(2)/umount2(2
 
 Следствия, названные явно: без живого root-композитора USB-том не монтируется
 (и список не приходит — Files получает его по PDP), поэтому shell/`/mnt`-путь
-не регрессирует. Kernel-спека b666bcae §11.3 рекомендовала kernel-side
-auto-mount — решение lead это отменяет; kernel-правка убирает auto-mount из
-`usb-storage`-потока и оставляет только `ADD` (coordination item, G16). Если
+не регрессирует. Kernel-спека dcab282e §11.3 уже фиксирует userspace-driven
+auto-mount (ядро только `ADD`); остаётся обновить её запись 128 B → 144 B
+(mount+uuid, G16). Если
 композитор не root, авто-mount не выполняется, и первая же попытка даёт
 понятную ошибку прав (`§5.4`, errno-таблица).
 
@@ -485,13 +543,13 @@ Kernel-ошибка не показывается пользователю ко�
 
 | Файл | Изменение |
 |---|---|
-| `rust-apps/pagh-desktop/src/usbdev.rs` (новый) | `const` записи, `parse_record`, `DeviceTable` (агрегация, `seq`, resync), `snapshot()`, host-тесты |
+| `rust-apps/pagh-desktop/src/usbdev.rs` (новый) | `const` записи **v2 144 B**, `parse_record`, `DeviceTable` (агрегация `usb0pN`→`usb0`, `uuid`, `seq`, resync), `snapshot()`, host-тесты |
 | `rust-apps/pagh-desktop/src/protocol.rs` | `Message::{DevicesSubscribe, Devices, DeviceRequest, DeviceResult}`, типы 17–20, `ERR_DEVICE`, `ERR_DEVICE_BUSY`, roundtrip-тесты |
 | `rust-apps/pagh-ui/src/protocol.rs` | те же типы (вторая реализация протокола — обязана совпадать; тесты в обоих крейтах) |
 | `rust-apps/pagh-ui/src/client.rs` | `DesktopClient::{subscribe_devices, request_device}`, `Incoming::{Devices, DeviceResult}` |
 | `rust-apps/pagh-desktop/src/server.rs` | подписка per-client, broadcast снимка, `device_request` → worker, **авто-mount по `ADD fs_class=1`**, `device_result`, маркеры в serial-логе |
 | `rust-apps/pagh-desktop/src/usbdev_ops.rs` (новый) | `DeviceOps` + реализация через `mount(2)`/`umount2(2)` (extern-FFI, без libc-крейта); фейк для тестов |
-| `rust-apps/pagh-files/src/device.rs` (новый) | `DeviceInfo`, `DeviceState`, `DeviceAction`, `reason_text`, `ui_label` (из `label`/vendor/product), `detail` |
+| `rust-apps/pagh-files/src/device.rs` (новый) | `DeviceInfo` (+ `uuid`, `unclean`, `detached`), `DeviceState`, `DeviceAction`, `reason_text`, `ui_label` (из `label`/vendor/product), `detail` |
 | `rust-apps/pagh-files/src/app.rs` | `devices: Vec<DeviceInfo>`, `apply_devices`, `device_result`, `build_device_places`, place-aware контекстное меню, диалоги, `Command::DeviceRequest` |
 | `rust-apps/pagh-files/src/menu_model.rs` | `place_menu(...)` + id действий 400–403 |
 | `rust-apps/pagh-files/src/icons.rs` + `assets/icons/usb-*.png` | `FluentIcon::UsbPlug` (Fluent «Usb Plug», MIT; атрибуция в README) |
@@ -540,6 +598,10 @@ Kernel-ошибка не показывается пользователю ко�
 | `no_media` | «Нет носителя (картридер без карты)» |
 | `read_only` | «Носитель защищён от записи — монтирование только для чтения не поддерживается» |
 | `bad_mount` | «Точка монтирования не помещается в ABI (15 символов) или некорректна» |
+| `unsupported_block` | «Логический блок не 512 байт — этот этап такие носители не поддерживает» |
+| `capacity_overflow` | «Ёмкость больше 2 ТиБ — нужен READ CAPACITY(16), следующий этап» |
+| `replay_failed` | «Том не восстановлен: WAL не реплеится, монтирование запрещено» |
+| `unclean` | «Том был извлечён без извлечения — WAL восстановится при монтировании» |
 
 ### 6.2 Сайдбар
 
@@ -579,8 +641,9 @@ Kernel-ошибка не показывается пользователю ко�
   (`/`, `/mnt`): у USB-пункта путь может быть пуст, и это не «мёртвый пункт».
 
 Свойства устройства (диалог, `Dialog::DeviceProperties`): UI-имя, метка тома
-`label` (если есть), vendor, product, ёмкость (`format_size` + точное число
-байт), блочные узлы и разделы с `fs_class`, состояние, mount, `removing`/причина.
+`label` (если есть), `uuid` (идентичность/персистентность; если нули — строка
+скрыта), vendor, product, ёмкость (`format_size` + точное число байт), блочные
+узлы и разделы с `fs_class`, состояние, mount, `removing`/причина.
 `serial` и VID:PID **не показываются** — их нет в записи `uevent` Phase 1
 (ABI v2; пробел `§10`, не выдумываем).
 
@@ -671,11 +734,12 @@ Files запускает приложение через `launch_targets`-рее
 ### 8.1 Crate-тесты (host, без QEMU)
 
 `pagh-desktop`:
-* T1 `parse_record_*` — 128 байт, `magic`/`version`/`kind` (1–6)/смещения по
+* T1 `parse_record_*` — **144 байта, version=2**, `magic`/`kind` (1–6)/смещения по
   таблице `§5.2`; чужой `magic`/`version`/короткая запись отвергаются;
   ASCII-санитайзинг (`0x7F`, `0x00` внутри строки) и NUL-padding; `mount`
   длиннее 15 символов не читается как путь; `label` на offset 108 не путается
-  с `product` (перестановка полей ловится вектором).
+  с `product`, `uuid` на 128 — с `reserved` (перестановка полей ловится
+  вектором); v1-запись 128 B отвергается по `version`.
 * T2 `table_aggregates_partitions` — `usb0` + `usb0p1` + `usb0p2` → одна
   строка `usb0`; представитель: смонтированный > `fs_class`; ёмкость
   представителя (`sectors × sector_size`); `in_use`/`surprise` — OR.
@@ -696,13 +760,14 @@ Files запускает приложение через `launch_targets`-рее
   `device_result`; клиент без подписки не получает ни одного нового типа;
   запрос без подписки → `error(ERR_DEVICE)`; второй запрос → `ERR_DEVICE_BUSY`.
 * T9 `failing_ops_surface_message` — фейковый `DeviceOps` с `EBUSY`/`EIO`/
-  `EINVAL` (зарезервированная точка, `MNT_FORCE`) → `device_result{status=1}`
-  с русским текстом; overlay `removing` снят.
+  `EINVAL` (зарезервированная точка; `MNT_FORCE` на живом) →
+  `device_result{status=1}` с русским текстом; overlay `removing` снят.
 * T19 `state_derivation` — таблица `§5.2` целиком: `fs_class` 0..5,
-  `mounted`, `read_only`, `error` 1–3, `safe_to_remove`, `surprise` →
-  ожидаемые `state`/`reason`; `ERROR flush_failed` не превращает `mounted` в
-  `unmounted`; `read_only` не даёт auto-mount.
-* T20 `read_contract` — `read(128)` = одна запись, `read(127)` = `EINVAL`,
+  `mounted`, `read_only`, `unclean`, `detached`, `error` 1–8,
+  `safe_to_remove`, `surprise` → ожидаемые `state`/`reason`; `ERROR
+  flush_failed` не превращает `mounted` в `unmounted`; `read_only` не даёт
+  auto-mount; `error=6/7` — `present` с причиной, `error=8` — `error`.
+* T20 `read_contract` — `read(144)` = одна запись, `read(143)` = `EINVAL`,
   `O_NONBLOCK` пусто = `EAGAIN`, `poll` = `POLLIN`; 257-я запись → `seq`-gap,
   а не тихая потеря.
 
@@ -737,6 +802,13 @@ Files запускает приложение через `launch_targets`-рее
   `Command::DeviceRequest`; в `pagh-files` нет вызовов `mount`/`umount2` и нет
   чтения `/dev/uevent` (R-USBF-13); ответ приходит только как
   `Incoming::DeviceResult`/`Devices`.
+* T23 `uuid_is_persistent_identity` — `uuid` один и тот же при `device_del` →
+  `device_add` даже когда `usbN` меняется; нулевой uuid (MBR/unknown)
+  превращается в `""`, подпись не ломается; `usbN` не сохраняется между
+  загрузками (T13 не воскрешает старую строку).
+* T24 `safe_to_remove_semantics` — таблица `§5.2`: clean unmount → 1; surprise
+  `EIO` → 0; `MNT_FORCE` → 1 (unclean остаётся); `REMOVE` смонтированного → 0;
+  no-op eject при `unclean=1` → 0 и текст «сначала восстановите том».
 
 `pagh-ui`: `ListItem.detail` рисуется приглушённо, ellipsize не съедает
 основную подпись, golden-тест виджетов.
@@ -765,12 +837,12 @@ Files запускает приложение через `launch_targets`-рее
    `HostVfs`, тот же PDP; клики заменены вызовами тех же методов (иначе
    приёмка зависела бы от указателя — см. `§10`, press-routing).
 4. Ассерты в serial-логе (детерминированные маркеры, без времени). Точные строки
-   ядра задаёт `docs/usb-mass-storage-spec.md` (b666bcae); ниже — контрактные
+   ядра задаёт `docs/usb-mass-storage-spec.md` (dcab282e; запись — v2 144 B); ниже — контрактные
    примеры, grep-паттерны фиксируются при реализации: `usb: uevent open ok`;
    `usb: add usb0 vendor=… product=… label=… sectors=… class=1` (ядро только
    классифицирует — **авто-mount в ядре нет**);
    `pagh-desktop: mount usb0p1 /usb0p1 ok` (root-композитор по `ADD`);
-   `pagh-files: devices 1 (usb0 mounted /usb0p1 label="PAGH")`;
+   `pagh-files: devices 1 (usb0 mounted /usb0p1 label="PAGH" uuid=…)`;
    **boot не затронут:** `/mnt` монтируется тем же `boot.rs::init_fs`, что и до
    фичи (проверяют существующие `desktop`/`usb` режимы).
    `USBFILES write PASS`, `USBFILES read PASS`, `USBFILES unmount PASS`,
@@ -783,16 +855,20 @@ Files запускает приложение через `launch_targets`-рее
 5. Hotplug: загрузка **без** `usb-storage`, после старта QMP
    `device_add usb-storage,drive=usb0,bus=xhci.0` → `usb: add` ≤ 3 с и Files
    `devices 1`; `device_del` при смонтированном → маркер ядра о surprise
-   removal (`REMOVE surprise=1`, читатели получают `EIO`), Files убирает
-   строку, не падает и показывает `surprise`-notice, если `cwd` был внутри
-   точки. Повторный `device_add` того же образа в этой же загрузке → `ADD`,
+   removal (`REMOVE surprise=1`; том был смонтирован → `unclean=1`,
+   `safe_to_remove=0`, читатели получают `EIO`), Files убирает строку, не
+   падает и показывает `surprise`-notice, если `cwd` был внутри точки.
+   Повторный `device_add` того же образа в этой же загрузке → `ADD` с тем же
+   `uuid` (не `usbN`), `unclean=1` до успешного replay,
    авто-mount композитора, чтение ранее записанного файла: WAL replay, а не
-   «чистый» том.
+   «чистый» том. Если WAL испорчен, mount fail-closed (`ERROR
+   error=replay_failed`), строка остаётся `state=error`, safe_to_remove=0.
 6. Негатив: `usb.img` как чужой ext2 (`mkfs.ext2` с хоста) → `class=2`, mount
    пуст, строка видна, mount disabled; `blank`-образ → `class=3`.
-7. Persistence (совпадает с kernel-приёмкой b666bcae): файл, оставленный
+7. Persistence (совпадает с kernel-приёмкой dcab282e + v2 144 B): файл, оставленный
    `--keep`, читается после `umount2` + `device_del` + `device_add` в той же
-   загрузке, и после перезагрузки (второй прогон `--verify-only`).
+   загрузке и после перезагрузки (второй прогон `--verify-only`); тождество
+   тома проверяется по `uuid`, не по `usbN`.
 8. Скриншот окна Files с секцией «УСТРОЙСТВА» (визуальное доказательство,
    как в `desktop`-режиме) — `e2e_usbfiles_sidebar.png`.
 
@@ -836,7 +912,7 @@ kernel-спекой, запрещает авто-mount и mount чужих то�
 | Этап | Содержание | Зависит от | Гейты |
 |---|---|---|---|
 | **S0** | Эта спека + согласование контракта | — | review lead |
-| **S1** | kernel: `/dev/uevent` (128 B, exclusive, `PUEV_IOC_SNAPSHOT`), `mount(2)` 165 / `umount2(2)` 166, flush/SYNCHRONIZE CACHE, surprise-remove, `ROOT_KEEPING_COMPONENTS += "usb"`, **без auto-mount** (только `ADD`); `docs/usb-mass-storage-spec.md` | kernel-агент | kernel-гейты (их PR) |
+| **S1** | kernel: `/dev/uevent` (**v2 144 B**, exclusive, `PUEV_IOC_SNAPSHOT`), `mount(2)` 165 / `umount2(2)` 166, flush/SYNCHRONIZE CACHE, surprise-remove, `ROOT_KEEPING_COMPONENTS += "usb"`, **без auto-mount** (только `ADD`), host-property на size/offset/flags/error v2 144 B; `docs/usb-mass-storage-spec.md` | kernel-агент | kernel-гейты (их PR) |
 | **S2** | `pagh-desktop/src/usbdev.rs` + PDP 17–20 + подписка/broadcast + маркеры в serial-логе; **без UI** | S1 (или фейковый reader для тестов) | `cargo test -p pagh-desktop`, `-p pagh-ui` |
 | **S3** | Files: модель устройств, сайдбар, detail, свойства, контекстное меню, состояния; mount/unmount — disabled до S4 (нет worker'а и подтверждений) | S2 | `cargo test -p pagh-files -p pagh-ui`; screenshot |
 | **S4** | mount/unmount/eject: worker + `DeviceOps` + `mount`/`umount2` + **авто-mount pagh по `ADD`** + overlay `removing` + диалоги | S1 (uevent + сисколлы), S3 | crate + `e2e.py usbfiles` |
@@ -874,16 +950,19 @@ crate-тесты затронутых rust-apps; для S4 — `python3 tools/e2
 | G12 | **Press-routing по окну** не в `dev` (ветка `fix/window-press-routing` не смержена) | клики по сайдбару в QEMU могут уходить в фон | приёмка S4 через `--device-selftest`; клики — ручная проверка/после мержа |
 | G13 | **Хабы не поддерживаются**, только корневые порты | флешка в хабе не появится | kernel-спека; UX ничего не обещает |
 | G14 | **Деградированный `/proc/partitions`** без vendor/fs_class | «USB-накопитель» без деталей | warning в serial; не приёмка |
-| G15 | **Устройства с `sector_size != 512` и ёмкостью > 2 TiB** kernel-контракт отвергает (открытый вопрос review) | такие носители не появятся/покажут error | UI показывает `error`/`enumeration_failed`, если ядро вообще отдаст устройство; иначе — «не отдано ядром» |
-| G16 | **Авто-mount — userspace: нужен живой root-композитор**; kernel-спека b666bcae §11.3 пока рекомендует kernel-side | без композитора нет ни mount, ни списка (Files — PDP-клиент); если композитор non-root — auto-mount не идёт | kernel-правка убирает auto-mount из `usb-storage`-потока (только `ADD`); композитор монтирует по `ADD fs_class=1`; boot `/mnt` не меняется |
+| G15 | **Устройства с `sector_size != 512` и ёмкостью > 2 TiB** | том не монтируется | kernel отдаёт `error=unsupported_block` / `error=capacity_overflow`; UI — `present` + причина, mount disabled, без усечения |
+| G16 | **Запись kernel-спеки 128 B ещё не обновлена до v2 144 B** (mount+uuid; lead решил, dcab282e §11.3 уже userspace-driven) | S1 не может стартовать на старом layout; композитор v2 отвергнет v1 | kernel: запись 144 B + host-property size/offset; auto-mount — композитор по `ADD`; boot `/mnt` не меняется |
 | G17 | **`mount[16]` = 15 символов** | будущие длинные точки не влезут | ENFORCE: невалидный/длинный `mount` → `error/bad_mount` с внятным текстом; вложенные `usbNpM ≤ 99` влезают; длиннее — ABI v2 |
 | G18 | **`ROOT_KEEPING_COMPONENTS` без `"usb"`** уводит `/usb0p1` в `/mnt/usb0p1` (kernel-правка §11.5 kernel-спеки) | Files/композитор получат `ENOENT`, если правку забыть | S1 обязан добавить `"usb"` + host-свойство; приёмка проверяет `/usb0p1` и `/mnt/usb0p1` (§8.2 шаг 4) |
-| G19 | **Kernel-спека b666bcae ещё не в `origin/dev`** | S1/S4 нельзя начинать до её merge | dependency line; UX-код S2 можно писать на фейковых записях |
+| G19 | **Kernel-спека dcab282e ещё не в `origin/dev`** и её запись ждёт 144 B | S1/S4 нельзя начинать до merge + layout-фикса | dependency line; UX-код S2 можно писать на фейковых записях v2 |
 | G20 | **Read-only носитель** (sense 07/27) и **ro-mount** | auto-mount не выполняется (ext2 mount пишет); тома с защитой от записи видны, но не монтируются | UI: `reason=read_only`, mount disabled; ro-mount — future (kernel §11.3) |
+| G21 | **`uuid` нет у MBR/неизвестной таблицы** (нули) | персистентность по uuid невозможна | честный `""`; fallback `label + capacity + vendor/product` — менее надёжно, UI не хранит `usbN` |
+| G22 | **ABI v2 144 B ещё не в kernel-спеке** (dcab282e пишет 128 B с uuid@44) | без kernel-фикса композитор v2 не с чем сверять | S1: запись 144 B + host-property size/offset/flags/error; v1/v2 не смешиваются |
 
-**Зависимости:** `docs/usb-mass-storage-spec.md` b666bcae (S1: uevent, `mount`/`umount2`,
-`ROOT_KEEPING_COMPONENTS`, auto-mount policy), OpenPath track B (v2 UX),
-стабильный `dev` (PR base).
+**Зависимости:** `docs/usb-mass-storage-spec.md` dcab282e + запись **v2 144 B**
+(S1: uevent, `mount`/`umount2`, `ROOT_KEEPING_COMPONENTS`, userspace auto-mount),
+host-property size/offset/flags/error; OpenPath track B (v2 UX); стабильный
+`dev` (PR base).
 
 ---
 
@@ -896,8 +975,9 @@ crate-тесты затронутых rust-apps; для S4 — `python3 tools/e2
 2. **O2 — закрыт контрактом.** `mount(2)` 165 / `umount2(2)` 166, root-only,
    `source="usb0p1"` (имя, не путь), `target="/usb0p1"`, `fstype="ext2"`,
    `flags=0`, `data=0`; `/mnt`,`/proc`,`/dev`,`/tmp`,`/media` → `EINVAL`;
-   `umount2(flags=0)`, `MNT_FORCE`/`MNT_DETACH` → `EINVAL`. S4 реализует
-   `DeviceOps` поверх этих сисколлов.
+   `umount2(flags ∈ {0, MNT_FORCE})`, `MNT_FORCE` только dead-устройство,
+   `MNT_DETACH`/прочее → `EINVAL`. S4 реализует `DeviceOps` поверх этих
+   сисколлов.
 3. **O3 — закрыт контрактом.** Top-level `usbNpM`; `/mnt`, `/proc`, `/dev`,
    `/tmp`, `/media` зарезервированы (`EINVAL`), коллизия с файлом невозможна
    (rootfs не writable). `/media` остаётся за будущими вложенными точками.
@@ -906,7 +986,10 @@ crate-тесты затронутых rust-apps; для S4 — `python3 tools/e2
    сбрасывать), сразу отдаёт `safe_to_remove` и сообщение «теперь можно
    отключить». Это **не** unmount: строка не становится `unmounted`, UI не
    пишет «отмонтировано», в логе нет `umount2`. «Отмонтировать» для
-   несмонтированного disabled.
+   несмонтированного disabled. **Исключение:** `unclean=1` (том не был
+   извлечён корректно) — no-op возвращает `safe_to_remove=0` и «сначала
+   восстановите том (смонтируйте), иначе данные не гарантированы»; «можно
+   отключать» не показывается.
 5. **O5 — решено lead: `--device-selftest` — скрытый test-only флаг.** Это не
    пользовательская фича и не документируется в `--help` для конечного
    пользователя; он существует для `tools/e2e.py usbfiles` и проверяет те же
@@ -921,18 +1004,30 @@ crate-тесты затронутых rust-apps; для S4 — `python3 tools/e2
    hotplug только публикует `ADD` (`fs_class`), `mount(2)` зовёт композитор;
    boot-mount `/mnt` не меняется. За kernel-спекой остаются два вопроса:
    отказ `sector_size != 512` и > 2 TiB (G15) и raw-узлы как future. Контракт
-   PDP/`devices` от них не меняется. Kernel-спека b666bcae §11.3 (kernel-side
-   auto-mount) этим решением отменяется — coordination item G16.
+   PDP/`devices` от них не меняется. Kernel-спека dcab282e §11.3 уже
+   userspace-driven; coordination item — обновить её запись до v2 144 B
+   (mount+uuid, G16).
+8. **O8 — закрыт решением lead: record v2 = 144 B.** `mount[16]` на 44
+   сохранён, `uuid[16]` добавлен отдельным полем на 128..143 (не замена);
+   `version=2`, LE, v1 128 B несовместим. Хост-property на size/offset — за
+   kernel-спекой (G22).
+9. **O9 — force-unmount (`MNT_FORCE`) в UI v1 (рекомендация, ждёт lead).** Kernel
+   поддерживает только для dead-устройства, как явное подтверждение потери
+   (`unclean=1`, `safe_to_remove=1`). Рекомендация UX: **не** выставлять
+   отдельную кнопку в Phase 1 — dead-устройство обычно уже исчезло, а
+   принудительный detach легко принять за «безопасное извлечение»;
+   recovery — переподключение/replay. Если lead решит иначе — отдельный
+   диалог с явным «потеря данных» и новый `action=4` в `device_request`.
 
 ---
 
 ## Приложение A. Пример снимка и сообщений
 
-`/dev/uevent` (семантика, не байты; `kind` — числом 1–6, `seq=0` — снимок):
+`/dev/uevent` v2 (семантика, не байты; `version=2`, `kind` — числом 1–6, `seq=0` — снимок; 144 B):
 
 ```text
-ADD      seq=0 usb0   fs_class=0 flags=removable                    sectors=131072 ss=512 vendor="QEMU" product="QEMU HARDDISK" label=""       # 64 MiB
-ADD      seq=0 usb0p1 fs_class=1 flags=removable|mounted            mount="/usb0p1" sectors=129024 vendor="QEMU" product="QEMU HARDDISK" label="PAGH"   # 63 MiB
+ADD      seq=0 usb0   fs_class=0 flags=removable                    sectors=131072 ss=512 vendor="QEMU" product="QEMU HARDDISK" label=""       uuid=00000000000000000000000000000000  # 64 MiB
+ADD      seq=0 usb0p1 fs_class=1 flags=removable|mounted            mount="/usb0p1" sectors=129024 vendor="QEMU" product="QEMU HARDDISK" label="PAGH"   uuid=9f1c2e4a7b3d4f6081a2b3c4d5e6f708  # 63 MiB
 CHANGE   seq=1 usb0p1 fs_class=1 flags=removable                    mount="" sectors=129024   # после umount2
 CHANGE   seq=2 usb0p1 fs_class=1 flags=removable|safe_to_remove    mount=""                # detach прошёл, можно отключать
 REMOVE   seq=3 usb0   flags=surprise                                                       # выдернули без извлечения
@@ -944,6 +1039,7 @@ REMOVE   seq=3 usb0   flags=surprise                                            
 generation=7 count=1
 id="usb0" state=mounted fs_class=1 flags=mounted|removable reason=none
 capacity=66060288 vendor="QEMU" product="QEMU HARDDISK" mount="/usb0p1" label="PAGH"
+uuid=9f1c2e4a7b3d4f6081a2b3c4d5e6f708
 ```
 
 `device_request` (19): `request_id=3 id="usb0" action=2 (unmount)`.
