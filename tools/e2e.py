@@ -3807,6 +3807,26 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("Files window is drawn on the QEMU framebuffer",
                   files_drawn, f"{files_shot.name} vs {desktop_ref.name}")
 
+    # ── REAL PDP/1 launch (type 13) while the requester is certainly alive ──
+    # Files' global Alt+Shift+F4 asks the compositor to launch app "terminal".
+    # The configured target is the real pagh-files binary in headless mode; it
+    # writes PNGs under /mnt before its first console write, so the file is
+    # proof that the compositor spawned the configured command. This runs
+    # BEFORE any pointer input: on this kernel a PS/2 mouse burst can be
+    # misread by the keyboard path and deliver SIGINT to the foreground client
+    # (see the honest note in the PR), which killed the requester in earlier
+    # runs. The evidence itself is inspected from the shell further below.
+    time.sleep(0.5)
+    launch_mark = mark()
+    h.qmp.keys(["alt", "shift", "f4"])
+    h.qmp.release_modifiers()
+    time.sleep(8.0)
+    launch_text = guest.serial()[launch_mark:]
+    died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
+    if died:
+        h.info_check("PDP launch: requesting pagh-files client died with EMSGSIZE",
+                     "pagh-files: Message too large (os error 90) after type-13 launch")
+
     # Input into the live window: click empty CONTENT, not the bottom-right
     # resize grip (a grip press starts a resize and repaints the desktop, which
     # confounds the console-freeze check below) and not a toolbar action (it
@@ -3892,10 +3912,6 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     # input artifact while a client owns the keyboard).
     time.sleep(0.6)
     kb.screenshot(term_a)
-    second = (term_a.is_file() and files_clicked.is_file()
-              and term_a.read_bytes() != files_clicked.read_bytes())
-    ok &= h.check("Terminal window is drawn as a second window",
-                  second, f"{term_a.name} vs {files_clicked.name}")
     # Cursor blink repaints every 500 ms: two dumps must differ if the client
     # really keeps committing frames (window alive, not a stale compositor blit).
     # Liveness by a deterministic input, not by an idle cursor-blink
@@ -3911,6 +3927,13 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     kb.key("ret")
     time.sleep(1.2)
     kb.screenshot(term_b)
+    # The settled frame (after the input above) is the baseline for "the window
+    # is on screen": the first screendump after create can still return the
+    # previous desktop while QEMU lags, which made the earlier order flaky.
+    second = (term_b.is_file() and files_clicked.is_file()
+              and term_b.read_bytes() != files_clicked.read_bytes())
+    ok &= h.check("Terminal window is drawn as a second window",
+                  second, f"{term_b.name} vs {files_clicked.name}")
     blinking = (term_a.is_file() and term_b.is_file()
                 and term_a.read_bytes() != term_b.read_bytes())
     ok &= h.check("Terminal window commits new frames after input (client alive)",
@@ -3941,41 +3964,6 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("serial shell alive after both real applications ran",
                   alive is not None, "^echo seen on serial")
 
-    # ── REAL PDP/1 launch path (type 13), LAST: the requesting client may die ──
-    # Files' global Alt+Shift+F4 asks the compositor to launch app "terminal".
-    # The configured target is the real pagh-files binary in headless mode; it
-    # writes PNGs under /mnt before its first console write, so the written file
-    # is proof that the compositor spawned the configured command.
-    #
-    # START A FRESH REQUESTER: the first Files client may have been killed by an
-    # input artifact, and the Terminal window overlaps its rectangle. A newly
-    # created window is focused by the compositor, so no click is needed and the
-    # hotkey goes to a demonstrably live Files client.
-    _desktop_restart_shell_line(kb)
-    off = mark()
-    requester_cmd = f"rust /mnt/pagh-files --connect {socket}"
-    log(f"type (launch requester): {requester_cmd}")
-    kb.text(requester_cmd)
-    kb.key("ret")
-    requester = wait_new(off, [r"pagh-files: окно \d+ \d+x\d+"], 45.0,
-                         "launch requester window")
-    ok &= h.check("fresh pagh-files requester opened for the PDP/1 launch",
-                  requester is not None,
-                  regex_first(r"pagh-files: окно[^\r\n]*", guest.serial()[off:]) or
-                  "no window line")
-    time.sleep(0.8)
-    kb_off = mark()
-    h.qmp.keys(["alt", "shift", "f4"])
-    h.qmp.release_modifiers()
-    time.sleep(6.0)
-    launch_text = guest.serial()[kb_off:]
-    died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
-    if died:
-        # Observed on this tree: the *requesting* Files client dies with EMSGSIZE
-        # right after the compositor spawns the target. The launch itself worked,
-        # so this is recorded as an ABI finding, not as a failed launch check.
-        h.info_check("PDP launch: requesting pagh-files client died with EMSGSIZE",
-                     "pagh-files: Message too large (os error 90) after type-13 launch")
     _desktop_restart_shell_line(kb)
     off = mark()
     kb.text("ls /mnt/launch-evidence")
