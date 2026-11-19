@@ -113,6 +113,19 @@ pub struct SurfaceClient {
 }
 
 impl SurfaceClient {
+    /// Переключить управляющий сокет в неблокирующий режим.
+    ///
+    /// Почему это нужно оконной shell-сессии: ядро принимает `SO_RCVTIMEO` и
+    /// **игнорирует** его (`unix_sock::sys_setsockopt` — «принимается и
+    /// игнорируется»), поэтому `set_read_timeout` не ограничивает `read`:
+    /// заблокированное чтение не вернётся на простое сессии. UI-цикл, который
+    /// ждёт и вывод shell-потомка, и события композитора, не может висеть в
+    /// одном `read` — он переключает сокет в неблокирующий режим и опрашивает
+    /// его с нулевым дедлайном, засыпая между итерациями сам.
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
+    }
+
     pub fn connect(path: impl AsRef<Path>) -> io::Result<SurfaceClient> {
         let stream = UnixStream::connect(path)?;
         stream.set_read_timeout(Some(Duration::from_millis(10)))?;
