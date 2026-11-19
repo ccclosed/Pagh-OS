@@ -400,34 +400,59 @@ fn read_user_cstr(ptr: u64) -> Result<String, Errno> {
 /// [`unix_sock::endpoint_wait_verdict`] заблокированный `read` спал бы вечно —
 /// тот же класс зависания, что watchdog печатает для `recvfrom` (nr 45).
 fn read_pipe(e: &PipeEndpoint, dst: &mut [u8]) -> Result<usize, Errno> {
+    // `SO_RCVTIMEO` читается ОДИН раз на входе: пока спим, соседний поток может
+    // его поменять, но Linux применяет значение, действовавшее на начало
+    // вызова, и пересчёт на каждом витке давал бы «вечный» таймаут.
+    let deadline = super::sock_wait::Deadline::from_ticks(
+        crate::arch::x86_64::apic::ms_to_ticks(e.rcv_timeout_ms()),
+        crate::task::scheduler::ticks(),
+    );
     loop {
         match e.read(dst) {
             PipeReadResult::Data(n) => return Ok(n),
             PipeReadResult::Eof => return Ok(0),
             PipeReadResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
-            PipeReadResult::WouldBlock => match unix_sock::endpoint_wait_verdict(e) {
-                super::sock_wait::WaitVerdict::Continue => crate::task::scheduler::yield_current(),
-                super::sock_wait::WaitVerdict::Eof => return Ok(0),
-                super::sock_wait::WaitVerdict::Ebadf => return Err(Errno::EBADF),
-            },
+            PipeReadResult::WouldBlock => {
+                let referenced = unix_sock::endpoint_reads_queue(e);
+                let timed_out = deadline
+                    .as_ref()
+                    .is_some_and(|d| d.expired(crate::task::scheduler::ticks()));
+                match super::sock_wait::read_step(referenced, e.writers(), timed_out) {
+                    // Сон, а не `yield_current()`: уступка оставляет задачу
+                    // готовой, поэтому блокирующий `read` выедал CPU и на каждом
+                    // витке брал глобальный compat-лок. `hlt` до тика — 1 мс.
+                    super::sock_wait::ReadStep::Sleep => crate::task::scheduler::sleep_ticks(1),
+                    super::sock_wait::ReadStep::TimedOut => return Err(Errno::EAGAIN),
+                    super::sock_wait::ReadStep::Eof => return Ok(0),
+                    super::sock_wait::ReadStep::Ebadf => return Err(Errno::EBADF),
+                }
+            }
         }
     }
 }
 fn write_pipe(e: &PipeEndpoint, src: &[u8]) -> Result<usize, Errno> {
+    // Симметрично `read_pipe`: `SO_SNDTIMEO` фиксируется на входе.
+    let deadline = super::sock_wait::Deadline::from_ticks(
+        crate::arch::x86_64::apic::ms_to_ticks(e.snd_timeout_ms()),
+        crate::task::scheduler::ticks(),
+    );
     loop {
         match e.write(src) {
             PipeWriteResult::Data(n) => return Ok(n),
             PipeWriteResult::Broken => return Err(Errno::EPIPE),
             PipeWriteResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
             PipeWriteResult::WouldBlock => {
-                crate::task::scheduler::yield_current();
                 // Зеркало `read_pipe`: закрытие ПИШУЩЕГО fd из соседнего
                 // потока счётчики очереди не меняет, и без перепроверки
-                // владения этот `write` уступал бы CPU вечно — watchdog печатал
-                // `stuck in syscall ? (nr=1 arg0=0x3 closed)`.
-                match unix_sock::endpoint_write_verdict(e) {
-                    super::sock_wait::WriteVerdict::Continue => {}
-                    super::sock_wait::WriteVerdict::Ebadf => return Err(Errno::EBADF),
+                // владения этот `write` спал бы вечно.
+                let referenced = unix_sock::endpoint_writes_queue(e);
+                let timed_out = deadline
+                    .as_ref()
+                    .is_some_and(|d| d.expired(crate::task::scheduler::ticks()));
+                match super::sock_wait::write_step(referenced, timed_out) {
+                    super::sock_wait::WriteStep::Sleep => crate::task::scheduler::sleep_ticks(1),
+                    super::sock_wait::WriteStep::TimedOut => return Err(Errno::EAGAIN),
+                    super::sock_wait::WriteStep::Ebadf => return Err(Errno::EBADF),
                 }
             }
         }

@@ -69,6 +69,16 @@ struct PipeState {
     read_total: u64,
     /// Ждущие `SCM_RIGHTS`; строго возрастают по `pos`, все `pos >= read_total`.
     cmsgs: VecDeque<StreamCmsg>,
+    /// `SO_RCVTIMEO` для блокирующего чтения этой очереди, в миллисекундах;
+    /// `0` — ждать бесконечно. Настройка живёт на ОЧЕРЕДИ, а не на fd: у пары
+    /// AF_UNIX очередь направления принадлежит ровно одному читающему концу, а
+    /// `dup`/`fork` по Linux делят настройку сокета между дескрипторами.
+    rcv_timeout_ms: u64,
+    /// `SO_SNDTIMEO` для блокирующей записи в эту очередь, в миллисекундах;
+    /// `0` — ждать бесконечно. Отдельное поле, а не общий «таймаут сокета»:
+    /// `recv` и `send` одной пары смотрят в РАЗНЫЕ очереди, и их настройки не
+    /// должны перетирать друг друга.
+    snd_timeout_ms: u64,
 }
 
 impl PipeState {
@@ -82,6 +92,8 @@ impl PipeState {
             written_total: 0,
             read_total: 0,
             cmsgs: VecDeque::new(),
+            rcv_timeout_ms: 0,
+            snd_timeout_ms: 0,
         }
     }
 }
@@ -312,6 +324,23 @@ impl PipeEndpoint {
             s.writers
         }
     }
+    /// `SO_RCVTIMEO` этой очереди в миллисекундах (`0` — бесконечно).
+    pub fn rcv_timeout_ms(&self) -> u64 {
+        self.state.lock().rcv_timeout_ms
+    }
+    /// `SO_SNDTIMEO` этой очереди в миллисекундах (`0` — бесконечно).
+    pub fn snd_timeout_ms(&self) -> u64 {
+        self.state.lock().snd_timeout_ms
+    }
+    /// Задать `SO_RCVTIMEO` (миллисекунды, `0` — снять таймаут).
+    pub fn set_rcv_timeout_ms(&self, ms: u64) {
+        self.state.lock().rcv_timeout_ms = ms;
+    }
+    /// Задать `SO_SNDTIMEO` (миллисекунды, `0` — снять таймаут).
+    pub fn set_snd_timeout_ms(&self, ms: u64) {
+        self.state.lock().snd_timeout_ms = ms;
+    }
+
     /// Клонировать этот конец pipe с другим флагом O_NONBLOCK (fcntl
     /// F_SETFL). Клон регистрируется как дополнительный читатель/писатель на
     /// общей очереди; счётчик оригинала падает, когда отпускается последний
