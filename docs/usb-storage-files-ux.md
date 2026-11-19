@@ -456,8 +456,9 @@ root-only (`euid == 0`), Linux-сигнатуры.
   `data = 0`.
 * `umount2(target, flags)`: `flags ∈ {0, MNT_FORCE=1}`; `MNT_DETACH` и прочее →
   `EINVAL`. `MNT_FORCE` допустим **только** для dead-устройства (на живом —
-  `EINVAL`): это явное подтверждение возможной потери; если такой путь вообще
-  выставляется в UI, он обязан спросить (O9: в Phase 1 force-кнопки нет).
+  `EINVAL`): это явное подтверждение возможной потери. В UI Phase 1 этого
+  пути **нет** (O9, решение lead): force живёт только в kernel/e2e и только
+  для dead-устройства.
 * **Eject = `umount2(target, 0)`** (отдельного сисколла нет). `EBUSY`, если под
   точкой есть открытые fd; иначе WAL-flush + SCSI `SYNCHRONIZE CACHE (10)`
   (0x35); ошибка flush → `EIO`, том **остаётся смонтированным**, приходит
@@ -468,8 +469,9 @@ root-only (`euid == 0`), Linux-сигнатуры.
   `UNMOUNTED mounted=0, unclean=1, detached=1, safe_to_remove=0`; новые записи
   запрещены, открытые fd получают `EIO`. Это **не** clean unmount, UI не
   говорит «можно отключать». `MNT_FORCE` → detach, `unclean=1`, но
-  `safe_to_remove=1` — только после явного подтверждения потери (O9: в Phase 1
-  force-кнопки нет, путь остаётся kernel/e2e).
+  `safe_to_remove=1` — только после явного подтверждения потери. В UI Phase 1
+  этого пути нет (O9): единственный пользовательский путь — safe eject с
+  видимыми `EBUSY`/ошибками; `MNT_FORCE` — kernel/e2e, dead-only.
 
 **Unmount vs «Безопасно извлечь».** Для смонтированного тома обе кнопки
 вызывают один и тот же `umount2`, разница только в UX: «Отмонтировать» — без
@@ -1022,13 +1024,13 @@ host-property size/offset/flags/error; OpenPath track B (v2 UX); стабиль�
    `version=2`, LE, v1 128 B несовместим. Host-property (size==144, offsets,
    version==2, flags 0..7, error 0..9) зафиксирован в kernel fbec8f8b; S1
    дублирует его тестом (G22).
-9. **O9 — force-unmount (`MNT_FORCE`) в UI v1 (рекомендация, ждёт lead).** Kernel
-   поддерживает только для dead-устройства, как явное подтверждение потери
-   (`unclean=1`, `safe_to_remove=1`). Рекомендация UX: **не** выставлять
-   отдельную кнопку в Phase 1 — dead-устройство обычно уже исчезло, а
-   принудительный detach легко принять за «безопасное извлечение»;
-   recovery — переподключение/replay. Если lead решит иначе — отдельный
-   диалог с явным «потеря данных» и новый `action=4` в `device_request`.
+9. **O9 — решено lead: force-unmount в UI Phase 1 не выставляется.** Ни кнопки,
+   ни пункта меню `MNT_FORCE` нет: пользователь видит `EBUSY`/ошибку и сам
+   закрывает fd/приложения; safe eject остаётся единственным пользовательским
+   путём. `MNT_FORCE` — исключительно kernel/e2e для dead-устройства
+   (`unclean=1`, `safe_to_remove=1`), без UI-призыва к потере данных. Если
+   когда-нибудь это появится в UI — только отдельный диалог с явным «потеря
+   данных» и новый `action=4` в `device_request`.
 
 ---
 
