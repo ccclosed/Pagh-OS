@@ -1052,11 +1052,24 @@ class QmpClient:
         key-up plus a settle makes the modifier state deterministic before the
         harness types a command line.
         """
-        for qcode in ("ctrl", "shift", "alt"):
-            self._input([{
-                "type": "key",
-                "data": {"down": False, "key": {"type": "qcode", "data": qcode}},
-            }])
+        # A bare key-up is not enough: QEMU skips a break event for a key it
+        # already considers released, so a break the GUEST missed (PS/2 packet
+        # loss) stays missed. A full tap (make + break) forces both edges through
+        # QEMU and clears the guest's modifier state. Alt is sent up only: a
+        # synthetic Alt tap opens the compositor launcher and would cover the
+        # desktop under test; a stuck Alt does not turn a `c` into ^C.
+        for qcode in ("ctrl", "shift"):
+            for down in (True, False):
+                self._input([{
+                    "type": "key",
+                    "data": {"down": down,
+                             "key": {"type": "qcode", "data": qcode}},
+                }])
+                time.sleep(0.03)
+        self._input([{
+            "type": "key",
+            "data": {"down": False, "key": {"type": "qcode", "data": "alt"}},
+        }])
         time.sleep(0.5)
 
     def close(self) -> None:
@@ -3874,12 +3887,24 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   second, f"{term_a.name} vs {files_clicked.name}")
     # Cursor blink repaints every 500 ms: two dumps must differ if the client
     # really keeps committing frames (window alive, not a stale compositor blit).
-    time.sleep(1.2)
-    kb.screenshot(term_b)
-    blinking = (term_a.is_file() and term_b.is_file()
-                and term_a.read_bytes() != term_b.read_bytes())
+    # Three samples, not one pair: the cursor toggles every 500 ms, but a pair
+    # of QEMU screendumps can land in the same phase (screendump timing under
+    # TCG is not frame-synchronised). Any difference between ANY two samples
+    # proves the client still commits; requiring every pair to differ would
+    # fail on sampling, not on the property.
+    frames = [term_a]
+    for _ in range(2):
+        time.sleep(1.2)
+        extra = CACHE / f"e2e_desktop_terminal_blink{len(frames)}.png"
+        kb.screenshot(extra)
+        frames.append(extra)
+    blinking = any(
+        frames[i].is_file() and frames[j].is_file()
+        and frames[i].read_bytes() != frames[j].read_bytes()
+        for i in range(len(frames)) for j in range(i + 1, len(frames))
+    )
     ok &= h.check("Terminal window keeps committing frames (cursor blink)",
-                  blinking, f"{term_b.name} differs={blinking}")
+                  blinking, ", ".join(f.name for f in frames) + f" differs={blinking}")
 
     # ── stop the terminal, prove the shell still works, then check crashes ──
     off = mark()
