@@ -22,7 +22,9 @@ pagh-desktop server ──► Compositor ──► damage-регионы ──�
 * Расширение **`launch` (type 13)**: клиент просит композитор открыть приложение
   (`app` + подсказка `cwd`) — так работают «Открыть терминал…» в Files и меню
   лаунчера. Цели запуска задаются `ServerOptions.launch_targets`/`--launch-target`
-  (`{socket}` подставляется), иначе используется демо-клиент (`--spawn-demo`).
+  (`{socket}` подставляется). Без цели сервер честно сообщает «приложение не
+  настроено» (лог/`ERR_UNSUPPORTED`) и подсказывает `--launch-target`; демо-клиент
+  `pagh-desktop-demo` — только тестовый фолбэк под `--spawn-demo`.
   `--autostart APP` открывает приложение из этого реестра сразу после старта.
 * Шрифт интерфейса — 8×16 ASCII + **кириллица** и типографские знаки
   (`tools/gen_cyrillic_font.py`), поэтому заголовки русских приложений читаемы.
@@ -80,16 +82,19 @@ cargo run --bin pagh-desktop-demo -- --help  # клиент/скриншоты
 Запуск сервера и клиента в двух терминалах:
 
 ```bash
-# терминал 1: сервер
-cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock --spawn-demo
+# терминал 1: сервер с реальной целью запуска (обычный путь)
+cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock \
+    --launch-target 'files=pagh-files|--socket|{socket}'
 
-# терминал 2: ещё один клиент (или клик по иконке панели при --spawn-demo)
+# терминал 2: клиент (для ручной проверки подойдёт тестовый pagh-desktop-demo)
 cargo run --bin pagh-desktop-demo -- --connect /tmp/pagh-desktop.sock --app files
 ```
 
 Сервер сам запускает приложение по запросам панели/меню/хоткея и по `launch`:
-сначала цель `--launch-target`, иначе демо-клиент `pagh-desktop-demo`, если рядом
-лежит бинарник (`--demo-binary PATH` задаёт явно):
+ищет цель `--launch-target`; если её нет, без `--spawn-demo` пишет в лог
+«приложение не настроено» и подсказывает флаг. Демо-клиент
+`pagh-desktop-demo` — тестовый фолбэк (см. «Обычный образ» ниже), включается
+явно `--spawn-demo` (`--demo-binary PATH` задаёт путь):
 
 ```bash
 # настоящий терминал: {socket} подставится путём сокета сервера
@@ -101,6 +106,32 @@ cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock \
     --launch-target 'terminal=pagh-terminal|--socket|{socket}' \
     --autostart terminal
 ```
+
+### Обычный образ: рецепт `/mnt/etc/autorun`
+
+Media стартует desktop не флагами QEMU, а файлом `/mnt/etc/autorun` внутри
+`disk.img`: kernel shell исполняет его до интерактивного промпта
+(`src/shell/mod.rs::run_autorun`, лимит 512 байт). Канонический рецепт лежит в
+файле [`desktop-autorun`](desktop-autorun) этого крейта — только реальные
+приложения, без демо-флагов:
+
+```text
+lxrun /mnt/pd --backend fbdev --input evdev \
+  --launch-target files=/mnt/pagh-files|--socket|{socket} \
+  --launch-target terminal=/mnt/pagh-terminal|--vt|/dev/vtconsole0|--vt-input|/dev/vtinput|--socket|{socket} \
+  --autostart files
+```
+
+Установка в образ (правится КОПИЯ `disk.img`, оригинал не меняется):
+
+```bash
+python3 tools/mkimage.py --iso dist/pagh.iso --disk demo-disk.img \
+    --autorun rust-apps/pagh-desktop/desktop-autorun
+```
+
+`--demo-window`/`--spawn-demo`/`--demo-binary` — тестовые (QEMU e2e,
+`tools/e2e.py desktop --legacy-demo`) и в обычный рецепт не попадают; демо-бинарник
+`pagh-desktop-demo` обычному образу не нужен.
 
 Headless-кадры: `--screenshot-dir DIR` (каждый presented-кадр →
 `frame_NNNNN.png`), `--max-frames N` — выйти после N кадров.
@@ -144,10 +175,10 @@ cargo run --bin pagh-desktop -- --backend fbdev --fbdev /dev/fb0 \
   EV_REL/EV_KEY/EV_SYN, накопление REL_X/REL_Y до SYN, BTN_LEFT/MIDDLE/RIGHT,
   REL_WHEEL → axis, модификаторы для `Input`-сообщений. Устаревшие события,
   накопившиеся до `open` (строка запуска из shell), отбрасываются.
-* `--e2e` — короткий режим для QEMU: `backend=auto`, `input=auto`, одно демо-окно
-  вместо AF_UNIX-клиента, `--exit-after-ms 15000`, selfcheck через 3 с,
-  `--input-trace` и полный кадр на каждый present (иначе QEMU screendump может
-  отдать устаревшую surface).
+* `--e2e` — короткий тестовый режим для QEMU: `backend=auto`, `input=auto`, одно
+  demo-окно вместо AF_UNIX-клиента (только для теста), `--exit-after-ms 15000`,
+  selfcheck через 3 с, `--input-trace` и полный кадр на каждый present (иначе
+  QEMU screendump может отдать устаревшую surface).
 * Runtime выбор: `--backend auto|headless|fbdev`, `--input auto|none|evdev`;
   headless-путь и его PIL/PNG-тесты не меняются.
 
@@ -273,8 +304,10 @@ python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
   kernel-примитивами (`desktop-kernel`); headless-путь полностью автономен.
 * `ShmSurface`/`SCM_RIGHTS`, частичный commit, клиентские popup/курсоры, outputs/scale,
   анимации, PTY/kernel-console bridge — не в этом срезе.
-* `--spawn-demo` — фолбэк для панели/меню/хоткея, если приложения нет в
-  `--launch-target`; реестр приложений/`.desktop`-файлы — следующий шаг.
+* `--spawn-demo`/`--demo-window` — тестовый фолбэк (демо-клиент/встроенное окно);
+  обычный образ задаёт реальные `--launch-target` в `/mnt/etc/autorun`
+  ([`desktop-autorun`](desktop-autorun)); реестр приложений/`.desktop`-файлы —
+  следующий шаг.
 * Скриншоты намеренно детерминированы (часы 23:38 / 15.11.2026), чтобы diff картинок
   был осмысленным.
 
