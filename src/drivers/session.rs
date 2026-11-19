@@ -72,6 +72,28 @@ pub fn current() -> usize {
     session_route::route(pid, &owners, bind)
 }
 
+/// Консольная сессия текущей задачи без блокировки на таблице привязок.
+///
+/// Как [`current`], но `BINDS` берётся через `try_lock`: путь печати
+/// (`kprint!` → serial) может оказаться в панике или в прерванном контексте,
+/// где лок уже держится, и ждать его там нельзя. При занятом локе задача
+/// считается boot-сессией — ошибка в сторону serial безопасна: диагностика не
+/// теряется, а в окно уходит только вывод самой задачи сессии (её владелец
+/// известен из атомика и в локе не нуждается).
+pub fn current_try() -> usize {
+    let pid = crate::task::scheduler::current_pid_atomic();
+    let mut owners = [0u64; MAX_SESSIONS];
+    for (slot, owner) in owners.iter_mut().zip(OWNERS.iter()) {
+        *slot = owner.load(Ordering::Relaxed);
+    }
+    let bind = if BIND_COUNT.load(Ordering::Relaxed) == 0 {
+        None
+    } else {
+        BINDS.try_lock().and_then(|binds| binds.get(&pid).copied())
+    };
+    session_route::route(pid, &owners, bind)
+}
+
 /// Записать задачу-владельца сессии (вызывается при её спавне).
 pub fn set_owner(session: usize, pid: u64) {
     if session != session_route::BOOT_SESSION && session < MAX_SESSIONS {
