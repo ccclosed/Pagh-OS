@@ -264,6 +264,16 @@ pub mod regs;
 #[path = "../../src/arch/x86_64/linux/trap_frame.rs"]
 pub mod trap_frame;
 
+// `compat_guard` — владелец и глубина входа в `COMPAT_STATES` (fix/pf-guard-reentry):
+// тик, вытеснивший задачу между `enter` и `lock()`, раньше оставлял глобальную
+// глубину >0, обработчик #PF отказывал в законной ленивой странице постороннего
+// процесса, а kill-путь сбрасывал счётчик и приводил к underflow. Модуль
+// `core`-only (атомики), поэтому host-свойство `pf_guard_reentry` исполняет ровно
+// тот исходник, который компилирует ядро, и проверяет межзадачные чередования,
+// которые в QEMU ловятся только вероятностно.
+#[path = "../../src/arch/x86_64/linux/compat_guard.rs"]
+pub mod compat_guard;
+
 // `x509` is the pure minimal DER (ASN.1) reader + X.509 time decoding that the
 // TLS server-certificate verifier (issue #14) is built on. `core`-only and
 // self-contained — its calendar math deliberately duplicates
@@ -607,6 +617,13 @@ mod properties {
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.
     mod link_walk_paths;
+
+    // PF-guard re-entry (fix/pf-guard-reentry): законный ленивый отказ ring 3
+    // обслуживается независимо от глубины compat-лока, а повторный вход
+    // kernel-контекста владельца по-прежнему отвергается. Свойства гоняют
+    // межзадачные чередования `CompatEntry` и чистую политику
+    // `trap_frame::pf_registry_must_refuse`.
+    mod pf_guard_reentry;
     // Tar members that carry links and the pure install plan built from them
     // (issue #18, contract `EXT2-LINKS.md` §5): `'1'` vs `'2'`, GNU `'L'`/`'K'`,
     // ustar `prefix`, pax records, and the hard-link ordering rules.
