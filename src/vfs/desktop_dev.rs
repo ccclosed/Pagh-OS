@@ -221,6 +221,13 @@ impl VfsNode for TerminalFramebufferDevice {
         true
     }
     fn vtfb_info(&self) -> Option<crate::drivers::vtfb_abi::VtfbInfo> {
+        // После выхода сессии — `ENODEV`: поверхность в PMM остаётся (кадры
+        // нельзя забрать, пока их держит отображение клиента), но окна больше
+        // нет, и ioctl/`mmap` по старому fd обязаны это сказать, а не отдать
+        // геометрию мёртвой сессии. Повторный `open` поднимает её заново.
+        if !crate::drivers::session::live(1) {
+            return None;
+        }
         crate::drivers::offscreen::info(1)
     }
     fn vtfb_page(&self, index: u64) -> Option<u64> {

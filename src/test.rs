@@ -10760,6 +10760,8 @@ mod desktop_b_tests {
 mod terminal_session_tests {
     use crate::drivers::{framebuffer, offscreen, session, session_route};
     use crate::task::scheduler;
+    /// Методы устройств живут в трейте `VfsNode`.
+    use crate::vfs::VfsNode as _;
 
     /// Снять текстовую сетку конкретного писателя (не текущей задачи).
     fn snapshot(writer: &framebuffer::FbWriter) -> Option<alloc::vec::Vec<(u8, u32, u32)>> {
@@ -11002,6 +11004,12 @@ mod terminal_session_tests {
             "close reaps the respawned session"
         );
         cleanup();
+        // Контракт vtfb1: после выхода сессии устройство отвечает ENODEV
+        // (ioctl/open), пока повторный open не поднимет её заново.
+        assert_kernel!(
+            crate::vfs::desktop_dev::vtfb1().vtfb_info().is_none(),
+            "vtfb1 reports ENODEV (no info) after the session exited"
+        );
     }
 
     /// Этап 3: `nano` в окне рисует в offscreen-поверхность и корректно
