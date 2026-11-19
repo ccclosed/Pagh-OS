@@ -37,7 +37,7 @@ fn rendered_pixels_match_golden_digests() {
     idle.render_full();
     let idle_digest = digest(&idle);
     assert_eq!(
-        idle_digest, 0x123d_1ca9_0b62_55a9,
+        idle_digest, 0xcff4_39a9_e1a3_8432,
         "idle-full: пиксели изменились (получено 0x{idle_digest:016x})"
     );
 
@@ -47,7 +47,7 @@ fn rendered_pixels_match_golden_digests() {
     cursor.render_full();
     let cursor_digest = digest(&cursor);
     assert_eq!(
-        cursor_digest, 0x172f_c965_3b98_62d3,
+        cursor_digest, 0x3f6a_bbf9_4f02_f2c8,
         "cursor: пиксели изменились (получено 0x{cursor_digest:016x})"
     );
 
@@ -59,7 +59,7 @@ fn rendered_pixels_match_golden_digests() {
     drag.render_full();
     let drag_digest = digest(&drag);
     assert_eq!(
-        drag_digest, 0xdf4c_a899_c133_4ebb,
+        drag_digest, 0x78a3_a4ab_fb3d_b8e8,
         "drag: пиксели изменились (получено 0x{drag_digest:016x})"
     );
 
@@ -77,7 +77,7 @@ fn rendered_pixels_match_golden_digests() {
     files.render_full();
     let files_digest = digest(&files);
     assert_eq!(
-        files_digest, 0x9101_4e4c_6248_9527,
+        files_digest, 0x4db8_1491_2ed4_31ac,
         "files-scroll: пиксели изменились (получено 0x{files_digest:016x})"
     );
 

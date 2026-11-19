@@ -9,7 +9,8 @@ use crate::color;
 use crate::context_menu::{ContextMenu, MenuAction};
 use crate::geometry::{DamageTracker, Point, Rect, Size};
 use crate::icons::{self, Icon};
-use crate::panel::{self, Panel, PanelHit, PanelHover, PanelIcon, PANEL_HEIGHT};
+use crate::netinfo::{self, NetInfo};
+use crate::panel::{self, NetState, Panel, PanelHit, PanelHover, PanelIcon, PANEL_HEIGHT};
 use crate::protocol::{
     key, Message, BUTTONS_LEFT, BUTTONS_MIDDLE, BUTTONS_RIGHT, CLOSE_SERVER, CONFIGURE_FOCUSED,
     CONFIGURE_MAXIMIZED, CONFIGURE_MINIMIZED, CONFIGURE_RESIZABLE, MOD_ALT, MOD_CTRL,
@@ -150,8 +151,10 @@ pub struct Flyout {
 
 /// Ширина сетевого флайаута: референс Win11 «Сети» — заметно шире меню календаря.
 const NETWORK_FLYOUT_WIDTH: i32 = 372;
-/// Высота сетевого флайаута: заголовок, статус и одна карточка подключения.
-const NETWORK_FLYOUT_HEIGHT: i32 = 136;
+/// Высота сетевого флайаута: заголовок, статус и карточка подключения в две
+/// строки (имя/адрес и скорости). Было 136 при одной строке имени; +32 под
+/// реальные `↓N Б/с ↑N Б/с` — без них карточка врала бы «подключено» без данных.
+const NETWORK_FLYOUT_HEIGHT: i32 = 168;
 /// Зазор между флайаутом, панелью и краем экрана.
 const FLYOUT_GAP: i32 = 8;
 /// Скругление сетевого флайаута: 6 px, компактнее меню и календаря.
@@ -229,7 +232,7 @@ struct PanelKey {
     screen: Rect,
     time: String,
     date: String,
-    network_online: bool,
+    network: NetState,
     hover: Option<PanelHover>,
     chips: Vec<(u32, String, bool)>,
 }
@@ -423,9 +426,25 @@ impl Compositor {
         self.damage.add(panel::clock_rect(self.screen));
     }
 
-    pub fn set_network_online(&mut self, online: bool) {
-        self.panel.network_online = online;
+    /// Новый сетевой сэмпл из ядра. Damage — только при реальном изменении
+    /// нарисованного: сервер опрашивает `/proc/net/dev` раз в секунду, и
+    /// безусловный damage держал бы панель и открытый флайаут в вечной перерисовке.
+    pub fn set_network_info(&mut self, info: Option<NetInfo>) {
+        let changed = match (&self.panel.network, &info) {
+            (None, None) => false,
+            (Some(prev), Some(next)) => prev != next,
+            _ => true,
+        };
+        if !changed {
+            return;
+        }
+        self.panel.network = info;
         self.damage.add(panel::network_rect(self.screen));
+        if let Some(flyout) = self.flyout {
+            if flyout.kind == FlyoutKind::Network {
+                self.damage.add(flyout.rect.inflate(26));
+            }
+        }
     }
 
     pub fn set_wallpaper_alt(&mut self, alt: bool) {
@@ -1946,7 +1965,7 @@ impl Compositor {
                 key.screen == self.screen
                     && key.time == self.panel.time
                     && key.date == self.panel.date
-                    && key.network_online == self.panel.network_online
+                    && key.network == self.panel.net_state()
                     && key.hover == hover
                     && key.chips == chips
             }
@@ -1963,7 +1982,7 @@ impl Compositor {
                     screen: self.screen,
                     time: self.panel.time.clone(),
                     date: self.panel.date.clone(),
-                    network_online: self.panel.network_online,
+                    network: self.panel.net_state(),
                     hover,
                     chips: chips.to_vec(),
                 },
@@ -2027,39 +2046,32 @@ impl Compositor {
         }
     }
 
-    /// Сетевой флайаут: заголовок, честный статус связи и карточка подключения.
+    /// Сетевой флайаут: заголовок, статус по реальному линку и карточка с
+    /// живыми данными ядра.
     ///
-    /// Композитор знает о сети ровно одно поле — [`Panel::network_online`].
-    /// Ядро пока не отдаёт userspace ни имени интерфейса, ни IP, ни счётчиков
-    /// (`/proc/net/dev`, `SIOCGIFADDR`/netlink отсутствуют), поэтому IP и
-    /// скорости здесь не рисуются: выдуманные значения были бы обманом. По той
-    /// же причине нет кнопки «Отключить» и chevron — в ядре нет пути управления
-    /// линком (нет `SIOCSIFFLAGS`/netlink), а нерабочая кнопка хуже её
-    /// отсутствия. Когда источник данных появится, сюда добавятся строки IP,
-    /// скоростей и действий без переделки геометрии.
+    /// Источник — [`Panel::network`] (сэмпл `netinfo::read()`): имя интерфейса,
+    /// адрес/префикс, скорости из дельты счётчиков `/proc/net/dev` и
+    /// `IFF_UP|IFF_RUNNING` из `SIOCGIFFLAGS`. Три состояния различаются честно:
+    /// данных нет (`None`) — «Нет данных» и карточка без чисел; линк не поднят —
+    /// «Отключено»; линк есть — «Подключено». Кнопки «Отключить» нет:
+    /// `SIOCSIFFLAGS` down/up в ядре не реализован (этап K4), а нерабочая кнопка
+    /// хуже её отсутствия.
     fn paint_network_flyout(&self, canvas: &mut Canvas, rect: Rect) {
         let x = rect.x + 20;
-        let online = self.panel.network_online;
+        let state = self.panel.net_state();
+        let online = state == NetState::Online;
 
         canvas.text(x, rect.y + 14, 1, self.theme.menu_text, "Сети");
 
-        let status = if online {
-            "Подключено"
-        } else {
-            "Отключено"
-        };
-        let status_color = if online {
-            self.theme.accent
-        } else {
-            self.theme.menu_text_dim
+        let (status, status_color) = match state {
+            NetState::Online => ("Подключено", self.theme.accent),
+            NetState::Offline => ("Отключено", self.theme.menu_text_dim),
+            NetState::NoData => ("Нет данных", self.theme.menu_text_dim),
         };
         canvas.text(x, rect.y + 38, 1, status_color, status);
 
-        // Карточка подключения: подложка, проводная иконка и имя подключения.
-        // Настоящего имени интерфейса у композитора нет, поэтому подпись
-        // нейтральная («Проводное подключение 1» из референса), а не выдуманный
-        // SSID или модель адаптера.
-        let card = Rect::new(rect.x + 12, rect.y + 64, rect.w - 24, 56);
+        // Карточка подключения: две строки — имя/адрес и реальные скорости.
+        let card = Rect::new(rect.x + 12, rect.y + 64, rect.w - 24, 76);
         canvas.fill_rounded_rect(card, 4, self.theme.chip_bg, 255);
         canvas.stroke_rounded_rect(card, 4, self.theme.menu_border, 90);
 
@@ -2074,13 +2086,51 @@ impl Compositor {
         } else {
             self.theme.menu_text_dim
         };
-        canvas.text(
-            card.x + 48,
-            card.center().y - 8,
-            1,
-            label_color,
-            "Проводное подключение 1",
-        );
+        let text_x = card.x + 48;
+        match &self.panel.network {
+            Some(info) => {
+                let addr = match (info.ip, info.prefix) {
+                    (Some(ip), Some(prefix)) => format!("{ip}/{prefix}"),
+                    _ => "нет адреса".to_string(),
+                };
+                canvas.text(
+                    text_x,
+                    card.y + 22,
+                    1,
+                    label_color,
+                    &format!("{} · {}", info.iface, addr),
+                );
+                if online {
+                    let rx = netinfo::format_rate(info.rx_rate);
+                    let tx = netinfo::format_rate(info.tx_rate);
+                    draw_rate_line(
+                        canvas,
+                        text_x,
+                        card.y + 46,
+                        self.theme.menu_text_dim,
+                        &rx,
+                        &tx,
+                    );
+                } else {
+                    canvas.text(
+                        text_x,
+                        card.y + 46,
+                        1,
+                        self.theme.menu_text_dim,
+                        "линк не поднят",
+                    );
+                }
+            }
+            None => {
+                canvas.text(
+                    text_x,
+                    card.y + 30,
+                    1,
+                    self.theme.menu_text_dim,
+                    "Сетевых данных нет",
+                );
+            }
+        }
     }
 
     fn paint_calendar_flyout(&self, canvas: &mut Canvas, rect: Rect) {
@@ -2158,6 +2208,45 @@ impl Compositor {
 /// подложка карточки не нужна: прозрачные пиксели не рисуются вовсе.
 fn draw_wired_icon(canvas: &mut Canvas, center: Point, color: color::Color) {
     icons::draw(canvas, Icon::NetworkWired, 24, center, color, 255);
+}
+
+/// Строка скоростей с нарисованными стрелками: `↓ 1.2 КБ/с   ↑ 340 Б/с`.
+///
+/// Символов `↓`/`↑` в шрифте 8×16 нет (таблица — ASCII + кириллица), а расширять
+/// её ради двух глифов значило бы трогать `font.rs`; стрелка рисуется двумя
+/// штрихами в той же ячейке 8 px, что и остальные символы.
+fn draw_rate_line(canvas: &mut Canvas, x: i32, y: i32, color: color::Color, rx: &str, tx: &str) {
+    let unit = crate::font::GLYPH_WIDTH;
+    draw_arrow(
+        canvas,
+        x + unit / 2,
+        y + crate::font::GLYPH_HEIGHT / 2,
+        color,
+        true,
+    );
+    canvas.text(x + unit, y, 1, color, rx);
+    let second = x + unit + rx.chars().count() as i32 * unit + unit * 2;
+    draw_arrow(
+        canvas,
+        second + unit / 2,
+        y + crate::font::GLYPH_HEIGHT / 2,
+        color,
+        false,
+    );
+    canvas.text(second + unit, y, 1, color, tx);
+}
+
+/// Стрелка 7×9 внутри ячейки: древко и два пера. `down` — к земле.
+fn draw_arrow(canvas: &mut Canvas, cx: i32, cy: i32, color: color::Color, down: bool) {
+    let (tip, tail) = if down {
+        (cy + 4, cy - 4)
+    } else {
+        (cy - 4, cy + 4)
+    };
+    let side = if down { tip - 3 } else { tip + 3 };
+    canvas.line(Point::new(cx, tail), Point::new(cx, tip), color, 1);
+    canvas.line(Point::new(cx, tip), Point::new(cx - 3, side), color, 1);
+    canvas.line(Point::new(cx, tip), Point::new(cx + 3, side), color, 1);
 }
 
 fn copy_shm_rect(surface: &mut Surface, view: &crate::shm::ShmView<'_>, area: Rect) {
@@ -2268,6 +2357,24 @@ fn build_shadow_cache(width: i32, height: i32) -> ShadowCache {
 mod tests {
     use super::*;
     use crate::protocol::{CONFIGURE_MAXIMIZED, MOD_SHIFT};
+
+    fn net_sample(running: bool) -> NetInfo {
+        NetInfo {
+            iface: crate::netinfo::IFACE.to_string(),
+            ip: Some(std::net::Ipv4Addr::new(10, 0, 2, 15)),
+            prefix: Some(24),
+            mac: Some([0x52, 0x54, 0, 12, 34, 56]),
+            up: true,
+            running,
+            rx_bytes: 4096,
+            tx_bytes: 2048,
+            rx_packets: 20,
+            tx_packets: 10,
+            rx_rate: 1024,
+            tx_rate: 512,
+            at: std::time::Instant::now(),
+        }
+    }
 
     fn compositor() -> Compositor {
         let mut compositor = Compositor::new(1280, 720);
@@ -2720,10 +2827,9 @@ mod tests {
         assert_eq!(flyout.rect.w, NETWORK_FLYOUT_WIDTH);
         assert_eq!(flyout.rect.right(), screen.right() - FLYOUT_GAP);
         assert_eq!(flyout.rect.bottom(), panel_top - FLYOUT_GAP);
-        assert!(
-            flyout.rect.h <= 160,
-            "низ флайаута должен быть компактным: {}",
-            flyout.rect.h
+        assert_eq!(
+            flyout.rect.h, NETWORK_FLYOUT_HEIGHT,
+            "высота флайаута содержит две строки карточки (имя/адрес и скорости)"
         );
         assert!(flyout.rect.x >= 0);
     }
@@ -2752,6 +2858,69 @@ mod tests {
             compositor.flyout().is_some(),
             "клик по карточке не закрывает флайаут"
         );
+    }
+
+    #[test]
+    fn network_info_damages_only_when_something_visible_changes() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        assert!(!compositor.has_damage(), "кадр сбросил damage");
+        // Нет данных → нет данных: сервер опрашивает раз в секунду, но damage
+        // без изменения содержимого — это вечная перерисовка.
+        compositor.set_network_info(None);
+        assert!(
+            !compositor.has_damage(),
+            "None→None не должен давать damage"
+        );
+        let online = net_sample(true);
+        compositor.set_network_info(Some(online.clone()));
+        assert!(
+            compositor.has_damage(),
+            "первый сэмпл должен попасть в кадр"
+        );
+        compositor.render_full();
+        // Тот же сэмпл с другим `at` — сравнение игнорирует момент опроса.
+        let mut later = online.clone();
+        later.at = std::time::Instant::now();
+        compositor.set_network_info(Some(later));
+        assert!(
+            !compositor.has_damage(),
+            "повторный одинаковый сэмпл не должен перерисовывать панель"
+        );
+        // Реальный линк пропал (IFF_RUNNING снялся) — это изменение.
+        compositor.set_network_info(Some(net_sample(false)));
+        assert!(compositor.has_damage(), "смена линка должна давать damage");
+    }
+
+    #[test]
+    fn network_flyout_paints_real_values_from_the_sample() {
+        let mut compositor = compositor();
+        compositor.set_network_info(Some(net_sample(true)));
+        let network = panel::network_rect(compositor.screen()).center();
+        compositor.pointer_motion(network);
+        compositor.pointer_button(MouseButton::Left, true);
+        compositor.pointer_button(MouseButton::Left, false);
+        compositor.render_full();
+        let rect = compositor.flyout().expect("флайаут открыт").rect;
+        let theme = *compositor.theme();
+        let frame = compositor.frame();
+        // Имя/адрес и скорости — реальные пиксели текста в карточке (не «нет
+        // данных»): вторая строка рисуется здесь, а не выдумывается.
+        let card = Rect::new(rect.x + 12, rect.y + 64, rect.w - 24, 76);
+        let dim = (card.y..card.bottom())
+            .flat_map(|y| (card.x..card.right()).map(move |x| (x, y)))
+            .filter(|(x, y)| frame.get(*x, *y) == theme.menu_text_dim)
+            .count();
+        assert!(
+            dim > 100,
+            "строка скоростей не нарисована в карточке: {dim} пикселей"
+        );
+        // «Подключено» — акцентная строка статуса.
+        let accent = (rect.y..rect.bottom())
+            .flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y)))
+            .filter(|(x, y)| frame.get(*x, *y) == theme.accent)
+            .count();
+        assert!(accent > 20, "статус «Подключено» не нарисован: {accent}");
     }
 
     #[test]
