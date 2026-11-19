@@ -2955,13 +2955,17 @@ def _require_boot_serial(h: "Harness", label: str, timeout: float) -> None:
 
 
 # Binaries the desktop acceptance injects into the pagh-owned ext2. ``pd`` is the
-# compositor (also exposed as ../../mnt/pd for the on-disk recipe); the three
-# others are real userland programs. ``pagh-desktop-demo`` is injected only so
-# ``--legacy-demo`` keeps working — the default path never spawns it.
+# compositor (also exposed as ../../mnt/pd for the on-disk recipe); ``pagh-files``
+# and ``pagh-terminal`` are the REAL userland programs of the ordinary image.
+# ``pagh-desktop-demo`` is test-only and injected for ``--legacy-demo`` alone, so
+# a green default run also proves the shipped path does not carry the demo client.
 _DESKTOP_INJECTED = ("pd", "pagh-desktop-demo", "pagh-files", "pagh-terminal")
 
+# The real scenario's disk: everything except the demo client.
+_DESKTOP_REAL_INJECTED = ("pd", "pagh-files", "pagh-terminal")
 
-def _desktop_bins(skip_build: bool) -> dict[str, pathlib.Path]:
+
+def _desktop_bins(skip_build: bool, legacy_demo: bool = False) -> dict[str, pathlib.Path]:
     """Build/locate the static musl binaries the desktop acceptance needs.
 
     The compositor pair comes from the crate's own ``build-static.sh``. The REAL
@@ -2995,6 +2999,11 @@ def _desktop_bins(skip_build: bool) -> dict[str, pathlib.Path]:
         "pagh-files": ROOT / "rust-apps" / "out" / "pagh-files",
         "pagh-terminal": ROOT / "rust-apps" / "out" / "pagh-terminal",
     }
+    # The demo client is required only by --legacy-demo; the ordinary scenario
+    # must not depend on it even being present.
+    if not legacy_demo:
+        bins = {name: path for name, path in bins.items()
+                if name in _DESKTOP_REAL_INJECTED}
     for name, path in bins.items():
         if not path.is_file():
             raise SetupError(f"desktop binary missing: {path} ({name})")
@@ -3032,13 +3041,20 @@ def _desktop_inject(image: pathlib.Path, bins: dict[str, pathlib.Path]) -> None:
 
 
 def _desktop_disk_ready(image: pathlib.Path, bins: dict[str, pathlib.Path]) -> bool:
-    """True when a reusable desktop image already carries every injected binary."""
+    """True when a reusable desktop image already carries exactly this scenario's binaries.
+
+    The ordinary path requires the demo client to be ABSENT: a reused image left
+    by an earlier ``--legacy-demo`` run is rebuilt, so a green default run is
+    evidence that the real desktop does not carry the demo binary at all.
+    """
     if not image.is_file():
         return False
     for name in bins:
         stat = _debugfs_stat(image, name)
         if stat is None or "Mode:  0755" not in stat:
             return False
+    if "pagh-desktop-demo" not in bins and _debugfs_stat(image, "pagh-desktop-demo") is not None:
+        return False
     return True
 
 
@@ -3107,11 +3123,12 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
       (fbdev takeover), and no panic/exception/ENOSYS appears.
 
     ``--legacy-demo`` keeps the previous demo-client scenario (pagh-desktop-demo
-    + ``--spawn-demo``), which the panel launch path still needs until the panel
-    fix lands (server.rs ``launch()`` currently calls ``spawn_demo`` only).
+    + ``--spawn-demo``) for regression coverage of the test-only fallback; the
+    ordinary image recipe in ``rust-apps/pagh-desktop/desktop-autorun`` starts
+    real ``--launch-target`` entries and never the demo client.
     """
     a = h.a
-    bins = _desktop_bins(a.skip_build)
+    bins = _desktop_bins(a.skip_build, a.legacy_demo)
     disk = CACHE / "e2e_desktop_disk.img"
     if not (a.reuse_desktop_disk and _desktop_disk_ready(disk, bins)):
         if a.reuse_desktop_disk:
@@ -3591,11 +3608,12 @@ def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
 
 def _desktop_demo_child_phase(h: "Harness", guest: "Guest",
                               kb: "QemuShotKeyboard") -> bool:
-    """Legacy panel path: the compositor spawns the DEMO client (`--spawn-demo`).
+    """Legacy test path: the compositor spawns the DEMO client (`--spawn-demo`).
 
-    Kept behind --legacy-demo because ``server.rs::launch()`` (the panel path)
-    still calls ``spawn_demo`` only; once it consults ``launch_targets`` the real
-    scenario's PDP/1 launch evidence covers this too.
+    Kept behind --legacy-demo to keep the test-only fallback covered. The
+    ordinary path never passes ``--spawn-demo``: the shipped recipe configures
+    real ``--launch-target`` entries, which the default scenario's PDP/1 launch
+    evidence proves.
     """
     ok = True
     child_cmd = ("rust /mnt/pd --backend headless --input none "
@@ -4204,8 +4222,8 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--legacy-demo", action="store_true",
                     help="run the previous demo-client scenario (pagh-desktop-demo + "
                          "--spawn-demo) instead of the REAL pagh-files/pagh-terminal "
-                         "windows; needed while the panel launch path still spawns the "
-                         "demo client (server.rs launch() -> spawn_demo)")
+                         "windows; the demo client is a test-only fallback and is "
+                         "injected into the disk for this mode alone")
     dp.add_argument("--pd-lifetime-ms", type=int, default=300_000,
                     help="compositor lifetime in the real-apps path passed as "
                          "--exit-after-ms (default 300000; the scenario is bounded by the "
