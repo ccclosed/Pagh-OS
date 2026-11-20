@@ -201,6 +201,24 @@ fn double_click_file_returns_open_command() {
     );
 }
 
+/// Двойной клик по папке открывает её (навигация), по файлу — `OpenPath`;
+/// раньше `on_double_click` был мёртвым кодом, потому что живой путь ввода не
+/// порождал `Event::DoubleClick` (синтез — `pagh-ui::client`, F3.1).
+#[test]
+fn double_click_directory_navigates_into_it() {
+    let mut app = demo_app();
+    let index = entry_index(&app, "Documents");
+    let rect = app.item_rect(index).unwrap();
+    let commands = double_click(&mut app, rect.center());
+    assert!(
+        commands.is_empty(),
+        "навигация не выходит наружу: {commands:?}"
+    );
+    assert_eq!(app.cwd(), "/home/user/Documents");
+    assert_eq!(app.location_label(), "Документы");
+    assert!(app.error().is_none(), "{:?}", app.error());
+}
+
 #[test]
 fn search_filters_entries_and_updates_status() {
     let mut app = demo_app();

@@ -2525,6 +2525,60 @@ mod tests {
         app.draw(&mut canvas);
     }
 
+    /// Двойной клик по каталогу в сетке открывает его: `cwd` меняется, наружу
+    /// команда не уходит — навигация внутренняя. Синтез `Event::DoubleClick`
+    /// из двух press'ов живёт в `pagh-ui::client` (F3.1).
+    #[test]
+    fn double_click_directory_navigates_into_it() {
+        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        let index = app
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "Documents")
+            .expect("Documents в домашнем каталоге");
+        let rect = app.item_rect(index).expect("ячейка сетки");
+        let commands = app.handle_event(&Event::DoubleClick { pos: rect.center() });
+        assert!(
+            commands.is_empty(),
+            "навигация не выходит наружу: {commands:?}"
+        );
+        assert_eq!(app.cwd(), "/home/user/Documents");
+        assert!(app.error().is_none(), "{:?}", app.error());
+        assert!(app.can_go_back(), "переход попал в историю");
+        assert_eq!(app.location_label(), "Документы");
+    }
+
+    /// То же на реальной ФС: двойной клик по каталогу входит в него и
+    /// показывает его содержимое (FakeVfs-случай не единственный путь).
+    #[test]
+    fn double_click_real_directory_lists_its_contents() {
+        let home = temp_home("dblclick");
+        let mut app = FilesApp::new(Box::new(HostVfs::with_home(home.to_string_lossy())), SIZE);
+        // Канонические XDG-каталоги создаёт сам Files при старте — файл
+        // кладём после этого, чтобы он появился в листинге без ошибок.
+        std::fs::write(home.join("Documents").join("план.txt"), b"ok").unwrap();
+        let index = app
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "Documents")
+            .expect("Documents на реальной ФС");
+        let rect = app.item_rect(index).expect("ячейка сетки");
+        let commands = app.handle_event(&Event::DoubleClick { pos: rect.center() });
+        assert!(
+            commands.is_empty(),
+            "навигация не выходит наружу: {commands:?}"
+        );
+        assert_eq!(
+            app.cwd(),
+            format!("{}/Documents", home.to_string_lossy()),
+            "двойной клик открыл каталог"
+        );
+        let names: Vec<&str> = app.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["план.txt"]);
+        assert!(app.error().is_none(), "{:?}", app.error());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     /// «Устройства» — реальные точки монтирования: без `/mnt` пункт не
     /// показывается, корень остаётся.
     #[test]
