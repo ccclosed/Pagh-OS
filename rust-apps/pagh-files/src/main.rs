@@ -160,6 +160,7 @@ fn run_compositor(
 
     // Переключиться на полный кадр: отпустить shm-поколение (если было) и
     // выделить обычный RGBA-холст.
+    #[allow(clippy::too_many_arguments)]
     fn use_fallback(
         client: &mut DesktopClient,
         shm: &mut Option<ShmFrame>,

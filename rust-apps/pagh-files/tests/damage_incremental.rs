@@ -74,7 +74,7 @@ fn step(app: &mut FilesApp, frame: &mut Canvas, layer: &StaticLayer, event: Even
 
 fn prepared() -> (FilesApp, Canvas, StaticLayer) {
     let mut app = demo_app();
-    let mut frame = render_window(&app);
+    let frame = render_window(&app);
     let mut layer = StaticLayer::new(app.size());
     layer.rebuild(|canvas| app.draw_base(canvas));
     app.take_damage();
@@ -88,10 +88,10 @@ fn list_row(app: &FilesApp, index: usize) -> Rect {
 
 #[test]
 fn list_hover_damages_only_the_row() {
-    let (mut app, mut frame, layer) = prepared();
+    let (mut app, _frame, layer) = prepared();
     app.set_view(ViewMode::List);
     // Переключение режима вне события — большое изменение: полный кадр.
-    frame = render_window(&app);
+    let mut frame = render_window(&app);
     app.take_damage();
 
     let row = list_row(&app, 1);
@@ -189,8 +189,8 @@ fn toolbar_hover_matches_full_frame() {
 #[test]
 fn sidebar_hover_matches_full_frame() {
     let (mut app, mut frame, layer) = prepared();
-    let layout = app.layout();
-    let item = layout
+    let item = app
+        .layout()
         .sidebar_list
         .items
         .get(3)
@@ -209,9 +209,9 @@ fn sidebar_hover_matches_full_frame() {
 
 #[test]
 fn search_typing_matches_full_frame() {
-    let (mut app, mut frame, layer) = prepared();
+    let (mut app, _frame, layer) = prepared();
     app.show_search("");
-    frame = render_window(&app);
+    let mut frame = render_window(&app);
     app.take_damage();
     step(
         &mut app,
@@ -235,9 +235,9 @@ fn search_typing_matches_full_frame() {
 
 #[test]
 fn scroll_matches_full_frame() {
-    let (mut app, mut frame, layer) = prepared();
+    let (mut app, _frame, layer) = prepared();
     app.set_view(ViewMode::List);
-    frame = render_window(&app);
+    let mut frame = render_window(&app);
     app.take_damage();
     let layout = app.layout();
     let center = Point::new(
@@ -258,8 +258,7 @@ fn scroll_matches_full_frame() {
 
 #[test]
 fn menu_hover_matches_full_frame() {
-    let (mut app, mut frame, layer) = prepared();
-    let layout = app.layout();
+    let (mut app, _frame, layer) = prepared();
     let row = list_row(&app, 1);
     // Правый клик по строке открывает контекстное меню — это popup, полный кадр.
     app.handle_event(&Event::MouseDown {
@@ -267,7 +266,7 @@ fn menu_hover_matches_full_frame() {
         button: MouseButton::Right,
     });
     assert!(app.menu_open(), "меню не открылось");
-    frame = render_window(&app);
+    let mut frame = render_window(&app);
     app.take_damage();
 
     // Ведём курсор по пунктам меню: damage — прямоугольник меню.
@@ -298,7 +297,7 @@ fn direct_state_change_without_event_requests_full_frame() {
     app.set_view(ViewMode::List);
     assert!(app.take_damage().is_empty());
     // А после события damage снова точечный и совпадает с полным кадром.
-    let (mut app, mut frame, layer) = prepared();
+    let (mut app, _frame, layer) = prepared();
     app.set_view(ViewMode::List);
     let mut frame = render_window(&app);
     app.take_damage();
@@ -317,12 +316,12 @@ fn direct_state_change_without_event_requests_full_frame() {
 
 #[test]
 fn click_on_row_costs_less_than_a_percent_of_the_window() {
-    let (mut app, mut frame, layer) = prepared();
+    let (mut app, _frame, layer) = prepared();
     let row = Rect::new(0, 0, WINDOW.w, 26);
     let point = Point::new(40, row.y + 13);
     // Выделение первой строки списка.
     app.set_view(ViewMode::List);
-    frame = render_window(&app);
+    let mut frame = render_window(&app);
     app.take_damage();
     let item = list_row(&app, 0);
     app.handle_event(&Event::MouseDown {
@@ -347,7 +346,7 @@ fn click_on_row_costs_less_than_a_percent_of_the_window() {
 
 #[test]
 fn resize_event_requests_full_frame() {
-    let (mut app, mut frame, _layer) = prepared();
+    let (mut app, _frame, _layer) = prepared();
     app.handle_event(&Event::Resize {
         size: Size::new(WINDOW.w - 40, WINDOW.h - 20),
     });
@@ -364,9 +363,9 @@ fn event_cost_full_frame_vs_widget_damage() {
     use pagh_ui::damage::{DamageTracker, DEFAULT_TILE};
     use std::time::Instant;
 
-    let (mut app, mut frame, layer) = prepared();
+    let (mut app, _frame, layer) = prepared();
     app.set_view(ViewMode::List);
-    frame = render_window(&app);
+    let mut frame = render_window(&app);
     app.take_damage();
     let row = list_row(&app, 1);
     let event = Event::MouseMove {

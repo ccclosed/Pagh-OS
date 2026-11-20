@@ -616,9 +616,9 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                         None => false,
                     };
                     prev_frame = None;
-                    if resized {
-                        // Новая поверхность — полный кадр.
-                    } else {
+                    // Новая поверхность (resize_shm) уже означает полный кадр;
+                    // иначе уходим на обычный холст, как legacy-клиент.
+                    if !resized {
                         if let Some(stale) = shm.take() {
                             let _ = client.release_shm(&stale);
                         }
@@ -1040,9 +1040,9 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                         None => false,
                     };
                     prev_frame = None;
-                    if resized {
-                        // Новая поверхность — полный кадр.
-                    } else {
+                    // Новая поверхность (resize_shm) уже означает полный кадр;
+                    // иначе уходим на обычный холст, как legacy-клиент.
+                    if !resized {
                         if let Some(stale) = shm.take() {
                             let _ = client.release_shm(&stale);
                         }
@@ -1140,7 +1140,6 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                         }
                         fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
                         prev_frame = None;
-                        dirty = true;
                     }
                     Err(error) => return Err(format!("commit_shm: {error}")),
                 }
@@ -1421,7 +1420,7 @@ mod tests {
         let theme = Theme::default();
         let opts = RenderOptions::default();
         let terminal = terminal_with(80, 24, b"$ echo hello");
-        let (width, height) = grid(80, 24);
+        let (_, _) = grid(80, 24);
         let mut canvas = screen_canvas(80, 24, &theme);
         let mut prev = None;
         paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
