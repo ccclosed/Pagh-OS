@@ -2794,8 +2794,9 @@ pub(super) fn cmd_free(_ctx: &mut ShellCtx, args: &[&str]) {
 /// когда cmdline пуст.
 pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
     shell_println("  PID  PPID STAT COMMAND");
-    // Потоки ядра (сам shell, сетевой насос, gated selftest harness) — НЕ
-    // Linux compat-процессы и не имеют записи в /proc, поэтому таблица состояла
+    // Потоки ядра (сам shell, диспетчер ввода `inputd`, сетевой насос `netd`,
+    // `usb`, `logd`, gated selftest harness) — НЕ Linux compat-процессы и не
+    // имеют записи в /proc, поэтому таблица состояла
     // из голого заголовка всякий раз, когда не было живого `lxrun`-процесса —
     // что читается как «на машине вообще нет процессов», ровно наоборот от того,
     // зачем нужен `ps`. Они перечисляются из таблицы имён планировщика, в
