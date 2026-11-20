@@ -86,6 +86,39 @@ impl Clone for Canvas {
     }
 }
 
+/// Fill `bytes` with a repeated 4-byte surface pixel.
+///
+/// The loop shape is not cosmetic: `chunks_exact_mut(4)` + `copy_from_slice`
+/// is what LLVM unrolls into wide (vector) stores, while assigning an array
+/// element by element (`*chunk = [..]` over `as_chunks_mut::<4>`) is not. On a
+/// 900×600 surface (2.16 MiB) that is 0.055 ms against 0.32 ms; "wider" blocks
+/// (`as_chunks_mut::<8>`/`<16>` + `copy_from_slice`) measure 0.25 ms and break
+/// the unroll as well. No alignment is required, so the same code serves a
+/// `Vec<u8>` and a `MAP_SHARED` mapping with an arbitrary `stride`, and it
+/// stays inside the crate's `#![forbid(unsafe_code)]`.
+fn fill_pixel_run(bytes: &mut [u8], pixel: [u8; 4]) {
+    let mut chunks = bytes.chunks_exact_mut(4);
+    for chunk in chunks.by_ref() {
+        chunk.copy_from_slice(&pixel);
+    }
+    // No < 4-byte tail occurs in this renderer (every length is a multiple of
+    // 4), but a fill must cover its slice completely or the frame gets a hole.
+    for (i, byte) in chunks.into_remainder().iter_mut().enumerate() {
+        *byte = pixel[i % 4];
+    }
+}
+
+/// The 4 bytes of a pixel in surface storage order: RGBA for an own buffer,
+/// `B,G,R,0` for a client `ShmSurface` (the PDP/1 wire order).
+#[inline]
+fn surface_pixel(mapped: bool, color: Rgb) -> [u8; 4] {
+    if mapped {
+        [color.2, color.1, color.0, 0]
+    } else {
+        [color.0, color.1, color.2, 255]
+    }
+}
+
 #[inline]
 fn mapped_rgba(bytes: &[u8], stride: usize, x: usize, y: usize) -> [u8; 4] {
     let offset = y * stride + x * 4;
@@ -159,18 +192,15 @@ impl Canvas {
 
     pub fn fill(&mut self, bg: Rgb) {
         if let Some(mapping) = &mut self.mapping {
+            let pixel = [bg.2, bg.1, bg.0, 0];
             let bytes = mapping.as_mut_slice();
             for y in 0..self.height {
                 let row = &mut bytes[y * self.stride..y * self.stride + self.width * 4];
-                for px in row.as_chunks_mut::<4>().0 {
-                    *px = [bg.2, bg.1, bg.0, 0];
-                }
+                fill_pixel_run(row, pixel);
             }
             return;
         }
-        for chunk in self.pixels.as_chunks_mut::<4>().0 {
-            *chunk = [bg.0, bg.1, bg.2, 255];
-        }
+        fill_pixel_run(&mut self.pixels, [bg.0, bg.1, bg.2, 255]);
     }
 
     #[inline]
@@ -180,17 +210,19 @@ impl Canvas {
         }
         if let Some(mapping) = &mut self.mapping {
             let i = y * self.stride + x * 4;
-            mapping.as_mut_slice()[i] = color.2;
-            mapping.as_mut_slice()[i + 1] = color.1;
-            mapping.as_mut_slice()[i + 2] = color.0;
-            mapping.as_mut_slice()[i + 3] = 0;
+            let pixel = surface_pixel(true, color);
+            mapping.as_mut_slice()[i] = pixel[0];
+            mapping.as_mut_slice()[i + 1] = pixel[1];
+            mapping.as_mut_slice()[i + 2] = pixel[2];
+            mapping.as_mut_slice()[i + 3] = pixel[3];
             return;
         }
+        let pixel = surface_pixel(false, color);
         let i = (y * self.width + x) * 4;
-        self.pixels[i] = color.0;
-        self.pixels[i + 1] = color.1;
-        self.pixels[i + 2] = color.2;
-        self.pixels[i + 3] = 255;
+        self.pixels[i] = pixel[0];
+        self.pixels[i + 1] = pixel[1];
+        self.pixels[i + 2] = pixel[2];
+        self.pixels[i + 3] = pixel[3];
     }
 
     /// Alpha-blend `color` over the existing pixel.
@@ -219,13 +251,34 @@ impl Canvas {
         );
     }
 
+    /// Fill a rectangle without blending, clipped to the surface.
+    ///
+    /// Each row is one contiguous store (row-store): bounds and the
+    /// `mapping`/`pixels` choice are resolved once per row instead of once per
+    /// pixel. On the 112×33 grid this is the 8×18 cell background that used to
+    /// go through [`Canvas::put`] — 532k calls per frame, 0.99 ms against
+    /// 0.10 ms after the change.
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: Rgb) {
         let x1 = (x + w).min(self.width);
         let y1 = (y + h).min(self.height);
-        for py in y..y1 {
-            for px in x..x1 {
-                self.put(px, py, color);
+        if x >= x1 || y >= y1 {
+            return;
+        }
+        let run = x1 - x;
+        if let Some(mapping) = &mut self.mapping {
+            let pixel = surface_pixel(true, color);
+            let bytes = mapping.as_mut_slice();
+            for py in y..y1 {
+                let start = py * self.stride + x * 4;
+                fill_pixel_run(&mut bytes[start..start + run * 4], pixel);
             }
+            return;
+        }
+        let pixel = surface_pixel(false, color);
+        let stride = self.width * 4;
+        for py in y..y1 {
+            let start = py * stride + x * 4;
+            fill_pixel_run(&mut self.pixels[start..start + run * 4], pixel);
         }
     }
 

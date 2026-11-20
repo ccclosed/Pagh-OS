@@ -325,3 +325,80 @@ fn cleared_path_repaints_non_default_backgrounds() {
         "a cell with an explicit background must be painted"
     );
 }
+
+/// The row-store rewrite must write exactly the pixels the per-pixel path wrote,
+/// including clipped rectangles and zero-size requests.
+#[test]
+fn bulk_fills_match_the_per_pixel_reference() {
+    let theme = theme();
+    let (width, height) = (23, 17);
+    // An offset stride exercises the mapped path's row arithmetic.
+    let stride = width * 4 + 12;
+    let cases = [
+        (0, 0, width, height, Rgb(10, 20, 30)),
+        (3, 4, 5, 1, Rgb(200, 100, 50)),
+        (width - 2, height - 1, 8, 8, Rgb(1, 2, 3)), // clipped at the edge
+        (width, 0, 4, 4, Rgb(9, 9, 9)),              // fully outside
+        (0, 0, 0, 5, Rgb(9, 9, 9)),                  // empty
+        (2, 2, 0, 0, Rgb(9, 9, 9)),                  // empty
+        (7, 7, 1, 1, Rgb(255, 255, 255)),
+    ];
+    for (x, y, w, h, color) in cases {
+        // Reference: the per-pixel `put` path (blend_pixel at alpha 255).
+        let mut reference = Canvas::new(width, height, theme.bg);
+        for py in y..(y + h).min(height) {
+            for px in x..(x + w).min(width) {
+                reference.blend_pixel(px, py, color, 255);
+            }
+        }
+        let mut fast = Canvas::new(width, height, theme.bg);
+        fast.fill_rect(x, y, w, h, color);
+        assert_eq!(
+            reference.pixels, fast.pixels,
+            "owned fill_rect({x},{y},{w},{h}) diverges from the per-pixel path"
+        );
+
+        // Same through a mapped surface: wire order must stay B,G,R,0.
+        let fd = pagh_ui::shm::create_memfd("bulk-fill-reference").expect("memfd");
+        pagh_ui::shm::set_len(std::os::fd::AsRawFd::as_raw_fd(&fd), stride * height).expect("len");
+        let mapping = pagh_ui::shm::MappedBuffer::map_shared(
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            stride * height,
+        )
+        .expect("mmap");
+        let mut mapped = Canvas::from_mapped(mapping, width, height, stride).expect("canvas");
+        mapped.fill(theme.bg);
+        mapped.fill_rect(x, y, w, h, color);
+        let rgba = mapped.clone();
+        assert_eq!(
+            fast.pixels, rgba.pixels,
+            "mapped fill_rect({x},{y},{w},{h}) diverges from the RGBA surface"
+        );
+    }
+
+    // Whole-surface fill, both storages, against a per-pixel reference.
+    let mut reference = Canvas::new(width, height, theme.bg);
+    for py in 0..height {
+        for px in 0..width {
+            reference.blend_pixel(px, py, Rgb(4, 5, 6), 255);
+        }
+    }
+    let mut filled = Canvas::new(width, height, theme.bg);
+    filled.fill(Rgb(4, 5, 6));
+    assert_eq!(reference.pixels, filled.pixels, "owned fill diverges");
+
+    let fd = pagh_ui::shm::create_memfd("bulk-fill-whole").expect("memfd");
+    pagh_ui::shm::set_len(std::os::fd::AsRawFd::as_raw_fd(&fd), stride * height).expect("len");
+    let mapping = pagh_ui::shm::MappedBuffer::map_shared(
+        std::os::fd::AsRawFd::as_raw_fd(&fd),
+        stride * height,
+    )
+    .expect("mmap");
+    let mut mapped = Canvas::from_mapped(mapping, width, height, stride).expect("canvas");
+    mapped.fill(Rgb(4, 5, 6));
+    assert_eq!(
+        reference.pixels,
+        mapped.clone().pixels,
+        "mapped fill diverges (wire order or stride)"
+    );
+}
