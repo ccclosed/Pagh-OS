@@ -192,7 +192,7 @@ MODE_EVIDENCE = {
     ),
     "desktop": (
         r"pagh-desktop:|pagh-files:|pagh-terminal:|evdev: |ext2 mounted at /mnt|"
-        r"launch-evidence|E2E_ALIVE|PANIC|\[EXC|pagh:/>",
+        r"/mnt/ev|launch ok|E2E_ALIVE|PANIC|\[EXC|pagh:/>",
     ),
 }
 
@@ -2999,6 +2999,21 @@ def _require_boot_serial(h: "Harness", label: str, timeout: float) -> None:
 # ``--legacy-demo`` keeps working — the default path never spawns it.
 _DESKTOP_INJECTED = ("pd", "pagh-desktop-demo", "pagh-files", "pagh-terminal")
 
+# The guest shell's line editor caps a command at MAX_CMD_LEN = 256 BYTES
+# (src/shell/editor.rs:16, R11.1) and silently drops the rest while the echo
+# still shows it. Every command below goes through `_desktop_shell_cap`, which
+# refuses to type a truncated one.
+SHELL_MAX_CMD_LEN = 256
+# Evidence directory of the launched `--launch-target`. Short on purpose: it is
+# part of a compositor command line that has to fit the shell cap above.
+LAUNCH_EVIDENCE = "/mnt/ev"
+# Lifetime of the dedicated type-13 compositor. It must outlive the autostart
+# requester (window + focus), the chord, and the spawned target's own PNG run:
+# under TCG that is ~40 s typical and the slow-scene path the acceptance already
+# documents can take ~90 s, so 180 s keeps a wide margin. The phase then waits
+# for the compositor's own exit line instead of parking it with ^Z/bg.
+TYPE13_PD_MS = 180_000
+
 
 def _desktop_bins(skip_build: bool) -> dict[str, pathlib.Path]:
     """Build/locate the static musl binaries the desktop acceptance needs.
@@ -3137,9 +3152,12 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
       scanout and survived its selfcheck; the evdev backend decoded real
       keyboard (F10) and relative-mouse (REL, BTN_LEFT) events;
     * pagh-files connected over PDP/1 and its window was drawn on screen;
-    * its global Alt+Shift+F4 sent PDP/1 ``launch`` (type 13) and the compositor
-      spawned the configured ``--launch-target`` — the real pagh-files binary in
-      headless mode, whose PNG under /mnt is the evidence;
+    * a real, focused pagh-files client (started by the compositor through
+      ``--autostart`` -> ``launch_targets``) sent PDP/1 ``launch`` (type 13) with
+      its global Alt+Shift+F4, and the compositor spawned the configured
+      ``--launch-target`` — the real pagh-files binary in headless mode, whose
+      PNG under /mnt is the evidence. This runs in its own bounded foreground
+      compositor; see ``_desktop_type13_phase`` for why;
     * pagh-terminal connected as a second window (the #138 private shell
       session; the ``--vt``/``--vt-input`` VT mirror stays as the fallback) and
       keeps committing frames (cursor blink);
@@ -3420,9 +3438,55 @@ def mode_groups(h: "Harness") -> tuple[str, int]:
                   crashes[0] if crashes else "none")
     h.metrics["probe modes"] = "root, drop, dropvideo, file"
     return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+
+
+def _desktop_shell_cap(text: str, label: str) -> str:
+    """Return `text` after proving it fits the guest shell's command buffer.
+
+    The dev shell's line editor caps a command at MAX_CMD_LEN = 256 BYTES
+    (src/shell/editor.rs:16, requirement R11.1) and silently drops the rest,
+    while the screen echo still shows everything typed. Every command this
+    harness types goes through that editor, so an over-long command is EXECUTED
+    truncated and no check can see it — before this guard the real-apps
+    compositor command was 259 bytes and the guest ran `--selfcheck-ms 3`
+    instead of `--selfcheck-ms 3000`. A silent truncation is exactly the class of
+    defect this harness exists to catch, so refuse it here (the run ends
+    SETUP-ERROR) instead of measuring something other than what was written.
+    """
+    size = len(text.encode())
+    if size > SHELL_MAX_CMD_LEN:
+        raise SetupError(
+            f"{label}: command is {size} bytes, over the guest shell's "
+            f"{SHELL_MAX_CMD_LEN}-byte line cap (src/shell/editor.rs:16); it "
+            f"would run truncated: {text!r}")
+    return text
+
+
+def _wait_serial_after(guest: "Guest", offset: int, patterns, timeout: float,
+                       label: str) -> str | None:
+    """`wait_for`, restricted to serial bytes written after `offset`.
+
+    A marker from an earlier phase is not evidence for this one: one run can
+    launch the same target twice, so "the marker exists somewhere on serial" and
+    "this phase produced the marker" are different claims.
+    """
+    deadline = time.time() + timeout
+    compiled = [re.compile(p) for p in patterns]
+    while time.time() < deadline:
+        text = guest.serial()[offset:]
+        for pat in compiled:
+            if pat.search(text):
+                return pat.pattern
+        if guest.proc is not None and not guest.alive():
+            raise HarnessError(f"QEMU exited before the {label}; serial tail:\n"
+                               f"{tail(guest.serial())}")
+        time.sleep(0.5)
+    return None
+
+
 def _wait_launch_png(guest: "Guest", kb: "QemuShotKeyboard",
                      timeout: float = 90.0) -> bool:
-    """Poll `ls /mnt/launch-evidence` until a PNG appears.
+    """Poll `ls <LAUNCH_EVIDENCE>` until a PNG appears.
 
     The launched pagh-files renders six 1280x800 scenes before it prints the first
     line; under TCG that takes longer than a fixed 6-8 s nap, and its first
@@ -3435,7 +3499,7 @@ def _wait_launch_png(guest: "Guest", kb: "QemuShotKeyboard",
     while time.time() < deadline:
         off = len(guest.serial())
         _desktop_restart_shell_line(kb)
-        kb.text("ls /mnt/launch-evidence")
+        kb.text(f"ls {LAUNCH_EVIDENCE}")
         kb.key("ret")
         # Give `ls` a moment to answer, then look only at the bytes written
         # after this command (an old `files-main` line elsewhere on serial is
@@ -3706,6 +3770,131 @@ def _desktop_demo_child_phase(h: "Harness", guest: "Guest",
     return ok
 
 
+def _desktop_type13_phase(h: "Harness", guest: "Guest",
+                          kb: "QemuShotKeyboard") -> bool:
+    """REAL PDP/1 ``launch`` (type 13): a real client asks the compositor to launch.
+
+    The request has to come from a CLIENT — ``pagh-files``'s global Alt+Shift+F4
+    (``Command::LaunchTerminal`` -> ``Message::Launch{app:"terminal"}``) — so the
+    requester must be alive AND FOCUSED when the chord lands. This phase
+    therefore owns one compositor run instead of borrowing the real-apps phase's
+    background client, for four reasons:
+
+    * the previous shape asked a client from an earlier step to still be alive;
+      the phase itself tolerates that client being gone after its click
+      (``h.info_check("Files client gone after the pointer click")``), and when
+      it is gone the chord lands on a window that has no Alt+Shift+F4 handler and
+      nothing can ever send type 13 — a harness lifecycle bug read as a product
+      defect;
+    * a fresh ``pagh-files --connect`` cannot replace it inside the same
+      compositor: window ids are client-chosen from a per-process counter that
+      starts at 1 (``pagh-ui/src/client.rs`` ``next_window``) while the
+      compositor's namespace is global, and ``create_window`` does not wait for
+      an ack — so a second Files keeps an unowned window id, only ever sees
+      ``NOT_OWNER``, and never takes focus;
+    * ``--autostart files`` makes the COMPOSITOR start the real requester through
+      the same ``launch_targets`` registry a PDP launch uses; a newly created
+      window takes focus, so no pointer click (and no click coordinate) is
+      involved at all;
+    * it runs in the FOREGROUND, because the spawn marker
+      (``pagh-desktop: launch terminal ok``) and the spawned target's own output
+      go to the controlling terminal, and a background writer is stopped by
+      TOSTOP (``drivers/tty.rs``, on by default). With ``--quiet`` there would be
+      no marker at all and the check would rest on the PNG alone.
+
+    One compositor at a time: ``/dev/input/event0`` has ONE ring shared by its
+    readers (``drivers/evdev.rs``), so a second compositor would split the chord.
+    The session is closed with one ^C for the whole foreground group (see the
+    comment at the end of the body for why the compositor is not allowed to exit
+    on its own here), and ``--exit-after-ms`` stays as the fallback lifetime.
+    """
+    ok = True
+    ev = LAUNCH_EVIDENCE
+    pd_cmd = _desktop_shell_cap(
+        "rust /mnt/pd --backend fbdev --input evdev --full-render "
+        "--launch-target files=/mnt/pagh-files|--socket|{socket} "
+        f"--launch-target terminal=/mnt/pagh-files|--out|{ev}|--shot|all|"
+        "--path|{socket} "
+        f"--autostart files --exit-after-ms {TYPE13_PD_MS}",
+        "type-13 compositor",
+    )
+    off = len(guest.serial())
+    log(f"type (type-13 compositor + real requester): {pd_cmd}")
+    _desktop_type(kb, h.qmp, pd_cmd)
+    kb.key("ret")
+    requester = _wait_serial_after(
+        guest, off, [r"pagh-files: окно \d+ \d+x\d+"], 120.0,
+        "type-13 requester window")
+    ok &= h.check("PDP/1 requester is a live, focused real client "
+                  "(--autostart files -> launch_targets)",
+                  requester is not None,
+                  regex_first(r"pagh-files: окно[^\r\n]*", guest.serial())
+                  or "no requester window")
+    # Alt+Shift+F4 is pagh-files' own global shortcut: the CLIENT sends type 13.
+    chord_off = len(guest.serial())
+    h.qmp.keys(["alt", "shift", "f4"])
+    time.sleep(0.5)
+    h.qmp.release_modifiers()
+    spawn = _wait_serial_after(
+        guest, chord_off, [r"pagh-desktop: launch terminal ok"], 60.0,
+        "type-13 spawn marker")
+    ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
+                  spawn is not None,
+                  regex_first(r"pagh-desktop: launch terminal ok[^\r\n]*",
+                              guest.serial()) or "no spawn marker")
+    # The spawned target is the real headless pagh-files: it writes its scenes
+    # before it prints, and it runs in this foreground group, so its own line is
+    # visible. A missing line is not evidence by itself (TOSTOP could eat it),
+    # so the directory listing below is the ground truth on the ext2 volume.
+    _wait_serial_after(guest, chord_off, [r"[^\s/]+\.png"], 120.0,
+                       "launched target PNG line")
+    # End the session by interrupting the whole foreground group (compositor AND
+    # the clients it started) rather than letting the compositor exit by itself.
+    # A client that sees the socket close runs its normal exit path, and that
+    # path currently faults in the guest's Linux-compat layer: `__errno_location`
+    # reads through a stale FS.base and the process is killed as SIGSEGV
+    # (`[EXC #13] GP Fault ... RIP=0x88e15`, reproduced with unmodified product
+    # code; the SAME binary exits 0 on the host, so it is kernel-side, not
+    # userspace). A group SIGINT terminates them in the kernel, so this leg stays
+    # free of a crash that has nothing to do with type 13, and the check below
+    # (`no panic/exception/SIGSEGV in guest`) keeps its meaning. The defect
+    # itself is reported, not hidden; `--exit-after-ms` stays as the fallback if
+    # the chord does not land.
+    stop_off = len(guest.serial())
+    h.qmp.keys(["ctrl", "c"])
+    h.qmp.release_modifiers()
+    # The marker is the shell prompt, not a literal "^C": the chord kills the
+    # whole group from the keyboard driver (`send_signal_to_pgid_all`), so
+    # `foreground_wait` finds the job already gone and never prints its own ^C
+    # line (observed: three `[signal] pid=N sig=2` lines, then `pagh:/>`).
+    stopped = _wait_serial_after(guest, stop_off, [r"pagh:/> "], 45.0,
+                                 "shell prompt after the type-13 session")
+    if stopped is None:
+        h.info_check("type-13 session did not stop on ^C",
+                     "falling back to the --exit-after-ms lifetime")
+        _wait_serial_after(guest, stop_off,
+                           [r"pagh-desktop: exit-after-ms reached"],
+                           TYPE13_PD_MS / 1000.0 + 60.0,
+                           "type-13 compositor exit")
+    listing = None
+    if stopped is not None:
+        listing_off = len(guest.serial())
+        _desktop_restart_shell_line(kb)
+        kb.text(f"ls {ev}")
+        kb.key("ret")
+        listing = _wait_serial_after(guest, listing_off, [r"[^\s/]+\.png"], 60.0,
+                                     "launch evidence listing")
+    else:
+        h.info_check("type-13 evidence dir not polled",
+                     "the session was still in the foreground")
+    ev_line = regex_first(r"[^\r\n]*\.png[^\r\n]*", guest.serial())
+    ok &= h.check("launched target is the REAL binary (headless Files PNG on /mnt)",
+                  listing is not None and "pagh-desktop-demo" not in guest.serial(),
+                  f"{ev}: {ev_line}" if listing is not None
+                  else f"no PNG in {ev}")
+    return ok
+
+
 def _desktop_real_apps(h: "Harness", guest: "Guest",
                        kb: "QemuShotKeyboard") -> bool:
     """Phase 2 (default): REAL pagh-files / pagh-terminal windows, PDP launch."""
@@ -3740,6 +3929,14 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
         h.qmp = QmpClient(h.qmp_path)
         h.qmp.connect()
 
+    # ── REAL PDP/1 launch (type 13) gets its own compositor run first ──
+    # It needs a live, FOCUSED requester and the shared event ring for itself, so
+    # it cannot borrow the background compositor below (see the phase's own
+    # docstring). It ends by itself via --exit-after-ms and hands the shell back
+    # before the real-apps compositor starts.
+    ok &= _desktop_type13_phase(h, guest, kb)
+    _desktop_restart_shell_line(kb)
+
     # Kernel TOSTOP is ON by default (drivers/tty.rs): a BACKGROUND job writing
     # to the console is stopped with SIGTTOU. The compositor therefore runs with
     # --quiet (backend/selfcheck lines are plain stdout and stay): its per-client
@@ -3747,11 +3944,13 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     # the server-side `hello ... app="pagh-files"` line is NOT on serial here; the
     # client's window line proves the same handshake (Files can only print it
     # after hello -> welcome -> create succeeded).
-    pd_cmd = (
-        f"rust /mnt/pd --backend fbdev --input evdev --quiet --full-render "
-        f"--launch-target files=/mnt/pagh-files|--socket|{{socket}} "
-        f"--launch-target terminal=/mnt/pagh-files|--out|/mnt/launch-evidence|--shot|all|--path|{{socket}} "
-        f"--exit-after-ms {a.pd_lifetime_ms} --selfcheck-ms {a.selfcheck_ms}"
+    pd_cmd = _desktop_shell_cap(
+        "rust /mnt/pd --backend fbdev --input evdev --quiet --full-render "
+        "--launch-target files=/mnt/pagh-files|--socket|{socket} "
+        f"--launch-target terminal=/mnt/pagh-files|--out|{LAUNCH_EVIDENCE}|"
+        "--shot|all|--path|{socket} "
+        f"--exit-after-ms {a.pd_lifetime_ms} --selfcheck-ms {a.selfcheck_ms}",
+        "real-apps compositor",
     )
     off = mark()
     log(f"type: {pd_cmd}")
@@ -3807,7 +4006,12 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     log(f"type: {headless_cmd}")
     kb.text(headless_cmd)
     kb.key("ret")
-    manual = wait_new(off, [r"\.png"], 60.0, "headless Files scene line")
+    # Six 1280x800 scenes with PNG compression: the same run takes ~10 s warm and
+    # can cross a minute under TCG when the host is busy (observed at 60 s on a
+    # loaded host while the scenes did land), so give it the budget the launch
+    # poll already uses. This is a time budget, not a weaker claim: the check
+    # still needs a real `.png` line on serial.
+    manual = wait_new(off, [r"\.png"], 180.0, "headless Files scene line")
     ok &= h.check("REAL pagh-files renders headless PNG scenes on /mnt",
                   manual is not None,
                   regex_first(r"[^\r\n]*\.png[^\r\n]*", guest.serial()[off:]) or
@@ -3979,53 +4183,19 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("serial shell alive after both real applications ran",
                   alive is not None, "^echo seen on serial")
 
-    # ── REAL PDP/1 launch (type 13): requester -> launch_app -> spawn target ──
-    # The requester is the ORIGINAL Files client parked in the background above:
-    # a fresh `rust /mnt/pagh-files --connect ...` typed at this point is killed
-    # by an input artifact (serial: `[signal] pid=N sig=2 default-terminate`)
-    # before the hotkey can reach it, while the parked client has already proven
-    # it survives its own window checks. Focus it in a provably free point: the
-    # point is inside the 1060x640 Files content and outside the 720x420 Terminal
-    # rectangle, and is not the resize grip.
-    h.qmp.rel(2000, 2000)
-    time.sleep(0.2)
-    h.qmp.rel(-280, -200)
-    time.sleep(0.3)
-    h.qmp.button("left", True)
-    time.sleep(0.1)
-    h.qmp.button("left", False)
-    time.sleep(0.6)
-    kb_off = mark()
-    h.qmp.keys(["alt", "shift", "f4"])
-    time.sleep(0.5)  # let the chord land before the modifier reset
-    h.qmp.release_modifiers()
-    time.sleep(6.0)
-    launch_text = guest.serial()[kb_off:]
-    died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
-    if died:
-        h.info_check("PDP launch: requesting pagh-files client died with EMSGSIZE",
-                     "pagh-files: Message too large (os error 90) after type-13 launch")
-    evidence = _wait_launch_png(guest, kb)
-    ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
-                  evidence,
-                  "PNG written" if evidence else "no PNG after 90 s of polling")
-    # `_wait_launch_png` returns a bool, so `is not None` was always true and the
-    # check passed vacuously when no PNG appeared at all. Require the evidence
-    # itself: a launch that produced nothing must FAIL here too.
-    ok &= h.check("launched target is the REAL binary (headless Files PNG on /mnt)",
-                  "pagh-desktop-demo" not in guest.serial() and evidence is True,
-                  "pagh-files headless output" if evidence
-                  else "no PNG: launch produced no evidence")
-
     # ── separate: launch_targets spawn from the compositor hotkey ──
-    # NOT a substitute for the type-13 leg above: this proves the server-side
-    # registry/spawn_target path only (no PDP message, no requester). The
-    # evidence directory is cleared first so the two checks are independent.
+    # The PDP/1 type-13 leg ran in its own compositor run at the top of this
+    # phase (it needs a live, focused requester and the shared event ring for
+    # itself). This check is NOT a substitute for it: it proves the server-side
+    # registry/spawn_target path with no client and no PDP message, which is why
+    # it kept passing while the client leg was broken. The evidence directory is
+    # cleared first so the two are independent.
     _desktop_restart_shell_line(kb)
     off = mark()
-    kb.text("rm -r /mnt/launch-evidence")
+    kb.text(f"rm -r {LAUNCH_EVIDENCE}")
     kb.key("ret")
-    wait_new(off, [r"/mnt/launch-evidence|rm:"], 10.0, "evidence dir removal")
+    wait_new(off, [rf"{re.escape(LAUNCH_EVIDENCE)}|rm:"], 10.0,
+             "evidence dir removal")
     time.sleep(0.3)
     hotkey_off = mark()
     h.qmp.keys(["ctrl", "alt", "t"])
