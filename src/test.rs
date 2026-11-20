@@ -8148,6 +8148,9 @@ mod usb_hid_tests {
             2,
             ReportMode::Report,
         );
+        // `feed_iface` — рабочий путь (только очередь `inputd`); тест дренирует
+        // её синхронно, иначе результат зависел бы от планировщика.
+        crate::drivers::inputd::drain();
         let after = crate::drivers::ps2_mouse::poll();
         assert_kernel!(
             after.seq == before.seq + 1,
@@ -8164,6 +8167,7 @@ mod usb_hid_tests {
     pub fn report_protocol_mouse_8bit() {
         let before = crate::drivers::ps2_mouse::poll();
         usb_hid::feed_iface(&[0x00, 0x02, 0xFD, 0x01], 1, 2, ReportMode::Report);
+        crate::drivers::inputd::drain();
         let after = crate::drivers::ps2_mouse::poll();
         assert_kernel!(
             after.seq == before.seq + 1,
@@ -9420,7 +9424,12 @@ mod desktop_b_tests {
             );
             while ps2_kbd::take_scancode().is_some() {}
             evdev::reset();
+            // Производитель только кладёт байт в очередь `inputd`; доставку
+            // делает диспетчер. Здесь он вызывается синхронно — то же, что
+            // делает поток раз в тик, — поэтому проверка не зависит от
+            // планировщика (дренаж сериализован и не может переупорядочить).
             ps2_kbd::inject_scancode(0x1E); // физический `a` make (USB-путь)
+            crate::drivers::inputd::drain();
             assert_kernel!(
                 !ps2_kbd::has_scancode(),
                 "dedup: physical key is not duplicated into the shell ring"

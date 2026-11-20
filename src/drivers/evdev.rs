@@ -8,8 +8,9 @@
 //! держит устройство открытым.
 //!
 //! Три источника:
-//!   * PS/2 IRQ1 и USB HID (через `ps2_kbd::inject_scancode`) — байты set-1
-//!     проходят через общий [`super::input_event::ScancodeDecoder`];
+//!   * PS/2 IRQ1 и USB HID (через `ps2_kbd::inject_scancode` → очередь
+//!     `inputd`) — байты set-1 проходят через общий
+//!     [`super::input_event::ScancodeDecoder`] в диспетчере `inputd::drain`;
 //!   * PS/2 IRQ12 и USB HID mouse (через `ps2_mouse::inject_packet`) — после
 //!     сборки пакета эмитятся `BTN_*`/`REL_X`/`REL_Y`/`REL_WHEEL`;
 //!   * каждый пакет закрывается `EV_SYN`/`SYN_REPORT`.
