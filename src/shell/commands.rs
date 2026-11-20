@@ -14,6 +14,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::getopt::{self, Item as GetoptItem, OptSpec};
 use super::identity;
 use super::registry::ShellCtx;
 use crate::arch::x86_64::linux::cred::{Creds, GROUPS_CAP};
@@ -199,25 +200,45 @@ pub(super) fn cmd_cd(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `ls [path]`: перечислить записи каталога (каталоги с завершающим `/`) или
-/// напечатать имя самого файла. По умолчанию `/`, если путь не задан.
+/// Опции `ls`: `-l` длинная форма, `-a` совместимость.
+const LS_OPTIONS: &[OptSpec] = &[getopt::short('l'), getopt::short('a')];
+
+/// `ls [-l] [-a] [path]`: перечислить записи каталога (каталоги с завершающим
+/// `/`) или напечатать имя самого файла. По умолчанию `/`, если путь не задан.
+///
+/// `-l` — режим, ссылки, владелец/группа, размер, имя. `-a` принимается ради
+/// POSIX-совместимости: этот `ls` и так перечисляет все записи каталога (VFS не
+/// скрывает имена с точкой), поэтому флаг не добавляет строк и не притворяется
+/// фильтром. `--` завершает опции; неизвестная опция — ошибка с usage, а не
+/// молчаливое «считать её путём».
 pub(super) fn cmd_ls(_ctx: &mut ShellCtx, args: &[&str]) {
-    // `-l`: длинная форма — режим, ссылки, владелец/группа, размер, имя.
-    // Остальное — путь. Нет пути: CWD (R9.2); относительный путь разрешается
-    // относительно CWD, чтобы работали `.`/`..` (R4.6).
     let mut long = false;
     let mut path_arg: Option<&str> = None;
-    for a in args {
-        if *a == "-l" {
-            long = true;
-        } else if a.starts_with('-') && a.len() > 1 && path_arg.is_none() {
-            shell_println(&alloc::format!("ls: unknown option: {}", a));
+    let parsed = match getopt::parse(args, LS_OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            shell_println(&alloc::format!("ls: {}", e));
+            shell_println("ls: usage: ls [-l] [-a] [path]");
             return;
-        } else if path_arg.is_none() {
-            path_arg = Some(a);
-        } else {
-            shell_println("ls: too many operands");
-            return;
+        }
+    };
+    for item in parsed {
+        match item {
+            GetoptItem::Opt { spec, .. } => match spec.short {
+                Some('l') => long = true,
+                // `-a`: единственный режим листинга — «все записи»; см. doc выше.
+                Some('a') => {}
+                _ => {}
+            },
+            GetoptItem::Operand(p) => {
+                if path_arg.is_none() {
+                    path_arg = Some(p);
+                } else {
+                    shell_println("ls: too many operands");
+                    shell_println("ls: usage: ls [-l] [-a] [path]");
+                    return;
+                }
+            }
         }
     }
     let path = match path_arg {
@@ -628,33 +649,141 @@ pub(super) fn cmd_pci(_ctx: &mut ShellCtx, _args: &[&str]) {
 /// не требует, чтобы пользователь был текущим. Формат повторяет coreutils
 /// (`uid=1000(oleg) gid=1000(oleg) groups=…`), чтобы привычные скрипты/глаза
 /// не удивлялись.
+/// Опции `id`: селекторы вывода и имена вместо чисел.
+const ID_OPTIONS: &[OptSpec] = &[
+    getopt::short('u'),
+    getopt::short('g'),
+    getopt::short('G'),
+    getopt::short('n'),
+];
+
+/// `id [-u|-g|-G] [-n] [user]`: идентичность сессии или запись `/etc/passwd`.
+///
+/// Без аргумента — сессионные креденшелы shell (то, с чем `lxrun` запускает
+/// Linux-программы; `su` меняет именно их). С аргументом — пользователь из
+/// `/etc/passwd` и его группы из `/etc/group`; это чисто справочный вывод и он
+/// не требует, чтобы пользователь был текущим. Формат по умолчанию повторяет
+/// coreutils (`uid=1000(oleg) gid=1000(oleg) groups=…`), чтобы привычные
+/// скрипты/глаза не удивлялись.
+///
+/// POSIX-селекторы: `-u` — uid, `-g` — gid, `-G` — все группы; `-n` печатает
+/// имена вместо чисел (требует одного из селекторов, как coreutils). Несколько
+/// селекторов печатаются каждый на своей строке в порядке появления. Неизвестная
+/// опция — ошибка с usage, а не «принять за имя пользователя».
 pub(super) fn cmd_id(_ctx: &mut ShellCtx, args: &[&str]) {
-    if args.len() > 1 {
-        shell_println("id: usage: id [user]");
+    let mut selectors: Vec<char> = Vec::with_capacity(3);
+    let mut names = false;
+    let mut user_arg: Option<&str> = None;
+    let parsed = match getopt::parse(args, ID_OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            shell_println(&alloc::format!("id: {}", e));
+            shell_println("id: usage: id [-u|-g|-G] [-n] [user]");
+            return;
+        }
+    };
+    for item in parsed {
+        match item {
+            GetoptItem::Opt { spec, .. } => match spec.short {
+                Some(ch @ ('u' | 'g' | 'G')) => {
+                    if !selectors.contains(&ch) {
+                        selectors.push(ch);
+                    }
+                }
+                Some('n') => names = true,
+                _ => {}
+            },
+            GetoptItem::Operand(name) => {
+                if user_arg.is_none() {
+                    user_arg = Some(name);
+                } else {
+                    shell_println("id: too many operands");
+                    shell_println("id: usage: id [-u|-g|-G] [-n] [user]");
+                    return;
+                }
+            }
+        }
+    }
+    if names && selectors.is_empty() {
+        shell_println("id: -n requires -u, -g or -G");
+        shell_println("id: usage: id [-u|-g|-G] [-n] [user]");
         return;
     }
-    if let Some(name) = args.first() {
-        let Some(user) = identity::lookup_user(name) else {
-            shell_println(&alloc::format!("id: '{}': no such user", name));
-            return;
-        };
-        let groups = identity::display_groups_for_user(name).unwrap_or_else(|| {
-            let mut v = alloc::vec::Vec::new();
-            v.push(user.gid);
-            v
-        });
+
+    // Идентичность либо запрошенного пользователя, либо сессии.
+    let (uid, gid, groups) = match user_arg {
+        Some(name) => {
+            let Some(user) = identity::lookup_user(name) else {
+                shell_println(&alloc::format!("id: '{}': no such user", name));
+                return;
+            };
+            let groups = identity::display_groups_for_user(name).unwrap_or_else(|| {
+                let mut v = alloc::vec::Vec::new();
+                v.push(user.gid);
+                v
+            });
+            (user.uid, user.gid, groups)
+        }
+        None => {
+            // Для селекторов `-u`/`-g` — effective id, как `id(1)` coreutils;
+            // группы сессии уже начинаются с egid (`session_groups`).
+            let creds = identity::current();
+            (creds.euid, creds.egid, identity::session_groups())
+        }
+    };
+
+    if !selectors.is_empty() {
+        for selector in selectors {
+            let line = match selector {
+                'u' => {
+                    if names {
+                        identity::user_label(uid)
+                    } else {
+                        alloc::format!("{}", uid)
+                    }
+                }
+                'g' => {
+                    if names {
+                        identity::group_label(gid)
+                    } else {
+                        alloc::format!("{}", gid)
+                    }
+                }
+                // `-G`: все группы через пробел, как coreutils.
+                _ => {
+                    let mut out = String::new();
+                    for (i, gid) in groups.iter().enumerate() {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        out.push_str(&if names {
+                            identity::group_label(*gid)
+                        } else {
+                            alloc::format!("{}", gid)
+                        });
+                    }
+                    out
+                }
+            };
+            shell_println(&line);
+        }
+        return;
+    }
+
+    // Формат по умолчанию: для пользователя — одна справочная строка;
+    // для сессии — с euid/egid, если они отличаются (как у `id` coreutils).
+    if user_arg.is_some() {
         shell_println(&alloc::format!(
             "uid={}({}) gid={}({}) groups={}",
-            user.uid,
-            user.name,
-            user.gid,
-            identity::group_label(user.gid),
+            uid,
+            identity::user_label(uid),
+            gid,
+            identity::group_label(gid),
             identity::format_gids(&groups)
         ));
         return;
     }
     let creds = identity::current();
-    let groups = identity::session_groups();
     let mut line = alloc::format!(
         "uid={}({}) gid={}({})",
         creds.uid,
@@ -683,13 +812,36 @@ pub(super) fn cmd_id(_ctx: &mut ShellCtx, args: &[&str]) {
     shell_println(&line);
 }
 
-/// `groups [user]`: имена групп сессии (или пользователя из `/etc/group`).
+/// Опции `groups`: своих флагов нет, но `--` и отказ на `-x` — часть
+/// getopt-контракта (иначе `groups -x` выглядел бы как имя пользователя).
+const GROUPS_OPTIONS: &[OptSpec] = &[];
+
+/// `groups [--] [user]`: имена групп сессии (или пользователя из `/etc/group`).
 pub(super) fn cmd_groups(_ctx: &mut ShellCtx, args: &[&str]) {
-    if args.len() > 1 {
-        shell_println("groups: usage: groups [user]");
-        return;
+    let mut user_arg: Option<&str> = None;
+    let parsed = match getopt::parse(args, GROUPS_OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            shell_println(&alloc::format!("groups: {}", e));
+            shell_println("groups: usage: groups [user]");
+            return;
+        }
+    };
+    for item in parsed {
+        match item {
+            GetoptItem::Operand(name) => {
+                if user_arg.is_none() {
+                    user_arg = Some(name);
+                } else {
+                    shell_println("groups: too many operands");
+                    shell_println("groups: usage: groups [user]");
+                    return;
+                }
+            }
+            GetoptItem::Opt { .. } => {}
+        }
     }
-    let gids = match args.first() {
+    let gids = match user_arg {
         Some(name) => match identity::display_groups_for_user(name) {
             Some(gids) => gids,
             None => {
@@ -1640,17 +1792,53 @@ pub(super) fn cmd_sleep(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `nano <path>`: запустить полноэкранный редактор nano+.
+/// Опции `nano`: единственная — существующая длинная `--settings`.
+const NANO_OPTIONS: &[OptSpec] = &[getopt::long("settings")];
+
+fn nano_usage() {
+    shell_println("nano: usage: nano [path] | nano --settings [show|reset|set <key> <value>]");
+}
+
+/// `nano [path]`, `nano --settings …`: полноэкранный редактор nano+.
+///
+/// `--settings` — прежняя длинная форма; её подкоманды (`show`/`reset`/`set`)
+/// остаются операндами. Неизвестная опция (`nano -x`) — ошибка с usage, а не
+/// файл с именем `-x`: раньше любой первый аргумент открывался как путь.
 pub(super) fn cmd_nano(_ctx: &mut ShellCtx, args: &[&str]) {
-    if args.first() == Some(&"--settings") {
-        super::nano_config::command(&args[1..]);
+    let mut settings = false;
+    let mut operands: Vec<&str> = Vec::with_capacity(args.len());
+    let parsed = match getopt::parse(args, NANO_OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            shell_println(&alloc::format!("nano: {}", e));
+            nano_usage();
+            return;
+        }
+    };
+    for item in parsed {
+        match item {
+            GetoptItem::Opt { spec, .. } => {
+                if spec.long == Some("settings") {
+                    settings = true;
+                }
+            }
+            GetoptItem::Operand(operand) => operands.push(operand),
+        }
+    }
+    if settings {
+        super::nano_config::command(&operands);
         return;
     }
-    if args.is_empty() {
-        shell_println("usage: nano <path> | nano --settings [show|reset|set <key> <value>]");
+    if operands.is_empty() {
+        nano_usage();
         return;
     }
-    super::nano::run(args[0]);
+    if operands.len() > 1 {
+        shell_println("nano: only one file is supported");
+        nano_usage();
+        return;
+    }
+    super::nano::run(operands[0]);
 }
 
 /// `rust <path> [args...]`: запустить Linux ELF через слой совместимости.
@@ -1946,16 +2134,7 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `lxrun <path> [args...]`: запустить установленный статически слинкованный
-/// Linux-бинарник как ring-3 `Compat_Process`.
-///
-/// Читает ELF по `path` из ext2, загружает через Linux ELF loader, строит
-/// начальный стек System V с переданными аргументами и ставит в очередь
-/// планировщика. Поддерживаются только статические `ET_EXEC` / static-PIE
-/// `ET_DYN` (динамически слинкованные отвергаются). Как и `exec`, запускается с
-/// выключенными прерываниями на время короткого переключения CR3, которое
-/// делают загрузчик/маппер стека.
-/// `warn` включает зеркалирование строк лога ядра `[WARN]` на
+/// `warn <on|off>`: зеркалирование строк лога ядра `[WARN]` на
 /// framebuffer-консоль. Serial всегда получает каждую строку; это управляет
 /// только экранным спамом, который ломал полноэкранные TUI.
 pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
@@ -2104,21 +2283,15 @@ pub(super) fn cmd_fg(_ctx: &mut ShellCtx, _args: &[&str]) {
     foreground_wait(pid, pgid, &command);
 }
 
-pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
-    if args.is_empty() {
-        shell_println("usage: lxrun <path> [args...]");
-        return;
-    }
-    let path = resolve_arg(args[0]);
-    // argv[0] — имя программы как набрано; остальные токены следуют.
-    let argv: alloc::vec::Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
-
-    // Убедиться, что VT-эмулятор существует, чтобы ANSI-вывод nvim рендерился
-    // правильно. Он создаётся один раз и затем живёт: консоль и VT делят один
-    // framebuffer, а переинициализация на каждый запуск стирала экран и оставляла
-    // курсор shell позади (промпт уезжал вниз на каждом запуске).
-    crate::drivers::vt::ensure();
-    let env: [&[u8]; 12] = [
+/// Окружение, с которым `lxrun` запускает Linux-программу.
+///
+/// Список фиксированный: у shell фазы 1 нет `export`, поэтому программа видит
+/// один и тот же `PATH`/`HOME`/... независимо от того, что набирали до неё.
+/// `PATH` здесь — ещё и источник для поиска голого имени (см.
+/// [`lxrun_search_dirs`]); жёсткое `/mnt/usr/bin` — подмножество
+/// [`super::lxpath::DEFAULT_PATH`], так что поиск не сужается.
+fn lxrun_env() -> [&'static [u8]; 12] {
+    [
         b"TERM=xterm",
         b"PYTHON_BASIC_REPL=1",
         b"PATH=/mnt/usr/bin",
@@ -2137,7 +2310,147 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
         // Nvim не может создать ~/.local/state/nvim/log; заглушить спам
         // "failed to open $NVIM_LOG_FILE" в stderr, направив его в /dev/null.
         b"NVIM_LOG_FILE=/dev/null",
-    ];
+    ]
+}
+
+/// Значение `PATH` из окружения запуска, если оно задано.
+///
+/// `core::str::from_utf8` отказывает не-UTF-8 значению: тогда поиск идёт по
+/// значениям по умолчанию, а не по мусору.
+fn env_path(env: &[&'static [u8]]) -> Option<&'static str> {
+    for entry in env {
+        if let Some(value) = entry.strip_prefix(b"PATH=") {
+            return core::str::from_utf8(value).ok();
+        }
+    }
+    None
+}
+
+/// Каталоги, по которым `lxrun` ищет голое имя программы.
+///
+/// Сначала непустые компоненты `PATH` из [`lxrun_env`], затем недостающие
+/// значения [`super::lxpath::DEFAULT_PATH`]. Обе точки входа — `lxrun` и
+/// shell-fallback в диспетчере — обязаны считать список этой функцией, чтобы
+/// они не разошлись.
+fn lxrun_search_dirs() -> Vec<&'static str> {
+    let env = lxrun_env();
+    super::lxpath::search_dirs(env_path(&env))
+}
+
+/// Проверить, что `path` — не каталог и начинается с ELF64-заголовка Linux
+/// x86_64.
+///
+/// Читаются только [`crate::vfs::elf_classify::HEADER_LEN`] байт: PATH-поиск не
+/// должен тянуть в память весь образ (несколько МиБ), который всё равно
+/// прочитает загрузчик. Полный вердикт (сегменты, `PT_INTERP`) даёт
+/// `classify_elf` в загрузчике; негодный кандидат отвергается там, а не
+/// запускается.
+fn is_linux_elf(path: &str) -> bool {
+    let Ok(node) = crate::vfs::lookup_path_walk(path, true) else {
+        return false;
+    };
+    if node.is_directory() {
+        return false;
+    }
+    let mut header = [0u8; crate::vfs::elf_classify::HEADER_LEN];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        match node.read(filled as u64, &mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return false,
+        }
+    }
+    crate::vfs::elf_classify::looks_like_linux_elf(&header[..filled])
+}
+
+/// Найти Linux ELF по голому имени в каталогах `dirs` — поиск по PATH в
+/// семантике `execvp(2)`.
+///
+/// Возвращает нормализованный абсолютный путь первого кандидата, который
+/// существует, не является каталогом и начинается с ELF-заголовка Linux
+/// x86_64. Имя с `/` не ищется: это путь, и `lxrun` исполняет его как раньше.
+///
+/// `/usr/bin` и `/bin` в этой ОС — каталоги Debian-диска под `/mnt`, поэтому для
+/// кандидата без префикса `/mnt` пробуется ещё и `/mnt`-вариант — ровно тот
+/// fallback, который `resolve_exec_path` делает для полного пути. Без него два
+/// из трёх значений PATH по умолчанию не нашли бы ничего.
+pub(super) fn find_path_program(name: &str, dirs: &[&str]) -> Option<String> {
+    for candidate in super::lxpath::candidates(name, dirs) {
+        let abs = resolve_arg(&candidate);
+        if is_linux_elf(&abs) {
+            return Some(abs);
+        }
+        if abs != "/mnt" && !abs.starts_with("/mnt/") {
+            let mapped = alloc::format!("/mnt{}", abs);
+            if is_linux_elf(&mapped) {
+                return Some(mapped);
+            }
+        }
+    }
+    None
+}
+
+/// `lxrun [path|program] [args...]`: запустить Linux-бинарник как ring-3
+/// `Compat_Process`.
+///
+/// `path` — абсолютный или относительный путь (как раньше): ELF читается из
+/// ext2, грузится через Linux ELF loader, получает начальный стек System V с
+/// переданными аргументами и ставится в очередь планировщика. Если же в имени
+/// **нет** `/`, это программа: она ищется по PATH
+/// ([`super::lxpath::DEFAULT_PATH`] + `PATH` окружения) и запускается тем же
+/// путём. Поддерживаются статические `ET_EXEC`, static-PIE `ET_DYN` и
+/// glibc-dynamic образы (интерпретатор мапится из `/mnt`).
+///
+/// Запуск идёт с выключенными прерываниями на время короткого переключения CR3,
+/// которое делают загрузчик/маппер стека.
+pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.is_empty() {
+        shell_println("usage: lxrun [path|program] [args...]");
+        shell_println("  path     absolute/relative path to a Linux ELF, as before");
+        shell_println(&alloc::format!(
+            "  program  bare name searched in PATH (default {})",
+            super::lxpath::DEFAULT_PATH
+        ));
+        return;
+    }
+    let name = args[0];
+    let path = if super::lxpath::is_bare_name(name) {
+        let dirs = lxrun_search_dirs();
+        match find_path_program(name, &dirs) {
+            Some(path) => path,
+            None => {
+                shell_println(&alloc::format!(
+                    "lxrun: {}: not found in PATH (searched: {})",
+                    name,
+                    super::lxpath::display_dirs(&dirs)
+                ));
+                return;
+            }
+        }
+    } else {
+        // Путь (абсолютный/относительный) — прежнее поведение, без PATH-поиска.
+        resolve_arg(name)
+    };
+    run_lxrun(&path, args);
+}
+
+/// Общий запуск Linux-программы для `lxrun` и shell-fallback'а диспетчера.
+///
+/// `args[0]` — имя программы как набрано (argv[0]); остальные токены — её
+/// аргументы. Всё остальное (фиксированное окружение, VT, передача терминала
+/// заданию, ожидание foreground) одинаково для обеих точек входа — именно
+/// поэтому fallback не может вести себя иначе, чем явный `lxrun`.
+pub(super) fn run_lxrun(path: &str, args: &[&str]) {
+    // argv[0] — имя программы как набрано; остальные токены следуют.
+    let argv: alloc::vec::Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
+
+    // Убедиться, что VT-эмулятор существует, чтобы ANSI-вывод nvim рендерился
+    // правильно. Он создаётся один раз и затем живёт: консоль и VT делят один
+    // framebuffer, а переинициализация на каждый запуск стирала экран и оставляла
+    // курсор shell позади (промпт уезжал вниз на каждом запуске).
+    crate::drivers::vt::ensure();
+    let env = lxrun_env();
     // Спавнить И опубликовать терминальное состояние ребёнка внутри ОДНОЙ
     // секции `without_interrupts`. Ребёнок становится runnable сразу, как
     // возвращаются прерывания, так что всё, что shell делает после, гонится с ним:
@@ -2558,27 +2871,81 @@ pub(super) fn cmd_disk(_ctx: &mut ShellCtx, args: &[&str]) {
     crate::shell::disk::cmd(args);
 }
 
+/// `mount …`: честная заглушка — операции в ядре ещё нет.
+///
+/// Смонтировать/размонтировать произвольную ФС можно только сисколлами
+/// `mount(2)`/`umount2(2)`; их в этом ядре пока нет (отложены до USB S1 вместе с
+/// hot-plug накопителей). Блочные устройства уже обслуживает команда `disk`
+/// (`list`/`setup`/`mount <n>`/`format <n>`), поэтому заглушка не пытается
+/// изобразить операцию, а называет рабочую альтернативу и не трогает VFS.
+pub(super) fn cmd_mount(_ctx: &mut ShellCtx, _args: &[&str]) {
+    shell_println("mount: not implemented: this kernel has no mount(2) yet (deferred to USB S1)");
+    shell_println("mount: use `disk list` / `disk mount <n>` for block devices");
+}
+
+/// `umount …`: та же заглушка, что [`cmd_mount`] — `umount2(2)` не реализован.
+pub(super) fn cmd_umount(_ctx: &mut ShellCtx, _args: &[&str]) {
+    shell_println(
+        "umount: not implemented: this kernel has no umount2(2) yet (deferred to USB S1)",
+    );
+    shell_println("umount: use `disk` to inspect the mounted ext2 volume");
+}
+
+/// Опции `df`: `-h` — двоичные единицы (KiB/MiB/…), `-H` — SI (KB/MB/…).
+const DF_OPTIONS: &[OptSpec] = &[getopt::short('h'), getopt::short('H')];
+
+/// Единицы `df`: блоки 1K (по умолчанию), двоичные `-h`, десятичные `-H`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DfUnits {
+    Blocks,
+    Human1024,
+    Human1000,
+}
+
 pub(super) fn cmd_df(_ctx: &mut ShellCtx, args: &[&str]) {
-    let mut human = false;
-    for a in args {
-        if *a == "-h" {
-            human = true;
-        } else {
-            shell_println(&alloc::format!("df: unknown option: {}", a));
-            shell_println("df: usage: df [-h]");
+    let mut units = DfUnits::Blocks;
+    let parsed = match getopt::parse(args, DF_OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            shell_println(&alloc::format!("df: {}", e));
+            shell_println("df: usage: df [-h] [-H]");
             return;
         }
+    };
+    for item in parsed {
+        match item {
+            GetoptItem::Opt { spec, .. } => match spec.short {
+                // Как coreutils: последний из -h/-H задаёт единицы.
+                Some('h') => units = DfUnits::Human1024,
+                Some('H') => units = DfUnits::Human1000,
+                _ => {}
+            },
+            GetoptItem::Operand(extra) => {
+                shell_println(&alloc::format!("df: unexpected operand: {}", extra));
+                shell_println("df: usage: df [-h] [-H]");
+                return;
+            }
+        }
     }
+    let human = units != DfUnits::Blocks;
     if human {
         shell_println("Filesystem       Size   Used  Avail Use% Mounted on");
     } else {
         shell_println("Filesystem     1K-blocks  Used Available Use% Mounted on");
     }
     let size_cell = |bytes: u64| -> alloc::string::String {
-        if human {
-            human_size(bytes.saturating_mul(1024))
-        } else {
-            alloc::format!("{}", bytes)
+        match units {
+            DfUnits::Blocks => alloc::format!("{}", bytes),
+            DfUnits::Human1024 => human_size(bytes.saturating_mul(1024)),
+            DfUnits::Human1000 => si_size(bytes.saturating_mul(1024)),
+        }
+    };
+    // Байты для строк без fs_stat (ramfs/rootfs `Used`): те же единицы, что у
+    // size_cell, но без домножения на размер блока.
+    let human_cell = |bytes: u64| -> alloc::string::String {
+        match units {
+            DfUnits::Human1000 => si_size(bytes),
+            _ => human_size(bytes),
         }
     };
     for mount in crate::vfs::mount_snapshot() {
@@ -2632,7 +2999,7 @@ pub(super) fn cmd_df(_ctx: &mut ShellCtx, args: &[&str]) {
                             "{:<12} {:>11} {:>9} {:>11} {:>3}% {}",
                             fs,
                             "-",
-                            human_size(used),
+                            human_cell(used),
                             "-",
                             "-",
                             point
@@ -2705,6 +3072,31 @@ pub(crate) fn human_size(bytes: u64) -> alloc::string::String {
     let whole = bytes / scale;
     let remainder = bytes % scale;
     // Округлить до десятых, чтобы 1023.96 MiB печаталось как 1024.0 MiB, а не 1023.9.
+    let tenths = (remainder * 10 + scale / 2) / scale;
+    if tenths >= 10 {
+        alloc::format!("{}.0 {}", whole + 1, UNITS[unit])
+    } else {
+        alloc::format!("{}.{} {}", whole, tenths, UNITS[unit])
+    }
+}
+
+/// Форматировать число байт как `-H` (`df --si`): десятичные единицы
+/// (1000 = K, как в coreutils), один знак после точки для K и выше, целое `B`
+/// ниже 1000. Та же целочисленная арифметика, что у [`human_size`], поэтому
+/// вывод точен и не зависит от float-форматирования.
+pub(crate) fn si_size(bytes: u64) -> alloc::string::String {
+    const UNITS: [&str; 5] = ["K", "M", "G", "T", "P"];
+    if bytes < 1000 {
+        return alloc::format!("{} B", bytes);
+    }
+    let mut scale: u64 = 1000;
+    let mut unit = 0usize;
+    while unit + 1 < UNITS.len() && bytes / scale >= 1000 {
+        scale *= 1000;
+        unit += 1;
+    }
+    let whole = bytes / scale;
+    let remainder = bytes % scale;
     let tenths = (remainder * 10 + scale / 2) / scale;
     if tenths >= 10 {
         alloc::format!("{}.0 {}", whole + 1, UNITS[unit])
@@ -2792,8 +3184,65 @@ pub(super) fn cmd_free(_ctx: &mut ShellCtx, args: &[&str]) {
 /// прочитала бы Linux-программа, так что это ещё и smoke-тест того дерева.
 /// Потоки перечисляются отдельно; `COMMAND` — basename argv[0] или `[comm]`,
 /// когда cmdline пуст.
-pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
-    shell_println("  PID  PPID STAT COMMAND");
+/// Опции `ps`: `-e` — все процессы, `-f` — расширенный формат.
+const PS_OPTIONS: &[OptSpec] = &[getopt::short('e'), getopt::short('f')];
+
+/// Прочитать effective uid процесса из `/proc/<pid>/status` (`Uid:` — четыре
+/// значения real/effective/saved/fs; `ps` показывает effective, как Linux).
+fn proc_effective_uid(pid: u64) -> Option<u32> {
+    let mut buf = [0u8; 512];
+    let len = crate::vfs::lookup_path(&format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|node| node.read(0, &mut buf).ok())
+        .unwrap_or(0);
+    let text = core::str::from_utf8(&buf[..len]).ok()?;
+    let line = text.lines().find(|line| line.starts_with("Uid:"))?;
+    line.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// `ps [-e] [-f]`: процессы compat и потоки ядра.
+///
+/// Заголовок и колонки по умолчанию имитируют `ps` (`PID PPID STAT COMMAND`), но
+/// буква состояния и имя команды берутся из тех же per-pid procfs-узлов, которые
+/// прочитала бы Linux-программа, так что это ещё и smoke-тест того дерева.
+/// Потоки перечисляются отдельно; `COMMAND` — basename argv[0] или `[comm]`,
+/// когда cmdline пуст.
+///
+/// `-e` принимается как «все процессы»: список и так включает и compat-процессы,
+/// и потоки ядра (Linux `ps -e` показывает то же). `-f` добавляет колонку UID и
+/// печатает полную командную строку вместо basename. Колонок `C`/`STIME`/`TTY`/
+/// `TIME` нет намеренно: procfs этого ядра их не публикует, а печатать нули было
+/// бы выдумкой. Неизвестная опция — ошибка с usage.
+pub(super) fn cmd_ps(_ctx: &mut ShellCtx, args: &[&str]) {
+    let mut full = false;
+    let parsed = match getopt::parse(args, PS_OPTIONS) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            shell_println(&alloc::format!("ps: {}", e));
+            shell_println("ps: usage: ps [-e] [-f]");
+            return;
+        }
+    };
+    for item in parsed {
+        match item {
+            GetoptItem::Opt { spec, .. } => match spec.short {
+                // `-e` — «все процессы»: это и есть единственный режим.
+                Some('e') => {}
+                Some('f') => full = true,
+                _ => {}
+            },
+            GetoptItem::Operand(extra) => {
+                shell_println(&alloc::format!("ps: unexpected operand: {}", extra));
+                shell_println("ps: usage: ps [-e] [-f]");
+                return;
+            }
+        }
+    }
+    if full {
+        shell_println("  UID   PID  PPID STAT COMMAND");
+    } else {
+        shell_println("  PID  PPID STAT COMMAND");
+    }
     // Потоки ядра (сам shell, сетевой насос, gated selftest harness) — НЕ
     // Linux compat-процессы и не имеют записи в /proc, поэтому таблица состояла
     // из голого заголовка всякий раз, когда не было живого `lxrun`-процесса —
@@ -2828,14 +3277,39 @@ pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
             .ok()
             .and_then(|node| node.read(0, &mut cmdline).ok())
             .unwrap_or(0);
-        let argv0 = cmdline[..cmd_len].split(|b| *b == 0).next().unwrap_or(&[]);
+        let tokens = || {
+            cmdline[..cmd_len]
+                .split(|b| *b == 0)
+                .filter(|token| !token.is_empty())
+        };
+        let argv0 = tokens().next().unwrap_or(&[]);
         let command = if argv0.is_empty() {
             format!("[{comm}]")
+        } else if full {
+            // `-f`: вся командная строка, а не только имя программы.
+            let mut joined = String::new();
+            for (i, token) in tokens().enumerate() {
+                if i > 0 {
+                    joined.push(' ');
+                }
+                joined.push_str(core::str::from_utf8(token).unwrap_or("?"));
+            }
+            joined
         } else {
             let text = core::str::from_utf8(argv0).unwrap_or(comm);
             String::from(text.rsplit('/').next().unwrap_or(text))
         };
-        shell_println(&format!("{:>5} {:>5} {:>4} {}", pid, ppid, state, command));
+        if full {
+            let uid = proc_effective_uid(pid)
+                .map(|uid| alloc::format!("{}", uid))
+                .unwrap_or_else(|| String::from("-"));
+            shell_println(&format!(
+                "{:>5} {:>5} {:>5} {:>4} {}",
+                uid, pid, ppid, state, command
+            ));
+        } else {
+            shell_println(&format!("{:>5} {:>5} {:>4} {}", pid, ppid, state, command));
+        }
     }
     for (pid, name) in kernel_tasks {
         if compat_pids.contains(&pid) {
@@ -2848,6 +3322,14 @@ pub(super) fn cmd_ps(_ctx: &mut ShellCtx, _args: &[&str]) {
         } else {
             "R"
         };
-        shell_println(&format!("{:>5} {:>5} {:>4} [{}]", pid, 0, state, name));
+        if full {
+            // У kernel-потока нет записи в /proc: uid честно неизвестен.
+            shell_println(&format!(
+                "{:>5} {:>5} {:>5} {:>4} [{}]",
+                "-", pid, 0, state, name
+            ));
+        } else {
+            shell_println(&format!("{:>5} {:>5} {:>4} [{}]", pid, 0, state, name));
+        }
     }
 }
