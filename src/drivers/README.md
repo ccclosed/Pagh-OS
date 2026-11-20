@@ -16,9 +16,9 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 | `virtio/blk.rs` | virtio-blk: `PciTransport` + `VirtIOBlk`, обёрнут в `BlockDevice` «virtio-blk0», секторный кэш 2 MiB (write-through), `flush` = `VIRTIO_BLK_T_FLUSH` |
 | `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit, поиск по CID), BAR0 MMIO, многостраничные PRP (PRP1 + PRP-list), до 4 команд в полёте, FLUSH (opcode 0x00) для дюрабильности WAL (issue #15), RMW для невыровненных записей; регистрируется как `BlockDevice` |
 | `nvme_prp.rs` | Чистая (`core` только) арифметика NVMe: PRP1/PRP2/PRP-list, LBA-чанки команд, SQ/CQ phase-tag и зажим CAP.MQES — включается в host-tests как есть |
-| `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C/Ctrl+Z, защёлки `CTRL_C`/`CTRL_Z`/`FG_PID`; ^C шлёт `SIGINT` foreground-группе терминала (`drivers::tty`), а не только записанному pid. Маршрутизация `deliver_physical`: evdev получает байт всегда, shell-кольцо — только пока клавиатурой не владеет VT-клиент (`vtinput::client_active`), иначе тот же байт пришёл бы в shell дважды |
+| `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C/Ctrl+Z, защёлки `CTRL_C`/`CTRL_Z`/`FG_PID`; ^C шлёт `SIGINT` foreground-группе терминала (`drivers::tty`), а не только записанному pid. IRQ1 только КЛАДЁТ байт в очередь `inputd`; единственная маршрутизация `deliver_physical` (вызывается диспетчером): evdev получает байт всегда, shell-кольцо — только пока клавиатурой не владеет VT-клиент (`vtinput::client_active`), иначе тот же байт пришёл бы в shell дважды |
 | `tty.rs` | Управляющий терминал консоли: foreground process group (kernel-side, по умолчанию — группа shell) + `TOSTOP`, `TIOCGPGRP`/`TIOCSPGRP` через чистую модель `linux::tty`, `check_access(kind)` — фоновое чтение/запись JOB-процесса получает `SIGTTIN`/`SIGTTOU` на всю группу и `EINTR` (не-JOB'ы, т.е. служебные spawn'ы ядра, не останавливаются) |
-| `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: IntelliMouse-негоциация (3 magic sample rate + id 3), 4-байтовые пакеты с колесом (Z в младшем ниббле 4-го байта), зажатые координаты + кнопки + `wheel` + `seq`; без колеса — 3-байтовый режим |
+| `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: IntelliMouse-негоциация (3 magic sample rate + id 3), 4-байтовые пакеты с колесом (Z в младшем ниббле 4-го байта), зажатые координаты + кнопки + `wheel` + `seq`; без колеса — 3-байтовый режим. IRQ12 кладёт байт (а USB-путь — готовый пакет) в очередь `inputd`, сборка/`evdev::feed_mouse` идут в диспетчере |
 | `scrollback.rs` | Чистое ядро скроллбека консоли: ring прокрученных строк (символы + цвет) и view-offset; `push`/`scroll`/`reset`/`view_row`, тесты в host-tests |
 | `usb_desc.rs` | Чистый обход configuration descriptor: HID-интерфейсы и пара RNDIS (communication + CDC Data), эндпоинты и wMaxPacketSize; host-tests |
 | `usb_rndis_proto.rs` | Чистый протокол RNDIS: INIT/QUERY/SET/KEEPALIVE, разбор ответов по `RequestId`/статусу, data-конверты с 8-байтным префиксом и батчами; host-tests |
@@ -26,7 +26,9 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 | `xhci_hub.rs` | Чистая (`core` только) политика корневого порта xHCI по `hub.c`/`xhci-hub.c`: neutral-запись PORTSC (PED/PR/WPR/change bits не пишутся обратно), `hub_port_debounce` (25 мс шаг, 100 мс стабильного CCS, 2 с бюджет), `hub_port_wait_reset` (10/200 мс, 800 мс на запись, 5 попыток), 100 мс power settle, стабильность PED+U0 200 мс, backoff ≥1 с, без PP power-cycle; включается в host-tests как есть |
 | `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл + скроллбек (см. `scrollback.rs`), status bar, макросы `fb_print!`; `FbInfo`/`fb_info()` — геометрия для `/dev/fb0`, `takeover_{acquire,active,release}()` — handover экрана userspace-композитору (flush консоли останавливается, serial-логи идут) |
 | `fb_abi.rs` | Чистый (`core`) ABI fbdev: `struct fb_var_screeninfo` (160 байт) и `fb_fix_screeninfo` (80 байт), `FBIOGET_VSCREENINFO` 0x4600 / `FBIOGET_FSCREENINFO` 0x4602; host-тесты сверяют размеры/смещения с Linux UAPI |
-| `evdev.rs` | evdev-подобная очередь `/dev/input/event0`: кольцо 256 событий, `feed_scancode` из PS/2 IRQ1 и USB HID, `feed_mouse` (BTN_*/REL_X/REL_Y/REL_WHEEL) из PS/2 IRQ12 и USB HID, `read_event`/`has_events`; композитор читает независимо, shell-stdin не затрагивается (пока клавиатурой владеет VT-клиент, прямой путь IRQ1/USB в shell-кольцо подавлен — см. `vtinput.rs`) |
+| `evdev.rs` | evdev-подобная очередь `/dev/input/event0`: кольцо 256 событий, `feed_scancode` из PS/2 IRQ1 и USB HID, `feed_mouse` (BTN_*/REL_X/REL_Y/REL_WHEEL) из PS/2 IRQ12 и USB HID, `read_event`/`has_events`; вызовы идут из `inputd` (единственный диспетчер), композитор читает независимо, shell-stdin не затрагивается (пока клавиатурой владеет VT-клиент, прямой путь IRQ1/USB в shell-кольцо подавлен — см. `vtinput.rs`) |
+| `inputd.rs` | Kernel-поток `inputd`: производители (IRQ1/IRQ12, USB-HID) кладут `Raw` в кольцо 256, поток дренирует его в `evdev` и shell-кольцо, а также в сборщик `ps2_mouse`. Дренаж сериализован спинлоком (маскирует `IF`), поэтому элемент доставляется ровно один раз и в порядке поступления; переполнение отвергает новый элемент (`dropped`). Boot-меню зовёт `drain()` синхронно (прерывания/потоки ещё не работают). SMP не заявляется |
+| `input_ring.rs` | Чистое (`core`) кольцо фиксированной ёмкости для очереди `inputd`: FIFO, при переполнении отвергается НОВЫЙ элемент (принятый префикс цел), `clear`; включается в host-tests (свойство P66) |
 | `input_event.rs` | Чистый (`core`) кодек `struct input_event` (24 байта), set-1 → Linux keycodes (extended-таблица, fake shift/ACK/Pause отбрасываются); включается в host-tests |
 | `vt_abi.rs` | Чистый (`core`) ABI `/dev/vtconsole0`: 128-байтный заголовок (magic/version/seqlock/курсор/margins/offsets), 16-байтные клетки, `PGVT_IOC_INFO`; host-тесты сверяют смещения/валидацию/seqlock с `TERMINAL.md` |
 | `vtsurface.rs` | Разделяемая VT-поверхность: кадры PMM + seqlock, публикация клеток/курсора из shell (`framebuffer`) и kernel-VT (`vt.rs`), `read_at` fallback, `page()` для read-only `mmap`; публикация включается первым open `vtconsole0` |
@@ -75,9 +77,10 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 
 ### IRQ
 Ровно два device-IRQ подключены в `boot.rs`: вектор 33 = IRQ1 клавиатура, вектор 44 = IRQ12 мышь.
-Всё остальное — **e1000 и NVMe — поллится, прерывания замаскированы** (`REG_IMC=0xFFFFFFFF`
-у e1000; phase-bit у NVMe). Это несущая предпосылка локинга `net::` — сетевой стек вообще
-не живёт в IRQ-контексте.
+Оба обработчика только читают порт и кладут байт в очередь `inputd`; разбор, сборка пакета
+мыши и доставка в потребителей идут в kernel-потоке `inputd`. Всё остальное — **e1000 и
+NVMe — поллится, прерывания замаскированы** (`REG_IMC=0xFFFFFFFF` у e1000; phase-bit у NVMe).
+Это несущая предпосылка локинга `net::` — сетевой стек вообще не живёт в IRQ-контексте.
 
 ### Клавиатура
 Сканкод с порта 0x60 → трекинг 0xE0-префикса → Ctrl+C-make ставит `CTRL_C` и, если `FG_PID`
@@ -85,13 +88,36 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 терминала** (`drivers::tty::foreground_pgid()` + `signal::send_signal_to_pgid_all`, по копии
 на каждую thread-группу внутри pgid) прямо из IRQ, а `scheduler::request_exit(fg)` зовёт лишь
 как фолбэк, когда у foreground-группы нет живого члена (например, ^C гонится с передачей
-терминала в `cmd_lxrun`) → байт в кольцо (аллокации нет, при переполнении дроп). Ctrl+Z
-(`CTRL_Z`) обрабатывает foreground-wait shell'а: останавливает ту же группу `SIGTSTP`.
+терминала в `cmd_lxrun`) → байт в очередь `inputd` (аллокации нет, при переполнении дроп).
+Ctrl+Z (`CTRL_Z`) обрабатывает foreground-wait shell'а: останавливает ту же группу `SIGTSTP`.
 
 ### Мышь
-Байт с 0x60 → ресинк по биту 3 нулевого байта → сборка 3 байтов → 9-битные знаковые дельты,
-Y инвертирован, кламп в экран, инкремент `seq`. Рендерингом не занимается — потребляют
-`cursor` и `paint`.
+Байт с 0x60 → очередь `inputd` → сборка 3 байтов → 9-битные знаковые дельты, Y инвертирован,
+кламп в экран, инкремент `seq`. Рендерингом не занимается — потребляют `cursor` и `paint`,
+а `/dev/input/event0` получает `BTN_*`/`REL_*` для userspace-композитора.
+
+### Диспетчер ввода `inputd`
+
+Один kernel-поток на один CPU (SMP не заявляется), спавнится из `kernel_main` как
+`[inputd]` в `ps`. Производители не доставляют события сами:
+
+| производитель | что кладёт в очередь | контекст |
+|---|---|---|
+| `ps2_kbd::irq_handler` (IRQ1) | `Raw::Scancode` | IRQ, IF замаскирован |
+| `usb_hid::feed_iface` (поток `usb`) | `Raw::Scancode` / `Raw::MousePacket` | поток, опрос xHCI |
+| `ps2_mouse::irq_handler` (IRQ12) | `Raw::Aux` | IRQ |
+| `boot_menu::poll_key` | то же, что `usb_hid` | до планировщика, IF=0 |
+
+`inputd::drain()` берёт `DISPATCH` (маскирует `IF`) и в цикле «pop под `QUEUE` →
+доставить» раскладывает элемент: `Scancode` → `ps2_kbd::deliver_physical` (evdev всегда,
+shell-кольцо с дедупликацией `vtinput`), `Aux` → сборщик `ps2_mouse`, `MousePacket` →
+`ps2_mouse::commit_packet`. Пока `DISPATCH` удержан, тик не может вытеснить диспетчер,
+поэтому два дренажа не переупорядочивают элементы; на это опираются и boot-меню, и
+in-QEMU-тесты (`inputd::*`), которые зовут `drain()` синхронно.
+
+Переполнение (ёмкость `QUEUE_CAP = 256`) отвергает НОВЫЙ элемент: уже принятый префикс
+нельзя вытеснять, иначе быстрый ввод рассогласовал бы make/break. Потеря не молчит —
+`inputd::stats()`/`input_summary()` печатают `pending`/`dropped`.
 
 ### e1000
 `attach` находит 0x8086:0x100E/0x100F → bus master → BAR 0 → `vmm::map_mmio(phys, 0x2_0000)` →
@@ -194,9 +220,11 @@ PRP-list страница. `rw_common` режет запрос на LBA-выро
 
   `usb_hid.rs` переводит boot-отчёты в тот же поток байт, что даёт 8042: set-1
   скан-коды с префиксом `0xE0` для extended-клавиш и break-коды со старшим битом,
-  для мыши — трёхбайтный PS/2-пакет. Декодер shell, защёлки `^C`/`^Z`, stdin
-  `lxrun` и compat-процессы читают одно кольцо `ps2_kbd`, поэтому USB-клавиатура
-  не требует изменений ниже по потоку и `^C` с неё останавливает программу.
+  для мыши — трёхбайтный PS/2-пакет. Переведённые байты кладутся в очередь
+  `inputd` (тот же диспетчер, что и для PS/2), а декодер shell, защёлки `^C`/`^Z`,
+  stdin `lxrun` и compat-процессы читают одно кольцо `ps2_kbd` — USB-клавиатура
+  не требует изменений ниже по потоку, и правило дедупликации `vtinput`
+  существует в одном месте.
 
   Запуск контроллера: PCI-энумерация, BIOS→OS handoff через USB Legacy Support
   (если прошивка не отпускает — владение забирается после ограниченного

@@ -8148,6 +8148,9 @@ mod usb_hid_tests {
             2,
             ReportMode::Report,
         );
+        // `feed_iface` — рабочий путь (только очередь `inputd`); тест дренирует
+        // её синхронно, иначе результат зависел бы от планировщика.
+        crate::drivers::inputd::drain();
         let after = crate::drivers::ps2_mouse::poll();
         assert_kernel!(
             after.seq == before.seq + 1,
@@ -8164,6 +8167,7 @@ mod usb_hid_tests {
     pub fn report_protocol_mouse_8bit() {
         let before = crate::drivers::ps2_mouse::poll();
         usb_hid::feed_iface(&[0x00, 0x02, 0xFD, 0x01], 1, 2, ReportMode::Report);
+        crate::drivers::inputd::drain();
         let after = crate::drivers::ps2_mouse::poll();
         assert_kernel!(
             after.seq == before.seq + 1,
@@ -8182,6 +8186,194 @@ mod usb_hid_tests {
             codes.is_empty(),
             "a non-boot HID interface must not inject keystrokes"
         );
+    }
+}
+
+// ─── `inputd`: диспетчеризация физического ввода (kernel-поток) ─────────────
+//
+// In-QEMU проверки того, что host-свойство кольца доказать не может: поток
+// `inputd` зарегистрирован в таблице имён планировщика (её рендерит `ps`),
+// элементы очереди доставляются ровно один раз и в порядке поступления,
+// переполнение отвергает НОВЫЙ элемент (сохраняя принятый префикс), а пакет
+// USB-мыши доходит до сборщика ровно один раз.
+//
+// NON-DESTRUCTIVE: каждая рутина вычитывает PS/2-кольцо и сбрасывает evdev до и
+// после себя, поэтому инжектированные байты не печатаются в shell после
+// `selftest`, а `selftest 2` проходит те же проверки повторно. Инжекция
+// выполняется производителями (`ps2_kbd::inject_scancode`/`inject_packet`), а
+// доставка — тем же `inputd::drain`, который зовёт поток; дренаж сериализован,
+// поэтому параллельный `inputd` не может переупорядочить элементы.
+mod inputd_tests {
+    use crate::drivers::{evdev, inputd, ps2_kbd, ps2_mouse};
+
+    /// Опустошить shell-кольцо, чтобы рутина стартовала с известного состояния.
+    fn drain_ring() {
+        let mut guard = 0;
+        while ps2_kbd::take_scancode().is_some() && guard < 4096 {
+            guard += 1;
+        }
+    }
+
+    /// `ps` рендерит kernel-потоки из [`task_names_snapshot`]; `inputd` и `netd`
+    /// обязаны быть там на работающей системе (иначе `ps` покажет только
+    /// `[shell]`, и «диспетчер ввода существует» станет непроверяемым).
+    pub fn registry_lists_inputd_netd_shell() {
+        let names = crate::task::scheduler::task_names_snapshot();
+        // Три отдельные проверки, чтобы упавшая назвала именно отсутствующее имя
+        // (`assert_kernel!` не печатает значения).
+        assert_kernel!(
+            names.iter().any(|(_, name)| *name == "shell"),
+            "inputd: `ps` registry lists [shell]"
+        );
+        assert_kernel!(
+            names.iter().any(|(_, name)| *name == "inputd"),
+            "inputd: `ps` registry lists [inputd] (kernel input dispatcher)"
+        );
+        assert_kernel!(
+            names.iter().any(|(_, name)| *name == "netd"),
+            "inputd: `ps` registry lists [netd] (network pump)"
+        );
+    }
+
+    /// Порядок и отсутствие дублей: четыре set-1-байта, положенные
+    /// производителем, доставляются в shell-кольцо по одному и в том же
+    /// порядке, а evdev видит по одному событию на байт.
+    pub fn order_and_no_duplicates() {
+        evdev::reset();
+        drain_ring();
+        inputd::drain();
+        let before = inputd::stats();
+        // `a` make/break, `b` make/break — так их прислал бы 8042 или USB HID.
+        let codes = [0x1E, 0x9E, 0x30, 0xB0];
+        for &byte in codes.iter() {
+            ps2_kbd::inject_scancode(byte);
+        }
+        // Идемпотентно: если поток уже доставил часть, повторный дренаж возьмёт
+        // только оставшееся и ничего не продублирует.
+        inputd::drain();
+        let mut got = alloc::vec::Vec::new();
+        while let Some(byte) = ps2_kbd::take_scancode() {
+            got.push(byte);
+        }
+        assert_eq_kernel!(
+            got,
+            codes.to_vec(),
+            "inputd: order preserved and every scancode delivered exactly once"
+        );
+        assert_eq_kernel!(
+            evdev::pending(),
+            8,
+            "inputd: evdev got exactly one EV_KEY + one EV_SYN per scancode"
+        );
+        let after = inputd::stats();
+        assert_eq_kernel!(
+            after.pushed - before.pushed,
+            codes.len() as u64,
+            "inputd: four producer pushes"
+        );
+        assert_eq_kernel!(
+            after.drained - before.drained,
+            codes.len() as u64,
+            "inputd: four dispatcher deliveries"
+        );
+        assert_eq_kernel!(
+            after.dropped,
+            before.dropped,
+            "inputd: no drops on a four-byte burst"
+        );
+        assert_eq_kernel!(inputd::pending(), 0, "inputd: queue drained");
+        evdev::reset();
+        drain_ring();
+    }
+
+    /// Переполнение: полное кольцо отвергает новый элемент и считает потерю, а
+    /// принятый префикс остаётся целым и доставляется целиком.
+    ///
+    /// Заполнение идёт под `without_interrupts`: иначе тик мог бы отдать
+    /// управление потоку `inputd` посреди «наполнить 256» и счётчики перестали
+    /// бы быть детерминированными. `drain` внутри того же окна маскирует IF сам.
+    pub fn overflow_rejects_newest_and_counts_it() {
+        evdev::reset();
+        drain_ring();
+        inputd::drain();
+        let before = inputd::stats();
+        let cap = inputd::QUEUE_CAP;
+        let (delivered, pending_after_fill) = crate::arch::cpu::without_interrupts(|| {
+            for _ in 0..cap {
+                inputd::push_scancode(0x1E);
+            }
+            let pending_after_fill = inputd::pending();
+            // Один лишний байт: кольцо полно, он обязан быть отвергнут.
+            inputd::push_scancode(0x1E);
+            let dropped_after_overflow = inputd::dropped();
+            let delivered = inputd::drain();
+            (delivered, (pending_after_fill, dropped_after_overflow))
+        });
+        let (pending_after_fill, dropped_after_overflow) = pending_after_fill;
+        assert_eq_kernel!(
+            pending_after_fill,
+            cap,
+            "inputd: a full queue holds exactly QUEUE_CAP items"
+        );
+        assert_eq_kernel!(
+            dropped_after_overflow - before.dropped,
+            1,
+            "inputd: exactly one byte dropped by the overflow"
+        );
+        assert_eq_kernel!(
+            delivered,
+            cap,
+            "inputd: the accepted prefix is delivered whole (no loss inside capacity)"
+        );
+        assert_eq_kernel!(inputd::pending(), 0, "inputd: overflow burst fully drained");
+        let after = inputd::stats();
+        assert_eq_kernel!(
+            after.pushed - before.pushed,
+            cap as u64 + 1,
+            "inputd: 256 accepted + 1 rejected pushes were attempted"
+        );
+        assert_eq_kernel!(
+            after.drained - before.drained,
+            cap as u64,
+            "inputd: 256 deliveries, the rejected item never appears"
+        );
+        // 256 байт дали 512 evdev-событий, а кольцо evdev держит 256: проверяем
+        // именно отсутствие дублей доставки, а не ёмкость evdev. Shell-кольцо
+        // тоже ограничено 128 — вычитываем, чтобы ничего не напечаталось в shell.
+        evdev::reset();
+        drain_ring();
+    }
+
+    /// USB-пакет мыши доходит до сборщика ровно один раз (курсор/клики —
+    /// userspace-потребитель `/dev/input/event0`, ядро только раскладывает пакет).
+    pub fn mouse_packet_delivered_once() {
+        evdev::reset();
+        inputd::drain();
+        let before = ps2_mouse::poll();
+        // ЛКМ + dx=+3, dy=-2 (PS/2: dy положителен вверх).
+        ps2_mouse::inject_packet([0x09, 3, 0xFE]);
+        inputd::drain();
+        let after = ps2_mouse::poll();
+        assert_eq_kernel!(
+            after.seq,
+            before.seq + 1,
+            "inputd: one USB mouse packet reaches the PS/2 assembler exactly once"
+        );
+        assert_kernel!(after.left, "inputd: the packet's left button is held");
+        assert_eq_kernel!(
+            after.x as i64 - before.x as i64,
+            3,
+            "inputd: REL_X moved by the packet's dx"
+        );
+        // Отпустить кнопку тем же путём, чтобы состояние не текло в следующий
+        // проход `selftest 2`.
+        ps2_mouse::inject_packet([0x08, 0, 0]);
+        inputd::drain();
+        assert_kernel!(
+            !ps2_mouse::poll().left,
+            "inputd: the release packet clears the button"
+        );
+        evdev::reset();
     }
 }
 
@@ -9420,7 +9612,12 @@ mod desktop_b_tests {
             );
             while ps2_kbd::take_scancode().is_some() {}
             evdev::reset();
+            // Производитель только кладёт байт в очередь `inputd`; доставку
+            // делает диспетчер. Здесь он вызывается синхронно — то же, что
+            // делает поток раз в тик, — поэтому проверка не зависит от
+            // планировщика (дренаж сериализован и не может переупорядочить).
             ps2_kbd::inject_scancode(0x1E); // физический `a` make (USB-путь)
+            crate::drivers::inputd::drain();
             assert_kernel!(
                 !ps2_kbd::has_scancode(),
                 "dedup: physical key is not duplicated into the shell ring"
@@ -11115,6 +11312,24 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "usb: HID non-boot interface ignored",
             usb_hid_tests::non_boot_interface_is_ignored
+        ),
+        // `inputd` (kernel-поток диспетчеризации): реестр задач для `ps`,
+        // порядок/отсутствие дублей, переполнение очереди и пакет USB-мыши.
+        (
+            "inputd: `ps` registry lists [shell]/[inputd]/[netd]",
+            inputd_tests::registry_lists_inputd_netd_shell
+        ),
+        (
+            "inputd: order preserved, every scancode delivered once",
+            inputd_tests::order_and_no_duplicates
+        ),
+        (
+            "inputd: overflow rejects the newest byte and counts the drop",
+            inputd_tests::overflow_rejects_newest_and_counts_it
+        ),
+        (
+            "inputd: one USB mouse packet reaches the assembler once",
+            inputd_tests::mouse_packet_delivered_once
         ),
         (
             "sysinfo::loads match /proc/loadavg in 16.16 fixed point",
@@ -12832,8 +13047,10 @@ mod texttools_tests {
 //   1) задача создана без compat-состояния (`create_user_process` его не ставит);
 //   2) после отказа её стек ядра снова не отображён — reaper снял задачу;
 //   3) она ушла из ready-очереди, а self-test продолжается (тики идут);
-//   4) PMM вернулся к исходному числу кадров, поэтому `selftest 2` не видит
-//      расхождения проходов.
+//   4) PMM вернулся к исходному числу кадров задачи, поэтому `selftest 2` не
+//      видит расхождения проходов; единственное допустимое расхождение —
+//      кадры таблиц страниц ядерного слота стека (<= 4), которые по дизайну
+//      общие с пользовательскими PML4 и не освобождаются.
 //
 // Не будь фикса, первый же тик с этой задачей увёл бы CPU в `halt()` и до
 // `SELFTEST SUMMARY` дело бы не дошло — `tools/e2e.py selftest` (и этот
@@ -12937,15 +13154,37 @@ mod ring3_fault_tests {
             scheduler::ticks() > ticks_before,
             "ring3-fault: kernel kept running after the ring-3 fault"
         );
-        assert_eq_kernel!(
-            pmm::free_frames(),
-            frames_before,
-            "ring3-fault: routine returned every PMM frame"
+        // Кадры самой задачи (64 страницы стека ядра + её пользовательское
+        // пространство) обязаны вернуться. Но первый слот стека, попавший в новую
+        // полосу таблиц страниц, оставляет в ЯДЕРНОМ адресном пространстве
+        // кадры PT/PD/PDPT: `vmm::new_user_pml4` копирует верхнюю половину
+        // PML4 по ссылке в каждое пользовательское пространство, поэтому такие
+        // таблицы нельзя освободить, пока жив хотя бы один процесс. Слот стека
+        // длиной `KERNEL_STACK_STRIDE` (260 КиБ) пересекает не больше двух
+        // 2 МиБ-полос, а PD (1 ГиБ) и PDPT (512 ГиБ) добавляются не более
+        // одного раза — итого не больше четырёх кадров метадаты. Всё, что
+        // больше, — настоящая утечка кадров задачи (их ~100), и проверка её
+        // по-прежнему ловит.
+        //
+        // Почему граница вообще возникает: PID монотонны, поэтому новый слот
+        // стека иногда пересекает 2 МиБ-границу. До появления потока `inputd`
+        // этот тест всегда получал pid 14, чей стек (3.87 МиБ) лежал внутри уже
+        // отображённой полосы; сдвиг нумерации на один сделал утверждение
+        // зависимым от арифметики слотов, а не от поведения задачи.
+        const KERNEL_STACK_TABLE_FRAMES_MAX: usize = 4;
+        let frames_after = pmm::free_frames();
+        let metadata = frames_before.saturating_sub(frames_after);
+        assert_kernel!(
+            metadata <= KERNEL_STACK_TABLE_FRAMES_MAX,
+            "ring3-fault: routine returned every PMM frame (only kernel-stack page-table metadata may persist)"
         );
         crate::kprintln!(
-            "ring3-fault: pid {} killed by #PF, kernel survived ({} ticks)",
+            "ring3-fault: pid {} killed by #PF, kernel survived ({} ticks); free frames {} -> {} ({} kernel-stack table frame(s))",
             pid,
-            waited
+            waited,
+            frames_before,
+            frames_after,
+            metadata
         );
     }
 }

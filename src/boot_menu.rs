@@ -230,6 +230,11 @@ pub fn run(partitions: &[(Arc<dyn BlockDevice>, PartitionContent)]) -> Choice {
 fn poll_key(usb: bool) -> Option<u8> {
     if usb {
         crate::drivers::xhci::poll();
+        // `xhci::poll` -> `usb_hid` только КЛАДЁТ переведённые скан-коды в
+        // очередь `inputd`; поток `inputd` здесь ещё не планируется (меню идёт
+        // до `kernel_main`, прерывания выключены). Дренируем синхронно тем же
+        // кодом, что и рабочий поток, иначе USB-клавиатура в меню «пропала» бы.
+        crate::drivers::inputd::drain();
     }
     if let Some(byte) = crate::drivers::ps2_kbd::take_scancode() {
         return Some(byte);
