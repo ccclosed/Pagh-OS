@@ -963,6 +963,39 @@ impl FilesApp {
         }
     }
 
+    /// Прямоугольник элемента без сборки виджета.
+    ///
+    /// `item_rect` строит `Grid` (клонирует подписи значков) — это нормально
+    /// для тестов, но damage считается на каждом событии, поэтому здесь только
+    /// геометрия (`pagh_ui::layout::grid`), без аллокаций строк.
+    fn entry_rect(&self, layout: &AppLayout, count: usize, index: usize) -> Option<Rect> {
+        match self.view {
+            ViewMode::Grid => {
+                let area = self.scrolled_area(layout.grid_area);
+                layout::grid(
+                    area,
+                    self.grid_cols(layout.grid_area),
+                    self.grid_cell(layout.grid_area),
+                    Size::new(8, 8),
+                    count as i32,
+                )
+                .get(index)
+                .copied()
+            }
+            ViewMode::List => {
+                if index >= count {
+                    return None;
+                }
+                Some(Rect::new(
+                    layout.grid_area.x,
+                    layout.grid_area.y + LIST_HEADER + index as i32 * LIST_ROW - self.scroll,
+                    layout.grid_area.w,
+                    LIST_ROW,
+                ))
+            }
+        }
+    }
+
     /// Выделить элемент по индексу.
     pub fn select(&mut self, index: Option<usize>) {
         self.selected = index;
@@ -1792,6 +1825,7 @@ impl FilesApp {
             || before.hovered != after.hovered
             || before.list_hover != after.list_hover
         {
+            let count = self.entries.len();
             for index in [
                 before.selected,
                 after.selected,
@@ -1803,7 +1837,7 @@ impl FilesApp {
             .into_iter()
             .flatten()
             {
-                if let Some(rect) = self.item_rect(index) {
+                if let Some(rect) = self.entry_rect(&layout, count, index) {
                     self.damage.add(rect);
                 }
             }

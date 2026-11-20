@@ -443,6 +443,9 @@ fn render_runs(
             screen.cursor.style,
         );
         sub.cursor_blink = screen.cursor_blink;
+        // Реверс экрана (DECSCNM) — состояние экрана, а не клетки: суб-экран
+        // обязан его унаследовать, иначе частичный кадр разойдётся с полным.
+        sub.reverse_video = screen.reverse_video;
         render_screen_into(
             canvas,
             VIEWPORT_PADDING + run.x0 * CELL_W,
@@ -1476,6 +1479,25 @@ mod tests {
             .begin_selection_view(0, 0, SelectionMode::Char);
         let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
         assert!(damage.is_full(), "выделение — оверлей вне клеток");
+    }
+
+    #[test]
+    fn reverse_video_survives_a_partial_frame() {
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let mut terminal = terminal_with(40, 8, b"one\r\ntwo");
+        terminal.screen.reverse_video = true;
+        let mut canvas = screen_canvas(40, 8, &theme);
+        let mut prev = None;
+        paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        terminal.feed(b" three");
+        let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        assert!(!damage.is_full());
+        let reference = full_frame(&terminal.screen, &theme, &opts, 40, 8);
+        assert!(
+            canvas == reference,
+            "реверс экрана потерялся в частичном кадре"
+        );
     }
 
     #[test]
