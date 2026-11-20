@@ -14,6 +14,21 @@
 //! разрешена только на первый кадр, `configure`/resize, смену темы, expose и
 //! открытие/закрытие popup (см. `docs/desktop-render-spec.md` §4 C2).
 //!
+//! ## Два источника damage
+//!
+//! Основной путь — **виджетный** damage (спека §4 C2, «Widgets return `Rect`
+//! damage»): приложение знает, что именно изменило событие (строка списка,
+//! кнопка панели, клетка терминала), и кладёт в список точные прямоугольники.
+//! Это O(damage) без чтения кадра.
+//!
+//! [`DamageTracker`] (хеши тайлов по всему канвасу) остаётся **фолбэком и
+//! отладочным инструментом**: он не требует от приложения никаких знаний о
+//! собственной раскладке, но читает и хеширует каждый пиксель кадра. На окне
+//! Files 1060×640 это 678 тыс. пикселей (2,7 МиБ) на каждое событие — ровно та
+//! цена, которую виджетный путь убирает. Трекер полезен, чтобы поймать
+//! пропущенный приложением прямоугольник (сравнить списки) и как страховка в
+//! отладочном режиме (`PAGH_DAMAGE_TRACKER=1`).
+//!
 //! ```
 //! use pagh_ui::damage::Damage;
 //! use pagh_ui::geom::Rect;
@@ -87,6 +102,12 @@ impl Damage {
 
     pub fn is_empty(&self) -> bool {
         self.rects.is_empty()
+    }
+
+    /// Есть ли пересечение с `rect` (для проверки «нужно ли вообще рисовать
+    /// секцию» без обхода её виджетов).
+    pub fn intersects(&self, rect: Rect) -> bool {
+        self.rects.iter().any(|damaged| damaged.intersects(rect))
     }
 
     /// Единственный прямоугольник, покрывающий всю поверхность.
@@ -515,6 +536,18 @@ mod tests {
         let mut reused = vec![(0, 0, 1, 1)];
         to_wire_into(damage.rects(), &mut reused);
         assert_eq!(reused, wire);
+    }
+
+    #[test]
+    fn intersects_reports_touched_rects() {
+        let mut damage = Damage::new(surface());
+        damage.add(Rect::new(10, 10, 20, 20));
+        assert!(damage.intersects(Rect::new(15, 15, 2, 2)));
+        assert!(damage.intersects(Rect::new(0, 0, 100, 100)));
+        assert!(!damage.intersects(Rect::new(40, 40, 10, 10)));
+        // Полный кадр пересекает всё.
+        let full = Damage::full(surface());
+        assert!(full.intersects(Rect::new(1270, 790, 5, 5)));
     }
 
     #[test]
