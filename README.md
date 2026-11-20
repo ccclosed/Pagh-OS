@@ -1089,3 +1089,8 @@ ELF и static-PIE bias, сборщик стека/auxv SysV, учёт fd-ном�
 ## License
 
 Licensed under the [MIT License](LICENSE).
+
+`rust-apps/tinygl` contains TinyGL 0.4.1 (MIT, Fabrice Bellard) — vendored
+upstream with a one-file `zfeatures.h` patch; see
+[`rust-apps/tinygl/THIRD_PARTY_NOTICES.md`](rust-apps/tinygl/THIRD_PARTY_NOTICES.md)
+and [`rust-apps/tinygl/LICENSE-TinyGL`](rust-apps/tinygl/LICENSE-TinyGL).
