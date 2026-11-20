@@ -13047,8 +13047,10 @@ mod texttools_tests {
 //   1) задача создана без compat-состояния (`create_user_process` его не ставит);
 //   2) после отказа её стек ядра снова не отображён — reaper снял задачу;
 //   3) она ушла из ready-очереди, а self-test продолжается (тики идут);
-//   4) PMM вернулся к исходному числу кадров, поэтому `selftest 2` не видит
-//      расхождения проходов.
+//   4) PMM вернулся к исходному числу кадров задачи, поэтому `selftest 2` не
+//      видит расхождения проходов; единственное допустимое расхождение —
+//      кадры таблиц страниц ядерного слота стека (<= 4), которые по дизайну
+//      общие с пользовательскими PML4 и не освобождаются.
 //
 // Не будь фикса, первый же тик с этой задачей увёл бы CPU в `halt()` и до
 // `SELFTEST SUMMARY` дело бы не дошло — `tools/e2e.py selftest` (и этот
@@ -13152,15 +13154,37 @@ mod ring3_fault_tests {
             scheduler::ticks() > ticks_before,
             "ring3-fault: kernel kept running after the ring-3 fault"
         );
-        assert_eq_kernel!(
-            pmm::free_frames(),
-            frames_before,
-            "ring3-fault: routine returned every PMM frame"
+        // Кадры самой задачи (64 страницы стека ядра + её пользовательское
+        // пространство) обязаны вернуться. Но первый слот стека, попавший в новую
+        // полосу таблиц страниц, оставляет в ЯДЕРНОМ адресном пространстве
+        // кадры PT/PD/PDPT: `vmm::new_user_pml4` копирует верхнюю половину
+        // PML4 по ссылке в каждое пользовательское пространство, поэтому такие
+        // таблицы нельзя освободить, пока жив хотя бы один процесс. Слот стека
+        // длиной `KERNEL_STACK_STRIDE` (260 КиБ) пересекает не больше двух
+        // 2 МиБ-полос, а PD (1 ГиБ) и PDPT (512 ГиБ) добавляются не более
+        // одного раза — итого не больше четырёх кадров метадаты. Всё, что
+        // больше, — настоящая утечка кадров задачи (их ~100), и проверка её
+        // по-прежнему ловит.
+        //
+        // Почему граница вообще возникает: PID монотонны, поэтому новый слот
+        // стека иногда пересекает 2 МиБ-границу. До появления потока `inputd`
+        // этот тест всегда получал pid 14, чей стек (3.87 МиБ) лежал внутри уже
+        // отображённой полосы; сдвиг нумерации на один сделал утверждение
+        // зависимым от арифметики слотов, а не от поведения задачи.
+        const KERNEL_STACK_TABLE_FRAMES_MAX: usize = 4;
+        let frames_after = pmm::free_frames();
+        let metadata = frames_before.saturating_sub(frames_after);
+        assert_kernel!(
+            metadata <= KERNEL_STACK_TABLE_FRAMES_MAX,
+            "ring3-fault: routine returned every PMM frame (only kernel-stack page-table metadata may persist)"
         );
         crate::kprintln!(
-            "ring3-fault: pid {} killed by #PF, kernel survived ({} ticks)",
+            "ring3-fault: pid {} killed by #PF, kernel survived ({} ticks); free frames {} -> {} ({} kernel-stack table frame(s))",
             pid,
-            waited
+            waited,
+            frames_before,
+            frames_after,
+            metadata
         );
     }
 }
