@@ -4,7 +4,8 @@ use pagh_terminal::cell::Rgb;
 use pagh_terminal::demo;
 use pagh_terminal::png;
 use pagh_terminal::render::{
-    render_screen, render_window, Canvas, RenderOptions, Theme, BORDER, TITLE_H, VIEWPORT_PADDING,
+    render_screen, render_screen_into, render_screen_into_cleared, render_window, Canvas,
+    RenderOptions, Theme, BORDER, TITLE_H, VIEWPORT_PADDING,
 };
 use pagh_terminal::screen::{Screen, SelectionMode};
 use pagh_terminal::Terminal;
@@ -194,4 +195,133 @@ fn committed_screenshots_are_current() {
         let canvas = pagh_terminal::png::decode(&committed).expect("decode screenshot");
         assert!(canvas.width > 300 && canvas.height > 200);
     }
+}
+
+/// The fast frame (background already painted `theme.bg`) must be byte-identical
+/// to the full path that repaints every cell: otherwise removing the second
+/// background pass would change the picture. Both surfaces are checked — RGBA
+/// (`Canvas`) and the mmap client one (`MappedBuffer`, XRGB8888 wire order).
+fn assert_cleared_matches_full(terminal: &Terminal, opts: &RenderOptions, label: &str) {
+    let theme = theme();
+    let (cols, rows) = (terminal.screen.cols(), terminal.screen.rows());
+    let pad = opts.padding;
+    let (width, height) = (pad * 2 + cols * 8, pad * 2 + rows * 18);
+
+    // Full path: every cell repaints its own background.
+    let mut full = Canvas::new(width, height, theme.bg);
+    render_screen_into(&mut full, pad, pad, &terminal.screen, &theme, opts);
+
+    // Fast path on an already-painted canvas.
+    let mut fast = Canvas::new(width, height, theme.bg);
+    fast.fill(theme.bg);
+    render_screen_into_cleared(&mut fast, pad, pad, &terminal.screen, &theme, opts);
+    assert_eq!(
+        full.pixels, fast.pixels,
+        "{label}: owned canvas pixels differ"
+    );
+
+    // ...and on a real MAP_SHARED memfd, as in the live client.
+    let fd = pagh_ui::shm::create_memfd("render-pixel-identical").expect("memfd");
+    let len = width * height * 4;
+    pagh_ui::shm::set_len(std::os::fd::AsRawFd::as_raw_fd(&fd), len).expect("ftruncate");
+    let mapping = pagh_ui::shm::MappedBuffer::map_shared(std::os::fd::AsRawFd::as_raw_fd(&fd), len)
+        .expect("mmap");
+    let mut mapped = Canvas::from_mapped(mapping, width, height, width * 4).expect("canvas");
+    mapped.fill(theme.bg);
+    render_screen_into_cleared(&mut mapped, pad, pad, &terminal.screen, &theme, opts);
+    let mapped_rgba = mapped.clone();
+    assert_eq!(
+        full.pixels, mapped_rgba.pixels,
+        "{label}: mapped canvas pixels differ"
+    );
+
+    // A second fast-path pass over the same canvas changes nothing: the
+    // background skip is idempotent.
+    let mut again = fast.clone();
+    again.fill(theme.bg);
+    render_screen_into_cleared(&mut again, pad, pad, &terminal.screen, &theme, opts);
+    assert_eq!(fast.pixels, again.pixels, "{label}: not idempotent");
+}
+
+#[test]
+fn cleared_background_path_is_pixel_identical() {
+    // 1. Empty grid: every cell is the default background.
+    assert_cleared_matches_full(
+        &Terminal::new(12, 4),
+        &RenderOptions::default(),
+        "empty grid",
+    );
+
+    // 2. Text, colours, bold/dim/hidden/blink, underline/overline/strike.
+    let mut colored = Terminal::new(24, 6);
+    colored.feed_str(
+        "\x1b[1;31mred bold\x1b[0m \x1b[2;32mdim\x1b[0m \x1b[4munder\x1b[0m\r\n\
+         \x1b[9mstrike\x1b[0m \x1b[53mover\x1b[0m \x1b[7mreverse\x1b[0m\r\n\
+         \x1b[38;5;208mindexed\x1b[0m \x1b[48;5;53mbg53\x1b[0m \x1b[8mhidden\x1b[0m",
+    );
+    assert_cleared_matches_full(&colored, &RenderOptions::default(), "attrs");
+
+    // 3. Block cursor over a cell that holds a glyph.
+    let mut cursor = Terminal::new(10, 3);
+    cursor.feed_str("abc");
+    assert_cleared_matches_full(&cursor, &RenderOptions::default(), "block cursor");
+
+    // 4. Underline and bar cursor styles.
+    let mut bar = Terminal::new(10, 3);
+    bar.feed_str("\x1b[3 qabc");
+    let mut opts = RenderOptions::default();
+    opts.padding = VIEWPORT_PADDING;
+    assert_cleared_matches_full(&bar, &opts, "bar cursor");
+
+    // 5. Mouse selection (cells painted with theme.selection).
+    let mut selected = Terminal::new(10, 3);
+    selected.feed_str("hello world");
+    selected
+        .screen
+        .begin_selection_abs(0, 1, SelectionMode::Char);
+    selected.screen.extend_selection_abs(0, 6);
+    assert_cleared_matches_full(&selected, &RenderOptions::default(), "selection");
+
+    // 6. Reverse video (the whole grid is inverted, so cell bg = theme.fg).
+    let mut reversed = Terminal::new(10, 3);
+    reversed.feed_str("\x1b[7mreversed\x1b[0m");
+    assert_cleared_matches_full(&reversed, &RenderOptions::default(), "reverse video");
+
+    // 7. Wide glyph: the continuation cell must not paint over it.
+    let mut wide = Terminal::new(8, 2);
+    wide.feed_str("\u{1F600}a\u{754C}");
+    assert_cleared_matches_full(&wide, &RenderOptions::default(), "wide glyph");
+
+    // 8. Scrollback and the scrollbar thumb.
+    let mut scrolled = Terminal::new(10, 3);
+    scrolled.feed_str("1\r\n2\r\n3\r\n4\r\n5\r\n6");
+    assert_cleared_matches_full(&scrolled, &RenderOptions::default(), "scrollback");
+}
+
+#[test]
+fn cleared_path_repaints_non_default_backgrounds() {
+    // The opposite guard: an unconditional skip would leave a cell with an
+    // explicit background as the canvas colour. Start from a *foreign* canvas
+    // colour and require the explicit cell background to cover it.
+    let theme = theme();
+    let mut terminal = Terminal::new(6, 2);
+    terminal.feed_str("\x1b[48;5;53mxx\x1b[0m");
+    let opts = RenderOptions::default();
+    let (width, height) = (opts.padding * 2 + 6 * 8, opts.padding * 2 + 2 * 18);
+    let mut canvas = Canvas::new(width, height, Rgb(9, 9, 9));
+    canvas.fill(theme.bg);
+    render_screen_into_cleared(
+        &mut canvas,
+        opts.padding,
+        opts.padding,
+        &terminal.screen,
+        &theme,
+        &opts,
+    );
+    let cell = canvas.pixel(VIEWPORT_PADDING + 1, VIEWPORT_PADDING + 1);
+    assert_ne!(
+        cell[..3],
+        theme.bg.to_array(),
+        "a cell with an explicit background must be painted"
+    );
 }
