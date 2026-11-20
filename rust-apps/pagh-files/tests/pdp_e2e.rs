@@ -341,3 +341,221 @@ fn pagh_files_falls_back_when_shm_disabled() {
     );
     let _ = std::fs::remove_dir_all(&shots);
 }
+
+/// Hover по первой ячейке сетки: композитор обязан показать иконку целиком.
+///
+/// Живой прогон через весь путь — клиентский рендер (`FilesApp::draw`),
+/// `DamageTracker` → `commit_shm` (только damage-прямоугольники) → серверная
+/// тень `Compositor::shm_update` → кадр композитора. Сравниваются два PNG
+/// самого композитора: до наведения и после. Проверяется то, что видит
+/// пользователь: иконка на месте, подсветка появилась, а изменения кадра не
+/// выходят за наведённую ячейку (и прямоугольники курсора).
+#[test]
+fn hover_does_not_erase_icons_under_the_compositor() {
+    use pagh_desktop::png::decode_png;
+    use pagh_files::icons::{self, FluentIcon};
+    use pagh_files::{FilesApp, HostVfs};
+    use pagh_ui::geom::{Point, Rect, Size};
+
+    let socket = unique_socket_path("files-hover");
+    let shots = temp_dir("hover-shots");
+    let home = temp_dir("hover-home");
+    std::fs::create_dir_all(home.join("Desktop")).unwrap();
+    std::fs::create_dir_all(home.join("Documents")).unwrap();
+    std::fs::write(home.join("notes.md"), b"# notes\n").unwrap();
+
+    let server = Server::spawn(ServerOptions {
+        socket: socket.clone(),
+        width: 1280,
+        height: 800,
+        quiet: std::env::var("PAGH_E2E_VERBOSE").is_err(),
+        screenshot_dir: Some(shots.clone()),
+        ..ServerOptions::default()
+    })
+    .expect("композитор стартует");
+    let empty = capture(&server.control, &shots, "00-empty.png");
+    let binary = env!("CARGO_BIN_EXE_pagh-files");
+    let trace = shots.join("hover.trace");
+    let mut child = Command::new(binary)
+        .arg("--connect")
+        .arg(&socket)
+        .arg("--size")
+        .arg("1000x600")
+        .env("HOME", &home)
+        .env("PAGH_UI_PDP_TRACE", &trace)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("pagh-files стартует");
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            capture(&server.control, &shots, "01-connected.png") != empty
+        }),
+        "окно Files не появилось на экране композитора"
+    );
+
+    // Указатель подальше от окна: базовый кадр без наведения.
+    let pointer_before = Point::new(1200, 700);
+    server
+        .control
+        .mouse_move(pointer_before.x, pointer_before.y);
+    std::thread::sleep(Duration::from_millis(300));
+    let before_png = capture(&server.control, &shots, "05-hover-before.png");
+
+    // Геометрия клиента: то же приложение и тот же размер, что у бинарника.
+    let app = FilesApp::new(
+        Box::new(HostVfs::with_home(home.to_string_lossy())),
+        Size::new(1000, 600),
+    );
+    let names: Vec<&str> = app
+        .entries()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(
+        names.first().copied(),
+        Some("Desktop"),
+        "первая запись должна быть каталогом Desktop: {names:?}"
+    );
+    let cell = app.item_rect(0).expect("ячейка 0");
+    // Окно каскадом в (96,64): рамка 1 px, заголовок 30 px.
+    let content = Point::new(96 + 1, 64 + 1 + 30);
+    let icon = Rect::new(
+        content.x + cell.x + (cell.w - 40) / 2,
+        content.y + cell.y + 8,
+        40,
+        32,
+    );
+    let raster = icons::raster(FluentIcon::Folder, 32).expect("растр папки");
+    let dst = Rect::new(
+        icon.x + (icon.w - raster.width as i32) / 2,
+        icon.y + (icon.h - raster.height as i32) / 2,
+        raster.width as i32,
+        raster.height as i32,
+    );
+    let palette = pagh_ui::theme::Theme::pagh_dark().palette;
+    let accent = [palette.accent.r, palette.accent.g, palette.accent.b];
+    let backdrop_point = Point::new(icon.x - 12, icon.center().y);
+
+    let before = decode_png(&before_png).expect("кадр «до» — PNG");
+    let pixel = |frame: &pagh_desktop::png::DecodedPng, point: Point| -> [u8; 3] {
+        let index = ((point.y.max(0) as u32 * frame.width) + point.x.max(0) as u32) as usize * 4;
+        [
+            frame.rgba[index],
+            frame.rgba[index + 1],
+            frame.rgba[index + 2],
+        ]
+    };
+
+    // До наведения: непрозрачная «тушь» иконки видна в кадре композитора.
+    let mut ink = Vec::new();
+    for y in 0..raster.height {
+        for x in 0..raster.width {
+            if raster.alpha(x, y) == 255 {
+                ink.push(Point::new(dst.x + x as i32, dst.y + y as i32));
+            }
+        }
+    }
+    assert!(ink.len() > 40, "у глифа мало непрозрачных пикселей");
+    let accent_ink = |frame: &pagh_desktop::png::DecodedPng| {
+        ink.iter()
+            .filter(|point| pixel(frame, **point) == accent)
+            .count()
+    };
+    assert!(
+        accent_ink(&before) * 10 >= ink.len() * 9,
+        "до наведения видно только {}/{} непрозрачных пикселей иконки",
+        accent_ink(&before),
+        ink.len()
+    );
+    let backdrop_before = pixel(&before, backdrop_point);
+
+    // Наводим внутрь ячейки, но левее иконки: курсор не накрывает её.
+    let pointer_after = Point::new(content.x + cell.x + 10, content.y + cell.y + cell.h / 2);
+    let before_frames = frame_count(&shots);
+    server.control.mouse_move(pointer_after.x, pointer_after.y);
+    assert!(
+        wait_for(Duration::from_secs(10), || frame_count(&shots)
+            > before_frames),
+        "композитор не перерисовал кадр после наведения"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let after_png = capture(&server.control, &shots, "06-hover-after.png");
+    let after = decode_png(&after_png).expect("кадр «после» — PNG");
+    assert_eq!((before.width, before.height), (after.width, after.height));
+
+    // 1. Иконка на месте: та же непрозрачная тушь, тот же цвет.
+    let survived = accent_ink(&after);
+    assert!(
+        survived * 10 >= ink.len() * 9,
+        "наведение стёрло иконку: осталось {survived}/{} пикселей",
+        ink.len()
+    );
+
+    // 2. Подсветка появилась.
+    let backdrop_after = pixel(&after, backdrop_point);
+    assert_ne!(
+        backdrop_before, backdrop_after,
+        "наведение не подсветило ячейку ({backdrop_before:?} -> {backdrop_after:?})"
+    );
+
+    // 3. Изменения кадра не выходят за наведённую ячейку и прямоугольники
+    //    курсора: клиент не перерисовывает соседей, а композитор не теряет их
+    //    пиксели на damage/SHM-пути.
+    let cell_screen = Rect::new(content.x + cell.x, content.y + cell.y, cell.w, cell.h);
+    let cursor = |point: Point| Rect::new(point.x - 1, point.y - 1, 16, 23);
+    let allowed = [cell_screen, cursor(pointer_before), cursor(pointer_after)];
+    let mut changed = 0usize;
+    let mut outside: Vec<Point> = Vec::new();
+    let mut bbox: Option<Rect> = None;
+    for y in 0..after.height as i32 {
+        for x in 0..after.width as i32 {
+            let point = Point::new(x, y);
+            if pixel(&before, point) == pixel(&after, point) {
+                continue;
+            }
+            changed += 1;
+            bbox = Some(match bbox {
+                None => Rect::new(x, y, 1, 1),
+                Some(rect) => rect.union(Rect::new(x, y, 1, 1)),
+            });
+            if !allowed.iter().any(|rect| rect.contains(point)) {
+                outside.push(point);
+            }
+        }
+    }
+    assert!(
+        changed > 100,
+        "наведение не изменило кадр ({changed} пикселей)"
+    );
+    assert!(
+        outside.is_empty(),
+        "наведение изменило {} пикселей вне ячейки, например {:?}",
+        outside.len(),
+        &outside[..outside.len().min(8)]
+    );
+    println!(
+        "hover: изменено {changed} пикселей, bbox {:?}, ячейка {:?}",
+        bbox.expect("bbox"),
+        cell_screen
+    );
+
+    if let Ok(dir) = std::env::var("PAGH_E2E_SHOTS") {
+        std::fs::create_dir_all(&dir).unwrap();
+        for (from, to) in [
+            ("05-hover-before.png", "files-hover-before.png"),
+            ("06-hover-after.png", "files-hover-after.png"),
+        ] {
+            std::fs::copy(shots.join(from), Path::new(&dir).join(to)).unwrap();
+        }
+    }
+
+    server.control.close_window(1);
+    let status = wait_child_exit(&mut child, Duration::from_secs(10))
+        .expect("pagh-files не завершился после close");
+    assert!(status.success(), "pagh-files завершился с {status:?}");
+    server.control.shutdown();
+    server.join().expect("композитор завершился");
+    let _ = std::fs::remove_dir_all(&shots);
+    let _ = std::fs::remove_dir_all(&home);
+}
