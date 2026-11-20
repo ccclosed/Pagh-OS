@@ -446,6 +446,14 @@ pub mod fb_abi;
 #[path = "../../src/drivers/input_event.rs"]
 pub mod input_event;
 
+// Кольцо сырого ввода `inputd` (`src/drivers/input_ring.rs`): FIFO фиксированной
+// ёмкости с политикой «переполнение отвергает НОВЫЙ элемент». `core`-only и без
+// зависимостей, поэтому свойство `p66` исполняет ровно тот исходник, который
+// компилирует ядро, и модель (VecDeque) доказывает отсутствие потерь/дублей и
+// сохранение порядка на любых последовательностях push/pop.
+#[path = "../../src/drivers/input_ring.rs"]
+pub mod input_ring;
+
 // Shared VT surface ABI (`/dev/vtconsole0`) и перевод VT-байтов в PS/2
 // scancodes (`/dev/vtinput`). Оба модуля `core`-only: host-тесты проверяют
 // байтовую раскладку/валидатор/seqlock и таблицу ввода без QEMU.
@@ -829,6 +837,11 @@ mod properties {
     // `p60` is the shutdown half-close policy above, so this is `p65` (the
     // next free number after the non-root phase-2 properties P61–P64).
     mod p65;
+
+    // Кольцо сырого ввода `inputd` (порядок/ёмкость/переполнение): модель
+    // `VecDeque` против точной реализации ядра. Следующий свободный номер после
+    // P61–P65 — P66.
+    mod p66;
 
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is

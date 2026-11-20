@@ -2,6 +2,7 @@
 
 use core::cell::SyncUnsafeCell;
 use x86_64::registers::control::Cr2;
+use x86_64::registers::model_specific::FsBase;
 use x86_64::registers::rflags::RFlags;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::VirtAddr;
@@ -332,14 +333,26 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // На машине без serial-порта экран — единственный свидетель отказа, а отказ
     // выглядит ровно как «загрузка встала после шага N»: обработчик писал в COM1
-    // и останавливался. Сообщаем и сюда.
+    // и останавливался. Сообщаем и сюда — с той же полнотой, что уходит в serial:
+    // без pid и FS.base заснятый экран не позволяет отличить отказ ring 3 от
+    // отказа ring 0 на пользовательском адресе и не показывает, был ли `%fs:0`
+    // (musl TLS/errno) направлен на снятую или чужую страницу.
+    let pid = crate::task::scheduler::current_pid();
+    let fs_base = FsBase::read().as_u64();
     crate::drivers::earlyfb::errorln(format_args!(
-        "EXCEPTION #14 page fault addr={:#x} RIP={:#x}",
+        "EXCEPTION #14 page fault pid={} addr={:#x} RIP={:#x} P={} W={} U={} I={} ec=0x{:x} FS.base={:#x}",
+        pid,
         fault_addr.as_u64(),
-        stack.instruction_pointer.as_u64()
+        stack.instruction_pointer.as_u64(),
+        error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
+        error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+        error_code.contains(PageFaultErrorCode::USER_MODE),
+        error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
+        error_code.bits(),
+        fs_base,
     ));
     crate::error!(
-        "[EXC #14] PAGE FAULT addr=0x{:016x} RIP=0x{:016x} RSP=0x{:016x} P={} W={} U={} I={} ec=0x{:x}",
+        "[EXC #14] PAGE FAULT addr=0x{:016x} RIP=0x{:016x} RSP=0x{:016x} P={} W={} U={} I={} ec=0x{:x} pid={} FS.base=0x{:016x}",
         fault_addr.as_u64(),
         stack.instruction_pointer.as_u64(),
         rsp,
@@ -348,6 +361,8 @@ extern "x86-interrupt" fn page_fault_handler(
         error_code.contains(PageFaultErrorCode::USER_MODE),
         error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
         error_code.bits(),
+        pid,
+        fs_base,
     );
     // При отказе в режиме ядра RIP/RBP могут быть мусором (порча потока
     // управления, например RIP=0x1), поэтому печатаем свободное от кучи

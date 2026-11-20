@@ -120,8 +120,10 @@ proptest! {
         }
         let items = parse(&tokens, SPECS).expect("verbs are known");
         prop_assert_eq!(flags(&items), expected_cluster_flags(&before).expect("known chars"));
+        // Первый `--` — разделитель и в операнды не попадает; а вот `--`,
+        // стоящий ПОСЛЕ него, — обычный операнд (проверяется дословным
+        // сравнением, поэтому отдельное «нет ни одного --» было бы неверно).
         prop_assert_eq!(operands(&items), after.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-        prop_assert!(!operands(&items).contains(&"--"));
     }
 
     /// Неизвестная буква в кластере — ошибка на первой же неизвестной, а не

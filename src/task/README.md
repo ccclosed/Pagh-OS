@@ -75,7 +75,8 @@
   (иначе clone-треды вечно висели в FUTEX_WAIT).
 - Вытесняющий: `irq32_stub` (CPU уже пушнул iret-фрейм; стаб пушит 15 GPR + pushfq) →
   `scheduler_tick_irq`: реап минимум одной exit-задачи за тик, EOI, выбор следующего,
-  `activate_task` (TSS RSP0 + зеркало syscall-стека + FS base), `vmm::load_cr3` (заодно TLB flush),
+  `activate_task` (TSS RSP0 + зеркало syscall-стека + FS base: свой у compat-задачи,
+  0 у задачи без compat-состояния), `vmm::load_cr3` (заодно TLB flush),
   FPU restore, возврат нового RSP.
 - Long-mode грабля: `iretq` ВСЕГДА попает 5 слов даже ring0→ring0; синтетические 3-словные
   фреймы ловили фолт на guard-странице.

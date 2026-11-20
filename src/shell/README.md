@@ -168,7 +168,7 @@ x86_64 (`elf_classify::looks_like_linux_elf`); полный вердикт вс�
 
 - `ps` печатает и Linux-compat процессы (строки собираются из `/proc/<pid>/stat`
   и `/proc/<pid>/cmdline`), и **kernel-потоки** из таблицы имён планировщика
-  (`task::scheduler::task_names_snapshot`) как `[shell]`, `[net]`, … До этого в
+  (`task::scheduler::task_names_snapshot`) как `[shell]`, `[inputd]`, `[netd]`, … До этого в
   сессии без запущенной программы выводился один заголовок — то есть «в системе
   нет процессов», ровно наоборот к смыслу команды. Состояние `T` — задача
   припаркована в `STOPPED_TASKS`, иначе `R`; PPID kernel-потока — 0, как у
