@@ -56,6 +56,7 @@
 use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::spinlock::Spinlock;
@@ -63,6 +64,7 @@ use crate::sync::spinlock::Spinlock;
 use super::apt_index::{PackageIndex, PackageIndexBuilder, PkgRef, StanzaParser};
 use super::apt_resolve::{resolve_install, AptError};
 use super::deb::{self, Compression};
+use super::install::plan_install_meta;
 use super::install_fs;
 use super::openpgp::{self, OpenPgpError};
 use super::openpgp_crypto;
@@ -267,6 +269,128 @@ pub fn human_bytes(n: u64) -> String {
     }
 }
 
+// ───────────────────────── phase timings (W0) ─────────────────────────
+
+/// The scheduler's millisecond counter (`TICK_HZ` = 1000, so one tick is ~1 ms of
+/// guest time). This is the timing source for every `apt: timings` line.
+///
+/// It is monotonic, cheap (one relaxed load), and advances during a network fetch
+/// because [`crate::net::http_fetch::http_get`] waits with
+/// [`crate::task::scheduler::sleep_ticks`] between TCP pump steps rather than
+/// spinning with interrupts off.
+fn now_ms() -> u64 {
+    crate::task::scheduler::ticks()
+}
+
+/// Kernel-heap bytes currently accounted as used, sampled at phase boundaries.
+///
+/// `apt` reports the **maximum of these samples** as `heap_peak_kib`: a phase
+/// boundary always follows the allocation a phase makes (the decompressed
+/// `data.tar`, the parsed entry list, the installed-file buffers), so the high
+/// water mark over those boundaries captures the peak that matters for the
+/// streaming comparison without adding an allocator hot-path hook.
+fn heap_used_bytes() -> usize {
+    crate::memory::heap::stats().1
+}
+
+/// Total time of the last `apt update`/`apt install`, in scheduler milliseconds.
+///
+/// The in-guest self-test prints this next to its verdict so a benchmark log
+/// carries a machine-readable total without scraping the phase breakdown.
+static LAST_TOTAL_MS: Spinlock<Option<u64>> = Spinlock::new(None);
+
+/// Total scheduler-ms of the most recent [`update`] or [`install`], or `None`
+/// before the first one. Used by the `apt_e2e`/benchmark self-tests.
+pub fn last_total_ms() -> Option<u64> {
+    *LAST_TOTAL_MS.lock()
+}
+
+/// One `apt` operation's phase timers.
+///
+/// Each `phase(name)` call charges the time since the previous mark to `name`
+/// (accumulating repeats, so a per-package phase shows the sum across packages)
+/// and samples the heap. [`Timings::finish`] emits exactly one
+/// `apt: timings cmd=… <phase>=<ms>… total_ms=… heap_peak_kib=…` line — the grep
+/// surface the benchmarks and the e2e harness read. Timing never changes what the
+/// operation does: it only reads two counters.
+struct Timings {
+    cmd: &'static str,
+    start: u64,
+    last: u64,
+    phases: Vec<(&'static str, u64)>,
+    counts: Vec<(&'static str, u64)>,
+    heap_peak: usize,
+}
+
+impl Timings {
+    /// Start timing `cmd`; the first phase includes everything since here.
+    fn begin(cmd: &'static str) -> Timings {
+        let now = now_ms();
+        Timings {
+            cmd,
+            start: now,
+            last: now,
+            phases: Vec::new(),
+            counts: Vec::new(),
+            heap_peak: heap_used_bytes(),
+        }
+    }
+
+    /// Sample the heap high-water mark (no-op when below the current peak).
+    fn sample_heap(&mut self) {
+        let used = heap_used_bytes();
+        if used > self.heap_peak {
+            self.heap_peak = used;
+        }
+    }
+
+    /// Charge the time since the previous mark to `name` and sample the heap.
+    fn phase(&mut self, name: &'static str) {
+        let now = now_ms();
+        let elapsed = now.saturating_sub(self.last);
+        self.last = now;
+        match self.phases.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => slot.1 = slot.1.saturating_add(elapsed),
+            None => self.phases.push((name, elapsed)),
+        }
+        self.sample_heap();
+    }
+
+    /// Record a non-time counter (bytes, packages, files) for the log line.
+    fn count(&mut self, name: &'static str, value: u64) {
+        match self.counts.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => slot.1 = slot.1.saturating_add(value),
+            None => self.counts.push((name, value)),
+        }
+    }
+
+    /// Emit the single `apt: timings …` line and record the total.
+    fn finish(mut self) {
+        let total = now_ms().saturating_sub(self.start);
+        *LAST_TOTAL_MS.lock() = Some(total);
+        self.sample_heap();
+        let mut line = format!("ppkg: timings cmd={}", self.cmd);
+        for (name, ms) in self.phases.iter() {
+            line.push(' ');
+            line.push_str(name);
+            line.push('=');
+            line.push_str(&format!("{}", ms));
+        }
+        for (name, value) in self.counts.iter() {
+            line.push(' ');
+            line.push_str(name);
+            line.push('=');
+            line.push_str(&format!("{}", value));
+        }
+        line.push_str(&format!(
+            " total_ms={} heap_peak_kib={}",
+            total,
+            self.heap_peak / 1024
+        ));
+        crate::info!("{}", line);
+    }
+}
+
 /// A read-only summary of one indexed package, returned by [`show`].
 ///
 /// Owns its strings so the caller need not hold the index lock while printing.
@@ -454,7 +578,8 @@ fn trusted_keyring() -> &'static [openpgp::PinnedKey] {
     #[cfg(not(any(
         feature = "lx_selftest",
         feature = "lx_bigindex",
-        feature = "lx_bigindex_inram"
+        feature = "lx_bigindex_inram",
+        feature = "lx_apt_bench"
     )))]
     {
         &super::openpgp_keys::DEBIAN_KEYRING
@@ -462,7 +587,8 @@ fn trusted_keyring() -> &'static [openpgp::PinnedKey] {
     #[cfg(any(
         feature = "lx_selftest",
         feature = "lx_bigindex",
-        feature = "lx_bigindex_inram"
+        feature = "lx_bigindex_inram",
+        feature = "lx_apt_bench"
     ))]
     {
         &super::openpgp_test_keys::TEST_TRUST_ANCHORS
@@ -485,66 +611,96 @@ struct SignedRelease {
 /// The fallback happens **only** when `InRelease` is absent (HTTP 404). A
 /// present-but-invalid `InRelease` is fatal: falling back there would let a
 /// man-in-the-middle force the weaker path.
-fn fetch_signed_release(cfg: &AptConfig, now: i64) -> Result<SignedRelease, AptOpError> {
+fn fetch_signed_release(
+    cfg: &AptConfig,
+    now: i64,
+    t: &mut Timings,
+) -> Result<SignedRelease, AptOpError> {
     let inrelease = format!("{}/dists/{}/InRelease", cfg.base, cfg.suite);
-    match cfg.fetch(&inrelease) {
+    let fetched = cfg.fetch(&inrelease);
+    t.phase("release_fetch_ms");
+    match fetched {
         Ok(bytes) => match openpgp::verify_clearsigned(trusted_keyring(), &bytes, now) {
             Ok((cs, verified)) => {
                 crate::info!(
-                    "apt: verify OK release=InRelease signer={} key={}",
+                    "ppkg: verify OK release=InRelease signer={} key={}",
                     hex20(&verified.signer),
                     hex20(&verified.key)
                 );
+                t.phase("release_verify_ms");
                 return Ok(SignedRelease {
                     text: cs.text.to_vec(),
                     source: "InRelease",
                     signer: verified.signer,
                 });
             }
-            Err(e) => return Err(signature_error(e, "InRelease")),
+            Err(e) => {
+                t.phase("release_verify_ms");
+                return Err(signature_error(e, "InRelease"));
+            }
         },
         Err(crate::net::http_fetch::FetchError::Status(404)) => {
             // No InRelease: the detached pair must be present instead.
         }
         Err(crate::net::http_fetch::FetchError::NoNetwork) => return Err(AptOpError::NoNetwork),
         Err(e) => {
-            crate::warn!("apt: InRelease fetch failed ({:?}) - trying Release.gpg", e);
+            crate::warn!(
+                "ppkg: InRelease fetch failed ({:?}) - trying Release.gpg",
+                e
+            );
         }
     }
 
     let release_url = format!("{}/dists/{}/Release", cfg.base, cfg.suite);
     let sig_url = format!("{}/dists/{}/Release.gpg", cfg.base, cfg.suite);
     let signature = match cfg.fetch(&sig_url) {
-        Ok(b) => b,
+        Ok(b) => {
+            t.phase("release_fetch_ms");
+            b
+        }
         Err(crate::net::http_fetch::FetchError::Status(404)) => {
+            t.phase("release_fetch_ms");
             verify_fail("metadata", "Unsigned", &format!(" url={}", sig_url));
             return Err(AptOpError::Unsigned { url: sig_url });
         }
-        Err(crate::net::http_fetch::FetchError::NoNetwork) => return Err(AptOpError::NoNetwork),
+        Err(crate::net::http_fetch::FetchError::NoNetwork) => {
+            t.phase("release_fetch_ms");
+            return Err(AptOpError::NoNetwork);
+        }
         Err(_) => {
+            t.phase("release_fetch_ms");
             return Err(AptOpError::Download {
                 pkg: "Release.gpg".to_string(),
-            })
+            });
         }
     };
     let text = match cfg.fetch(&release_url) {
-        Ok(b) => b,
+        Ok(b) => {
+            t.phase("release_fetch_ms");
+            b
+        }
         Err(crate::net::http_fetch::FetchError::Status(404)) => {
+            t.phase("release_fetch_ms");
             verify_fail("metadata", "Unsigned", &format!(" url={}", release_url));
             return Err(AptOpError::Unsigned { url: release_url });
         }
-        Err(crate::net::http_fetch::FetchError::NoNetwork) => return Err(AptOpError::NoNetwork),
+        Err(crate::net::http_fetch::FetchError::NoNetwork) => {
+            t.phase("release_fetch_ms");
+            return Err(AptOpError::NoNetwork);
+        }
         Err(_) => {
+            t.phase("release_fetch_ms");
             return Err(AptOpError::Download {
                 pkg: "Release".to_string(),
-            })
+            });
         }
     };
 
     match openpgp::verify_detached(trusted_keyring(), &signature, &text, now) {
         Ok(verified) => {
+            t.phase("release_verify_ms");
             crate::info!(
-                "apt: verify OK release=Release.gpg signer={} key={}",
+                "ppkg: verify OK release=Release.gpg signer={} key={}",
                 hex20(&verified.signer),
                 hex20(&verified.key)
             );
@@ -554,7 +710,10 @@ fn fetch_signed_release(cfg: &AptConfig, now: i64) -> Result<SignedRelease, AptO
                 signer: verified.signer,
             })
         }
-        Err(e) => Err(signature_error(e, "Release.gpg")),
+        Err(e) => {
+            t.phase("release_verify_ms");
+            Err(signature_error(e, "Release.gpg"))
+        }
     }
 }
 
@@ -658,7 +817,7 @@ fn verify_index_body(
         });
     }
     crate::info!(
-        "apt: verify index path={} sha256={} size={} ok",
+        "ppkg: verify index path={} sha256={} size={} ok",
         path,
         hex32(&digest),
         entry.size
@@ -711,7 +870,7 @@ fn verify_package_body(
         });
     }
     crate::info!(
-        "apt: verify deb pkg={} sha256={} size={} ok",
+        "ppkg: verify deb pkg={} sha256={} size={} ok",
         pkg,
         hex32(&digest),
         expected_size
@@ -722,7 +881,7 @@ fn verify_package_body(
 /// One `apt: verify FAIL stage=… cause=…` line — the grep surface the e2e
 /// harnesses assert on. Exactly one line per refusal.
 fn verify_fail(stage: &str, cause: &str, extra: &str) {
-    crate::error!("apt: verify FAIL stage={} cause={}{}", stage, cause, extra);
+    crate::error!("ppkg: verify FAIL stage={} cause={}{}", stage, cause, extra);
 }
 
 /// Map a signature failure onto the apt error, keeping the (stage, cause) pair.
@@ -754,6 +913,332 @@ fn hex20(fpr: &[u8; 20]) -> String {
         hex_nibble_out(&mut out, *byte);
     }
     out
+}
+
+// ───────────────────── persistent compact index cache (W3) ─────────────────────
+//
+// `apt update` normally re-downloads, re-decompresses and re-parses the whole
+// `Packages` index every boot. The indices this project cares about are large
+// (the full Debian `main` decompresses to ~150 MiB), so that is the most
+// expensive part of a boot-time package refresh. The cache below stores the
+// parsed index in its compact arena form (see
+// [`PackageIndex::to_compact_bytes`](super::apt_index::PackageIndex::to_compact_bytes))
+// under the ext2 install root and revalidates it against the **signed** `Release`
+// the current update just verified.
+//
+// ## Trust model
+//
+// The signed `Release` is ALWAYS fetched and verified first; the cache never
+// replaces that step and is only consulted after it succeeds. The cache key is
+// `(SHA-256 of the verified Release body, suite, component, arch, format
+// version)`, so a mirror rollback/rotation or a configuration change invalidates
+// it. The payload is length-delimited, versioned and carries a SHA-256 of its own
+// bytes, and every offset is validated before use; anything inconsistent is
+// treated as absent and the normal verified network path runs.
+//
+// The cache file lives on `/mnt`, i.e. at the same trust level as everything
+// else installed there (packages are signature-verified before installation, and
+// an actor who can rewrite `/mnt` can already rewrite the userland and boot
+// files this kernel executes). Its checksum protects against corruption and
+// accidental clobbering by an installed file; it is not a substitute for the
+// signed `Release` check, which still gates every run.
+
+/// Directory of the persistent apt index cache on the install root.
+const INDEX_CACHE_DIR: &str = "/mnt/var/cache/pagh/apt";
+/// File name of the single cached index (keyed by suite/component/arch + Release).
+const INDEX_CACHE_FILE: &str = "index-v1.bin";
+/// Cache file magic (16 bytes, fixed).
+const INDEX_CACHE_MAGIC: [u8; 16] = *b"PAGHAPT-CACHE-v1";
+/// Cache container format version; bump on any layout change.
+const INDEX_CACHE_VERSION: u32 = 1;
+/// Refuse to read or write a cache larger than this. The guest disk is 64 MiB
+/// and the compact encoding is several times smaller than the text index; a
+/// "cache" beyond this bound is corrupt or from an incompatible future format, so
+/// it is ignored (fallback) rather than trusted.
+const MAX_INDEX_CACHE_BYTES: usize = 48 * 1024 * 1024;
+/// Fixed part of the cache header:
+/// magic(16) + version(4) + release digest(32) + three u16 lengths(6) +
+/// payload length(8) + payload SHA-256(32).
+const INDEX_CACHE_HEADER_FIXED: usize = 16 + 4 + 32 + 6 + 8 + 32;
+
+/// Whether the persistent index cache is active in this build.
+///
+/// The cache is a production optimization. The diagnostic harnesses that exist to
+/// exercise the REAL download+decompress+parse path (`lx_bigindex`,
+/// `lx_bigindex_inram`, and the live-mirror `lx_livetest`) must never be short-
+/// circuited by a cache left on a reused disk, so it is compiled out there.
+fn index_cache_enabled() -> bool {
+    !cfg!(any(
+        feature = "lx_bigindex",
+        feature = "lx_bigindex_inram",
+        feature = "lx_livetest"
+    ))
+}
+
+/// Create (or look up) every component of an absolute directory path.
+fn ensure_dir_path(path: &str) -> Result<Arc<dyn crate::vfs::VfsNode>, crate::vfs::VfsError> {
+    use crate::vfs::VfsError;
+    if let Ok(node) = crate::vfs::lookup_path(path) {
+        if node.is_directory() {
+            return Ok(node);
+        }
+        return Err(VfsError::InvalidArgument);
+    }
+    let split = path.rfind('/').ok_or(VfsError::InvalidArgument)?;
+    let parent_path = if split == 0 { "/" } else { &path[..split] };
+    let name = &path[split + 1..];
+    if name.is_empty() {
+        return Err(VfsError::InvalidArgument);
+    }
+    let parent = ensure_dir_path(parent_path)?;
+    match parent.create_dir(name) {
+        Ok(node) => Ok(node),
+        Err(VfsError::AlreadyExists) => match parent.lookup(name) {
+            Ok(node) if node.is_directory() => Ok(node),
+            _ => Err(VfsError::InvalidArgument),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Write `bytes` at `offset`, looping on short writes (`write_all` for a
+/// [`VfsNode`]).
+fn write_all_at(
+    node: &Arc<dyn crate::vfs::VfsNode>,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), crate::vfs::VfsError> {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let n = node.write(offset + written as u64, &bytes[written..])?;
+        if n == 0 {
+            return Err(crate::vfs::VfsError::IoError);
+        }
+        written += n;
+    }
+    Ok(())
+}
+
+/// Read exactly `buf.len()` bytes at `offset`; a short read is an I/O error.
+fn read_exact_at(
+    node: &Arc<dyn crate::vfs::VfsNode>,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), crate::vfs::VfsError> {
+    let mut read = 0usize;
+    while read < buf.len() {
+        let n = node.read(offset + read as u64, &mut buf[read..])?;
+        if n == 0 {
+            return Err(crate::vfs::VfsError::IoError);
+        }
+        read += n;
+    }
+    Ok(())
+}
+
+fn cache_push_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn cache_push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn cache_push_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Header cursor for the cache container (strict, bounds-checked).
+struct CacheCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+impl<'a> CacheCursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        let mut b = [0u8; 2];
+        b.copy_from_slice(self.take(2)?);
+        Some(u16::from_le_bytes(b))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(self.take(4)?);
+        Some(u32::from_le_bytes(b))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(self.take(8)?);
+        Some(u64::from_le_bytes(b))
+    }
+    fn digest(&mut self) -> Option<[u8; 32]> {
+        let mut d = [0u8; 32];
+        d.copy_from_slice(self.take(32)?);
+        Some(d)
+    }
+    fn str(&mut self, len: usize) -> Option<&'a str> {
+        core::str::from_utf8(self.take(len)?).ok()
+    }
+}
+
+/// Serialize `index` plus its cache key and write it to [`INDEX_CACHE_DIR`].
+///
+/// Returns the number of bytes written. Any failure (no space, unsupported
+/// filesystem, encoding larger than [`MAX_INDEX_CACHE_BYTES`]) is a logged
+/// warning, not an update failure: the cache is an optimization only.
+fn store_index_cache(
+    cfg: &AptConfig,
+    release_digest: &[u8; 32],
+    index: &PackageIndex,
+) -> Result<usize, ()> {
+    let payload = index.to_compact_bytes();
+    if payload.len() > MAX_INDEX_CACHE_BYTES {
+        crate::warn!(
+            "ppkg: index cache skipped ({} > {} byte cap)",
+            payload.len(),
+            MAX_INDEX_CACHE_BYTES
+        );
+        return Err(());
+    }
+    let suite = cfg.suite.as_bytes();
+    let component = cfg.component.as_bytes();
+    let arch = cfg.arch.as_bytes();
+    if suite.len() > u16::MAX as usize
+        || component.len() > u16::MAX as usize
+        || arch.len() > u16::MAX as usize
+    {
+        return Err(());
+    }
+    let payload_digest = openpgp_crypto::sha256(&payload);
+
+    let mut header: Vec<u8> =
+        Vec::with_capacity(INDEX_CACHE_HEADER_FIXED + suite.len() + component.len() + arch.len());
+    header.extend_from_slice(&INDEX_CACHE_MAGIC);
+    cache_push_u32(&mut header, INDEX_CACHE_VERSION);
+    header.extend_from_slice(release_digest);
+    cache_push_u16(&mut header, suite.len() as u16);
+    cache_push_u16(&mut header, component.len() as u16);
+    cache_push_u16(&mut header, arch.len() as u16);
+    header.extend_from_slice(suite);
+    header.extend_from_slice(component);
+    header.extend_from_slice(arch);
+    cache_push_u64(&mut header, payload.len() as u64);
+    header.extend_from_slice(&payload_digest);
+
+    let dir = ensure_dir_path(INDEX_CACHE_DIR).map_err(|e| {
+        crate::warn!("ppkg: index cache dir unavailable ({:?}); not caching", e);
+    })?;
+    // Replace any previous cache atomically-enough for a single-writer kernel:
+    // remove first, then create the new file (a crash in between just yields a
+    // cache miss next boot).
+    let _ = dir.remove(INDEX_CACHE_FILE);
+    let file = dir.create_file(INDEX_CACHE_FILE).map_err(|e| {
+        crate::warn!("ppkg: index cache create failed ({:?}); not caching", e);
+    })?;
+    let mut offset = 0u64;
+    if let Err(e) = write_all_at(&file, offset, &header) {
+        crate::warn!("ppkg: index cache write failed ({:?})", e);
+        let _ = dir.remove(INDEX_CACHE_FILE);
+        return Err(());
+    }
+    offset += header.len() as u64;
+    if let Err(e) = write_all_at(&file, offset, &payload) {
+        crate::warn!("ppkg: index cache write failed ({:?})", e);
+        let _ = dir.remove(INDEX_CACHE_FILE);
+        return Err(());
+    }
+    offset += payload.len() as u64;
+    file.sync();
+    if file.size() != offset {
+        crate::warn!(
+            "ppkg: index cache size mismatch after write ({} != {})",
+            file.size(),
+            offset
+        );
+        let _ = dir.remove(INDEX_CACHE_FILE);
+        return Err(());
+    }
+    Ok(offset as usize)
+}
+
+/// Try to load the cached index for the verified `Release` whose body has digest
+/// `release_digest`.
+///
+/// Returns the index and the cache file size on a validated hit, `None` on a
+/// miss or ANY inconsistency (corrupt header, checksum mismatch, foreign key,
+/// undecodable payload, oversized file). The caller then runs the normal
+/// verified download+parse path. Never panics and never trusts a partial file.
+fn load_index_cache(cfg: &AptConfig, release_digest: &[u8; 32]) -> Option<(PackageIndex, usize)> {
+    let dir = crate::vfs::lookup_path(INDEX_CACHE_DIR).ok()?;
+    let file = dir.lookup(INDEX_CACHE_FILE).ok()?;
+    if file.is_directory() {
+        return None;
+    }
+    let size = file.size() as usize;
+    if size <= INDEX_CACHE_HEADER_FIXED || size > MAX_INDEX_CACHE_BYTES {
+        crate::info!("ppkg: index cache MISS (implausible size {})", size);
+        return None;
+    }
+    let mut buf = alloc::vec![0u8; size];
+    if read_exact_at(&file, 0, &mut buf).is_err() {
+        crate::warn!("ppkg: index cache read failed; ignoring it");
+        return None;
+    }
+
+    let mut c = CacheCursor {
+        bytes: &buf,
+        pos: 0,
+    };
+    let parsed = (|| -> Option<(PackageIndex, usize)> {
+        if c.take(INDEX_CACHE_MAGIC.len())? != INDEX_CACHE_MAGIC {
+            return None;
+        }
+        if c.u32()? != INDEX_CACHE_VERSION {
+            return None;
+        }
+        if c.digest()? != *release_digest {
+            return None;
+        }
+        let suite_len = c.u16()? as usize;
+        let component_len = c.u16()? as usize;
+        let arch_len = c.u16()? as usize;
+        let suite = c.str(suite_len)?;
+        let component = c.str(component_len)?;
+        let arch = c.str(arch_len)?;
+        if suite != cfg.suite || component != cfg.component || arch != cfg.arch {
+            return None;
+        }
+        let payload_len = c.u64()? as usize;
+        let payload_digest = c.digest()?;
+        let header_len = c.pos;
+        if payload_len != size.checked_sub(header_len)? {
+            return None;
+        }
+        let payload = buf.get(header_len..)?;
+        if openpgp_crypto::sha256(payload) != payload_digest {
+            return None;
+        }
+        let index = PackageIndex::from_compact_bytes(payload)?;
+        Some((index, size))
+    })();
+
+    match parsed {
+        Some((index, bytes)) => {
+            crate::info!(
+                "ppkg: index cache HIT ({} packages, {} bytes, key=sha256:{})",
+                index.len(),
+                bytes,
+                hex32(release_digest)
+            );
+            Some((index, bytes))
+        }
+        None => {
+            crate::info!("ppkg: index cache MISS (key/format/checksum mismatch)");
+            None
+        }
+    }
 }
 
 /// Download and parse the repository `Packages` index into RAM, returning the
@@ -798,13 +1283,47 @@ fn update_verified() -> Result<usize, AptOpError> {
     #[cfg(not(feature = "insecure_network_demo"))]
     return Err(AptOpError::NetworkDisabled);
 
+    // W0: phase timers around the whole update. The result is unchanged; the
+    // one `apt: timings cmd=update …` line is emitted on success and failure.
+    let mut t = Timings::begin("update");
+    let result = update_timed(&mut t);
+    if let Ok(count) = result {
+        t.count("pkgs", count as u64);
+    }
+    t.finish();
+    result
+}
+
+/// The body of [`update_verified`], taking the phase timer so every early return
+/// still reports what it measured.
+fn update_timed(t: &mut Timings) -> Result<usize, AptOpError> {
     let cfg = config();
     let now = crate::arch::x86_64::linux::rtc::now_unix() as i64;
 
     // 1+2. Signed metadata, verified, parsed and policy-checked.
-    let signed = fetch_signed_release(&cfg, now)?;
+    let signed = fetch_signed_release(&cfg, now, t)?;
     let release = release_file::parse_release(&signed.text);
     check_release_policy(&cfg, &release, now)?;
+    t.phase("release_policy_ms");
+
+    // W3: if the signed Release is byte-identical to the one the cache was built
+    // from, the parsed index can be read back instead of downloading,
+    // decompressing and parsing `Packages`. This runs only AFTER the signature and
+    // Release policy checks above, so the cache can never bypass them; a miss or
+    // any inconsistency falls through to the normal verified path below.
+    let release_digest = openpgp_crypto::sha256(&signed.text);
+    let cache_enabled = index_cache_enabled();
+    if cache_enabled {
+        if let Some((index, bytes)) = load_index_cache(&cfg, &release_digest) {
+            t.phase("cache_load_ms");
+            t.count("cache_bytes", bytes as u64);
+            let count = index.len();
+            *INDEX.lock() = Some(index);
+            crate::info!("ppkg: index ready - {} packages (cache)", count);
+            return Ok(count);
+        }
+    }
+    t.phase("cache_load_ms");
 
     // 3. Candidate index variants, in preference order: gzip first (faster to
     // decode at full-index scale), then xz, then uncompressed — but only those
@@ -842,7 +1361,7 @@ fn update_verified() -> Result<usize, AptOpError> {
         };
         listed += 1;
         crate::info!(
-            "apt: Get {}://{}{} [{}/{}/{}]",
+            "ppkg: Get {}://{}{} [{}/{}/{}]",
             cfg.scheme(),
             cfg.host,
             url,
@@ -850,14 +1369,17 @@ fn update_verified() -> Result<usize, AptOpError> {
             cfg.component,
             cfg.arch
         );
-        match cfg.fetch(url) {
+        let fetched = cfg.fetch(url);
+        t.phase("index_fetch_ms");
+        match fetched {
             Ok(bytes) => {
                 // 4. The signed Release is the authority for these bytes: check
                 // them BEFORE any decoding. A mismatch is fatal for the whole
                 // update (see the doc comment).
                 verify_index_body(path, &bytes, entry)?;
+                t.phase("index_verify_ms");
                 crate::info!(
-                    "apt: fetched {} index body - decompressing...",
+                    "ppkg: fetched {} index body - decompressing...",
                     human_bytes(bytes.len() as u64)
                 );
                 // A successful download that fails to *decode* is no longer fatal
@@ -866,14 +1388,25 @@ fn update_verified() -> Result<usize, AptOpError> {
                 let index = match stream_parse_index(&bytes, *comp) {
                     Ok(index) => index,
                     Err(e) => {
-                        crate::warn!("apt: decode of {} failed - trying next index variant", url);
+                        t.phase("index_parse_ms");
+                        crate::warn!("ppkg: decode of {} failed - trying next index variant", url);
                         last_decode_err = Some(e);
                         continue;
                     }
                 };
+                t.phase("index_parse_ms");
+                // W3: persist the parsed index for the next update, keyed by the
+                // signed Release digest + this configuration. Failure to cache is
+                // only a warning: the update itself already succeeded.
+                if cache_enabled {
+                    if let Ok(bytes) = store_index_cache(&cfg, &release_digest, &index) {
+                        t.count("cache_store_bytes", bytes as u64);
+                    }
+                }
+                t.phase("cache_store_ms");
                 let count = index.len();
                 *INDEX.lock() = Some(index);
-                crate::info!("apt: index ready - {} packages", count);
+                crate::info!("ppkg: index ready - {} packages", count);
                 return Ok(count);
             }
             Err(crate::net::http_fetch::FetchError::NoNetwork) => {
@@ -920,7 +1453,7 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
     // Explicit start marker -- the full Debian index decompresses
     // to ~150 MiB and parses for minutes; without this line the gap after
     // "decompressing..." looks like a hang.
-    crate::info!("apt: parsing index (takes a few minutes for the full Debian index; progress every 4 MiB)...");
+    crate::info!("ppkg: parsing index (takes a few minutes for the full Debian index; progress every 4 MiB)...");
     let mut parser = StanzaParser::new();
     let mut builder = PackageIndexBuilder::new();
     let mut decompressed: usize = 0;
@@ -956,7 +1489,7 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
         // not look hung, while staying modest (not per-line).
         if decompressed >= next_byte_mark || builder.len() >= next_pkg_mark {
             crate::info!(
-                "apt: reading package lists... {} / {} pkgs",
+                "ppkg: reading package lists... {} / {} pkgs",
                 human_bytes(decompressed as u64),
                 builder.len()
             );
@@ -975,7 +1508,7 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
             // Flush the trailing partial line / final stanza.
             parser.finish_view(&mut builder);
             crate::info!(
-                "apt: read package lists - {} / {} pkgs",
+                "ppkg: read package lists - {} / {} pkgs",
                 human_bytes(decompressed as u64),
                 builder.len()
             );
@@ -983,7 +1516,7 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
         }
         Err(_) => {
             crate::warn!(
-                "apt: index decode failed after {} decompressed / {} pkgs parsed",
+                "ppkg: index decode failed after {} decompressed / {} pkgs parsed",
                 human_bytes(decompressed as u64),
                 builder.len()
             );
@@ -991,6 +1524,236 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
         }
     }
 }
+
+/// Pass 1 of the streaming `.deb` install: decompress `data.tar` **once** and
+/// collect member metadata only (no content, no `Vec<TarEntry>`).
+///
+/// Bounded by [`deb::MAX_DECOMPRESSED`] like any other `.deb` member decode; every
+/// member is validated by the same panic-free [`tar::TarWalker`] rules as
+/// [`tar::read_tar`] (checksum, size, truncation, GNU/pax extensions).
+fn scan_deb_metadata(
+    member: &deb::ArMember<'_>,
+    comp: Compression,
+    pkg: &str,
+    observer: &mut dyn InstallObserver,
+) -> Result<Vec<tar::TarMeta>, AptOpError> {
+    struct Collect(Vec<tar::TarMeta>);
+    impl tar::TarVisitor for Collect {
+        fn on_entry(&mut self, meta: &tar::TarMeta) -> Result<(), tar::TarError> {
+            self.0.push(meta.clone());
+            Ok(())
+        }
+        fn on_data(&mut self, _chunk: &[u8]) -> Result<(), tar::TarError> {
+            Ok(())
+        }
+    }
+
+    let mut sink = Collect(Vec::new());
+    let mut walker = tar::TarWalker::new();
+    let mut walk_error: Option<tar::TarError> = None;
+    // Progress while the archive is scanned: the unpacked total is not known yet,
+    // so the UI shows its unknown-total animation. One update per 256 KiB keeps
+    // the observer overhead invisible next to the decode itself.
+    let mut scanned: u64 = 0;
+    let mut next_tick: u64 = 256 * 1024;
+    let decoded = deb::decompress_stream(member.data, comp, deb::MAX_DECOMPRESSED, |chunk| {
+        match walker.push(chunk, &mut sink) {
+            Ok(()) => {
+                scanned += chunk.len() as u64;
+                if scanned >= next_tick {
+                    observer.on_unpack_progress(pkg, scanned, 0);
+                    while scanned >= next_tick {
+                        next_tick += 256 * 1024;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                walk_error = Some(e);
+                // Abort the decode; the walker error is the real cause and is
+                // reported below.
+                Err(deb::DebError::DecompressFailed)
+            }
+        }
+    });
+    if let Some(e) = walk_error {
+        crate::warn!("ppkg: data.tar scan failed pkg={} err={:?}", pkg, e);
+        return Err(AptOpError::Parse {
+            pkg: pkg.to_string(),
+        });
+    }
+    if decoded.is_err() {
+        crate::warn!(
+            "ppkg: data.tar decode failed pkg={} (cap {} bytes)",
+            pkg,
+            deb::MAX_DECOMPRESSED
+        );
+        return Err(AptOpError::Parse {
+            pkg: pkg.to_string(),
+        });
+    }
+    if let Err(e) = walker.finish(&mut sink) {
+        crate::warn!("ppkg: data.tar truncated pkg={} err={:?}", pkg, e);
+        return Err(AptOpError::Parse {
+            pkg: pkg.to_string(),
+        });
+    }
+    Ok(sink.0)
+}
+
+/// Pass 2 of the streaming `.deb` install: decompress `data.tar` again and write
+/// each planned member as its bytes arrive (no whole-archive buffer).
+///
+/// The tar walker enforces the archive structure and the declared sizes; this
+/// driver only maps each accepted member ordinal onto the preflight-validated
+/// [`install_fs::StreamingInstall`]. A filesystem refusal is carried out through
+/// [`tar::TarError::VisitorFailure`] (the walker has no filesystem error type) and
+/// unwrapped into [`AptOpError::Install`], exactly where the eager path mapped
+/// [`install_fs::InstallError`].
+fn extract_deb_stream(
+    member: &deb::ArMember<'_>,
+    comp: Compression,
+    pkg: &str,
+    unpack_total: u64,
+    install: &mut install_fs::StreamingInstall,
+    observer: &mut dyn InstallObserver,
+) -> Result<(), AptOpError> {
+    struct Sink<'a> {
+        install: &'a mut install_fs::StreamingInstall,
+        observer: &'a mut dyn InstallObserver,
+        pkg: &'a str,
+        unpack_total: u64,
+        written: u64,
+        next_tick: u64,
+        error: Option<install_fs::InstallError>,
+    }
+    impl tar::TarVisitor for Sink<'_> {
+        fn on_entry(&mut self, meta: &tar::TarMeta) -> Result<(), tar::TarError> {
+            if self.error.is_some() {
+                return Ok(());
+            }
+            match self.install.accept_entry(meta) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.error = Some(e);
+                    Err(tar::TarError::VisitorFailure)
+                }
+            }
+        }
+        fn on_data(&mut self, chunk: &[u8]) -> Result<(), tar::TarError> {
+            if self.error.is_some() {
+                return Ok(());
+            }
+            match self.install.accept_chunk(chunk) {
+                Ok(()) => {
+                    self.written = self.written.saturating_add(chunk.len() as u64);
+                    if self.written >= self.next_tick {
+                        self.observer
+                            .on_unpack_progress(self.pkg, self.written, self.unpack_total);
+                        while self.written >= self.next_tick {
+                            self.next_tick += 256 * 1024;
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    Err(tar::TarError::VisitorFailure)
+                }
+            }
+        }
+    }
+
+    let mut sink = Sink {
+        install,
+        observer,
+        pkg,
+        unpack_total,
+        written: 0,
+        next_tick: 256 * 1024,
+        error: None,
+    };
+    let mut walker = tar::TarWalker::new();
+    let mut walk_error: Option<tar::TarError> = None;
+    let decoded =
+        deb::decompress_stream(
+            member.data,
+            comp,
+            deb::MAX_DECOMPRESSED,
+            |chunk| match walker.push(chunk, &mut sink) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    walk_error = Some(e);
+                    Err(deb::DebError::DecompressFailed)
+                }
+            },
+        );
+    // The visitor's own error is the most specific outcome: unwrap it before the
+    // sentinel it produced and before generic decode errors.
+    if let Some(e) = sink.error.take() {
+        crate::debug!("ppkg: streaming install failed pkg={} err={}", pkg, e);
+        return Err(AptOpError::Install {
+            pkg: pkg.to_string(),
+        });
+    }
+    if let Some(e) = walk_error {
+        crate::warn!("ppkg: data.tar walk failed pkg={} err={:?}", pkg, e);
+        return Err(AptOpError::Parse {
+            pkg: pkg.to_string(),
+        });
+    }
+    if decoded.is_err() {
+        crate::warn!(
+            "ppkg: data.tar decode failed pkg={} (cap {} bytes)",
+            pkg,
+            deb::MAX_DECOMPRESSED
+        );
+        return Err(AptOpError::Parse {
+            pkg: pkg.to_string(),
+        });
+    }
+    if let Err(e) = walker.finish(&mut sink) {
+        crate::warn!("ppkg: data.tar truncated pkg={} err={:?}", pkg, e);
+        return Err(AptOpError::Parse {
+            pkg: pkg.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// A phase of one package's installation, reported to an [`InstallObserver`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InstallPhase {
+    /// Fetching the `.deb` (the transport draws its own byte bar meanwhile).
+    Download,
+    /// Checking the signed index digest/size before unpacking.
+    Verify,
+    /// Planning the archive and writing its members.
+    Unpack,
+}
+
+/// Progress/notification interface for the shell's install UI
+/// (`ppkg install`, see `shell::progress`).
+///
+/// `apt` drives the whole transaction synchronously, so the observer is a plain
+/// `&mut dyn` call-back channel — no threads, no polling and no change to the
+/// install logic or its ordering. Every method has a default no-op, so a caller
+/// that only cares about a subset (or nothing, via [`install`]) implements none.
+pub trait InstallObserver {
+    /// The resolver produced the transaction plan: `(package, declared .deb size)`.
+    fn on_plan(&mut self, _packages: &[(String, u64)]) {}
+    /// A package entered `phase`.
+    fn on_phase(&mut self, _pkg: &str, _phase: InstallPhase) {}
+    /// Bytes written while unpacking `pkg`; `total == 0` while the plan (and so
+    /// the unpacked size) is still being discovered.
+    fn on_unpack_progress(&mut self, _pkg: &str, _done: u64, _total: u64) {}
+    /// A package finished; `files` entries were created.
+    fn on_package_done(&mut self, _pkg: &str, _files: usize) {}
+}
+
+/// The no-op observer behind the programmatic [`install`] API.
+struct NullObserver;
+impl InstallObserver for NullObserver {}
 
 /// Resolve and install `name` (and its not-yet-installed dependencies) from the
 /// loaded index, returning the package names installed in dependency-first order.
@@ -1007,9 +1770,51 @@ fn stream_parse_index(bytes: &[u8], comp: Compression) -> Result<PackageIndex, A
 /// `{base}/{filename}`, parsed, decompressed, and written onto ext2 under `/mnt`.
 /// Each successfully installed name is recorded in [`struct@INSTALLED`].
 pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
-    #[cfg(not(feature = "insecure_network_demo"))]
-    return Err(AptOpError::NetworkDisabled);
+    let mut observer = NullObserver;
+    install_observed(name, &mut observer)
+}
 
+/// [`install`] with a progress observer (the `ppkg install` UI).
+///
+/// Identical transaction, resolution, verification and install semantics; the
+/// observer only receives call-backs. A [`NullObserver`] is exactly [`install`].
+pub fn install_observed(
+    name: &str,
+    observer: &mut dyn InstallObserver,
+) -> Result<Vec<String>, AptOpError> {
+    #[cfg(not(feature = "insecure_network_demo"))]
+    {
+        let _ = observer;
+        return Err(AptOpError::NetworkDisabled);
+    }
+
+    // W0: phase timers for the whole transaction; one `ppkg: timings cmd=install`
+    // line on success and failure alike.
+    let mut t = Timings::begin("install");
+    let result = install_timed(name, &mut t, observer);
+    if let Ok(installed) = &result {
+        t.count("pkgs", installed.len() as u64);
+    }
+    t.finish();
+    result
+}
+
+/// One resolved package of an install transaction: the pool filename plus the
+/// digest and size the **same** signed stanza declares for it.
+struct Target {
+    pkg: String,
+    filename: String,
+    sha256: Option<[u8; 32]>,
+    size: u64,
+}
+
+/// The body of [`install`], taking the phase timer so every early return still
+/// reports what it measured.
+fn install_timed(
+    name: &str,
+    t: &mut Timings,
+    observer: &mut dyn InstallObserver,
+) -> Result<Vec<String>, AptOpError> {
     let cfg = config();
 
     // Snapshot the session installed-set for the resolver.
@@ -1019,12 +1824,6 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
     // the digest the signed index declares for it — from the SAME record, so the
     // URL and the digest can never come from different stanzas. The index lock is
     // held only for this short, network-free span.
-    struct Target {
-        pkg: String,
-        filename: String,
-        sha256: Option<[u8; 32]>,
-        size: u64,
-    }
     let targets: Vec<Target> = {
         let guard = INDEX.lock();
         let index = guard.as_ref().ok_or(AptOpError::NoIndex)?;
@@ -1047,84 +1846,168 @@ pub fn install(name: &str) -> Result<Vec<String>, AptOpError> {
         t
     };
 
+    t.phase("resolve_ms");
     let total = targets.len();
     if total > 0 {
         let plan: Vec<&str> = targets.iter().map(|t| t.pkg.as_str()).collect();
         crate::info!(
-            "apt: {} new package(s) to install: {}",
+            "ppkg: {} new package(s) to install: {}",
             total,
             plan.join(" ")
         );
+        let sizes: Vec<(String, u64)> = targets
+            .iter()
+            .map(|target| (target.pkg.clone(), target.size))
+            .collect();
+        observer.on_plan(&sizes);
     }
 
+    // W2: one `sync` for the whole transaction. `wrote_any` is conservative: set
+    // before a package's install step, so an abort after partial writes still
+    // syncs once on the way out. ext2 journals every mutation at `commit` and its
+    // `sync()` is a documented no-op today; this is nonetheless the correct
+    // transaction boundary and keeps crash-consistency semantics identical.
+    let mut wrote_any = false;
+    let mut failure: Option<AptOpError> = None;
     let mut installed: Vec<String> = Vec::new();
 
     for (i, target) in targets.into_iter().enumerate() {
         let step = i + 1;
-        let pkg = target.pkg;
-        let filename = target.filename;
-        if filename.is_empty() {
-            return Err(AptOpError::Download { pkg: pkg.clone() });
+        let pkg = target.pkg.clone();
+        wrote_any = true;
+        match install_target(&cfg, target, step, total, t, observer) {
+            Ok(n) => {
+                t.count("files", n as u64);
+                INSTALLED.lock().insert(pkg.clone());
+                installed.push(pkg);
+            }
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
         }
-        // The payload is bound to the signed metadata through this digest. A
-        // stanza without one cannot be verified, so it is refused instead of
-        // installed on faith.
-        let Some(expected_digest) = target.sha256 else {
-            verify_fail("deb", "DigestUnavailable", &format!(" pkg={}", pkg));
-            return Err(AptOpError::DigestUnavailable { pkg });
-        };
-        let url = format!("{}/{}", cfg.base, filename);
-        crate::info!(
-            "apt: [{}/{}] Get {} <- {}://{}{}",
-            step,
-            total,
-            pkg,
-            cfg.scheme(),
-            cfg.host,
-            url
-        );
+    }
 
-        let bytes = cfg.fetch(&url).map_err(|e| match e {
-            crate::net::http_fetch::FetchError::NoNetwork => AptOpError::NoNetwork,
-            _ => AptOpError::Download { pkg: pkg.clone() },
-        })?;
-        let dl = bytes.len();
-
-        // Signature -> Release -> Packages -> .deb: the digest from the signed
-        // index is checked BEFORE the payload is parsed, decompressed or written
-        // to ext2. Nothing below this line sees unverified bytes.
-        verify_package_body(&pkg, &bytes, &expected_digest, target.size)?;
-
-        let members = deb::parse_ar(&bytes).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
-        let deb_members =
-            deb::locate_members(&members).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
-        let comp = deb::compression_of(deb_members.data.name)
-            .map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
-        let tar_bytes = deb::decompress_data(&deb_members.data, comp)
-            .map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
-        let entries =
-            tar::read_tar(&tar_bytes).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
-        let n = install_fs::install_data_tar(&entries, "/mnt")
-            .map_err(|_| AptOpError::Install { pkg: pkg.clone() })?;
-
-        // Sync after each package so files survive a later crash.
+    if wrote_any {
         if let Ok(node) = crate::vfs::lookup_path("/mnt") {
             node.sync();
         }
-
-        INSTALLED.lock().insert(pkg.clone());
-        crate::info!(
-            "apt: [{}/{}] Unpacked {} ({} files, {})",
-            step,
-            total,
-            pkg,
-            n,
-            human_bytes(dl as u64)
-        );
-        installed.push(pkg);
     }
+    t.phase("sync_ms");
 
+    if let Some(e) = failure {
+        return Err(e);
+    }
     Ok(installed)
+}
+
+/// One package of an `apt install` transaction: fetch, verify against the signed
+/// index, then the two-pass streaming install (see [`install`]).
+///
+/// Returns the number of entries the installer created. Every phase is charged to
+/// `t`; `step`/`total` only shape the log lines.
+fn install_target(
+    cfg: &AptConfig,
+    target: Target,
+    step: usize,
+    total: usize,
+    t: &mut Timings,
+    observer: &mut dyn InstallObserver,
+) -> Result<usize, AptOpError> {
+    let pkg = target.pkg;
+    let filename = target.filename;
+    if filename.is_empty() {
+        return Err(AptOpError::Download { pkg: pkg.clone() });
+    }
+    // The payload is bound to the signed metadata through this digest. A stanza
+    // without one cannot be verified, so it is refused instead of installed on
+    // faith.
+    let Some(expected_digest) = target.sha256 else {
+        verify_fail("deb", "DigestUnavailable", &format!(" pkg={}", pkg));
+        return Err(AptOpError::DigestUnavailable { pkg });
+    };
+    let url = format!("{}/{}", cfg.base, filename);
+    crate::info!(
+        "ppkg: [{}/{}] Get {} <- {}://{}{}",
+        step,
+        total,
+        pkg,
+        cfg.scheme(),
+        cfg.host,
+        url
+    );
+
+    observer.on_phase(&pkg, InstallPhase::Download);
+    let fetched = cfg.fetch(&url).map_err(|e| match e {
+        crate::net::http_fetch::FetchError::NoNetwork => AptOpError::NoNetwork,
+        _ => AptOpError::Download { pkg: pkg.clone() },
+    });
+    t.phase("fetch_ms");
+    let bytes = fetched?;
+    let dl = bytes.len();
+    t.count("deb_bytes", dl as u64);
+
+    // Signature -> Release -> Packages -> .deb: the digest from the signed index
+    // is checked BEFORE the payload is parsed, decompressed or written to ext2.
+    // Nothing below this line sees unverified bytes.
+    observer.on_phase(&pkg, InstallPhase::Verify);
+    verify_package_body(&pkg, &bytes, &expected_digest, target.size)?;
+    t.phase("verify_ms");
+
+    let members = deb::parse_ar(&bytes).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
+    let deb_members =
+        deb::locate_members(&members).map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
+    let comp = deb::compression_of(deb_members.data.name)
+        .map_err(|_| AptOpError::Parse { pkg: pkg.clone() })?;
+    t.phase("ar_ms");
+    // W1: two-pass streaming install. Pass 1 decompresses `data.tar` into metadata
+    // only and plans the install; the security planner's verdict over that metadata
+    // is what authorizes any write. Pass 2 decompresses again and writes each
+    // planned member as its bytes stream past, so neither the decompressed tar nor
+    // a `Vec<TarEntry>` is ever resident.
+    observer.on_phase(&pkg, InstallPhase::Unpack);
+    let metas = scan_deb_metadata(&deb_members.data, comp, &pkg, observer)?;
+    t.phase("scan_ms");
+    let plan = plan_install_meta(&metas);
+    // The unpacked-byte total is now known: sum of every planned file member.
+    let unpack_total: u64 = plan
+        .ops
+        .iter()
+        .map(|op| match op {
+            super::install::MetaOp::File { size, .. } => *size,
+            _ => 0,
+        })
+        .sum();
+    observer.on_unpack_progress(&pkg, 0, unpack_total);
+    t.phase("plan_ms");
+    // The plan is fully validated (F-x86n-1/F-r3-vfs-1/F-r4-vfs-1) before the
+    // first inode — preflight atomicity is unchanged by streaming.
+    let mut install = install_fs::StreamingInstall::prepare(&plan, "/mnt")
+        .map_err(|_| AptOpError::Install { pkg: pkg.clone() })?;
+    extract_deb_stream(
+        &deb_members.data,
+        comp,
+        &pkg,
+        unpack_total,
+        &mut install,
+        observer,
+    )?;
+    t.phase("extract_ms");
+    let n = install
+        .finish()
+        .map_err(|_| AptOpError::Install { pkg: pkg.clone() })?;
+    t.phase("link_ms");
+
+    observer.on_package_done(&pkg, n);
+    crate::info!(
+        "ppkg: [{}/{}] Unpacked {} ({} files, {})",
+        step,
+        total,
+        pkg,
+        n,
+        human_bytes(dl as u64)
+    );
+    Ok(n)
 }
 
 /// Look up a package summary by name (real or virtual). Returns `None` if no

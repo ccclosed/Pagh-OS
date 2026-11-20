@@ -21,7 +21,7 @@
            can only be emitted after a verified handshake), or NEGATIVE - the
            handshake was refused and the verifier named the check that refused it
            ("Package_Fetcher(tls): stage=verify cause=..."). A plain-HTTP
-           "apt: index loaded" line is NOT accepted: it proves the index pipeline,
+           "ppkg: index loaded" line is NOT accepted: it proves the index pipeline,
            not authentication.
 
   It reads serial_e2e.log (local-mirror run) and, if present, serial_live.log
@@ -84,9 +84,9 @@ if (-not $SkipDebugBuild) {
 } else {
     Write-Host "  (debug-build link check skipped by flag)" -ForegroundColor DarkYellow
 }
-# The kernel logs "apt: index ready - N packages" (src/pkg/apt.rs:374); the
+# The kernel logs "ppkg: index ready - N packages" (src/pkg/apt.rs:374); the
 # local harness additionally prints "LXSELFTEST apt_e2e: index loaded (N packages)".
-$idx = [regex]::Match($local, 'apt: index ready - (\d+) packages')
+$idx = [regex]::Match($local, 'ppkg: index ready - (\d+) packages')
 if ($idx.Success) {
     Write-Host ("  Functional index pipeline evidence ($LocalLog): '{0}'" -f $idx.Value.Trim())
     Write-Host "    note: the local-mirror e2e drives the same update/parse/install code paths;"

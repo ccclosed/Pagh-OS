@@ -30,20 +30,24 @@
 //! `mmap` возвращает `-ENOMEM`.
 #![allow(dead_code)]
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use x86_64::structures::paging::PageTableFlags;
 
+use crate::drivers::framebuffer::FbInfo;
 use crate::memory::layout::{USER_STACK_PAGES, USER_STACK_TOP};
-use crate::memory::{pmm, vmm};
+use crate::memory::{pat, pmm, vmm};
 use crate::task::compat;
+use crate::vfs::VfsNode;
 
 use super::errno::Errno;
 use super::mem::{
     plan_brk, plan_mmap_base, plan_munmap, prot_to_flags, range_is_free, BrkOutcome, MmapBacking,
-    MmapRegion, MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE,
+    MmapRegion, MunmapPlan, VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ,
 };
-use super::validate::USER_ADDR_MAX;
+use super::trap_frame::pf_registry_must_refuse;
+use super::validate::{self, MappingKind, PageAcceptance, USER_ADDR_MAX};
 
 /// Архитектурный размер страницы (4 КиБ).
 const PAGE_SIZE: u64 = 4096;
@@ -190,8 +194,7 @@ fn brk_impl(vm: &mut VmRegionSet, requested: u64) -> u64 {
 }
 
 /// Дополнительные биты флагов `mmap` Linux, обрабатываемые здесь (сверх
-/// `MAP_PRIVATE`/`MAP_ANONYMOUS` из модуля чистых планировщиков).
-const MAP_SHARED: u32 = 0x1;
+/// `MAP_PRIVATE`/`MAP_SHARED`/`MAP_ANONYMOUS` из модуля чистых планировщиков).
 const MAP_FIXED: u32 = 0x10;
 /// Биты-подсказки/только-учёт, принимаются и игнорируются:
 /// `MAP_DENYWRITE | MAP_EXECUTABLE | MAP_NORESERVE | MAP_POPULATE | MAP_STACK`.
@@ -226,14 +229,23 @@ pub fn sys_mmap(
     off: u64,
 ) -> Result<u64, Errno> {
     let flags = flags as u32;
-    if len == 0 || flags & MAP_SHARED != 0 || flags & MAP_PRIVATE == 0 {
+    let shared = flags & MAP_SHARED != 0;
+    let private = flags & MAP_PRIVATE != 0;
+    // Ровно один из MAP_SHARED/MAP_PRIVATE, как в Linux: оба или ни одного —
+    // EINVAL (иначе неясно, чьи записи должны быть видны).
+    if len == 0 || shared == private {
         return Err(Errno::EINVAL);
     }
-    if flags & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_IGNORED) != 0 {
+    if flags & !(MAP_PRIVATE | MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED | MAP_IGNORED) != 0 {
         return Err(Errno::EINVAL);
     }
     let anon = flags & MAP_ANONYMOUS != 0;
     let fixed = flags & MAP_FIXED != 0;
+    // `offset` имеет смысл только у файла; анонимное отображение в Linux
+    // принимает только 0.
+    if anon && off != 0 {
+        return Err(Errno::EINVAL);
+    }
 
     // File-backed: разрешить и клонировать узел (и его путь VFS, для
     // `/proc/<pid>/maps`) ДО взятия compat-лока, как в `read`/`pread64` (I/O VFS
@@ -270,6 +282,44 @@ pub fn sys_mmap(
     let span = pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
     let (writable, nx) = prot_to_flags(prot as u32);
     let prot_none = prot == 0;
+
+    // `/dev/fb0`: mmap отображает физический scanout по MMIO, а не копию
+    // «содержимого файла». Только MAP_SHARED: приватная копия экрана не имеет
+    // смысла и не должна выглядеть работающей.
+    if let Some(info) = node.as_ref().and_then(|n| n.fb_info()) {
+        if !shared {
+            return Err(Errno::EINVAL);
+        }
+        return mmap_fb(info, &backing, fixed, addr, len, writable, nx, off);
+    }
+
+    // `/dev/vtconsole0`: read-only shared снимок kernel-VT/shell. Адресное
+    // пространство пользователя получает те же кадры, что пишет ядро, но PTE
+    // без WRITABLE и с `VT_RO_BIT`; mprotect(PROT_WRITE) отвергается.
+    if let Some(info) = node.as_ref().and_then(|n| n.vtconsole_info()) {
+        if !shared || prot != PROT_READ as u64 || off != 0 || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if len > info.total_bytes as u64 {
+            return Err(Errno::EINVAL);
+        }
+        let node = node.as_ref().expect("vtconsole node");
+        return mmap_vtconsole(node, &backing, fixed, addr, len);
+    }
+
+    // MAP_SHARED: общие физические кадры (memfd) либо общие анонимные страницы.
+    if shared {
+        // Запись в MAP_SHARED требует открытого на запись файла (Linux).
+        if !anon && writable {
+            let acc = super::io_sys::fd_open_flags(fd as u32).unwrap_or(0) & 0o3;
+            if acc == 0 {
+                return Err(Errno::EACCES);
+            }
+        }
+        return mmap_shared(
+            node, backing, anon, fixed, addr, len, prot, writable, nx, off,
+        );
+    }
 
     // Фаза 1 (под compat-локом): разместить регион, подпереть обнулёнными
     // кадрами, если жадно, записать в отслеживаемый набор.
@@ -371,6 +421,297 @@ pub fn sys_mmap(
     Ok(base)
 }
 
+/// `MAP_SHARED`: общие физические кадры.
+///
+/// * memfd (`node.is_memfd()`): каждый лист — кадр из страничного кэша узла;
+///   `mmap` добавляет ссылку отображения (`pmm::cow_ref`), лист помечается
+///   [`vmm::SHARED_BIT`]. Поэтому запись через одно отображение видна и второму
+///   `mmap` того же fd, и fork-ребёнку, а `munmap`/exit только отпускают ссылку.
+/// * `MAP_SHARED|MAP_ANONYMOUS`: кадры выделяются при `mmap` и тоже помечаются
+///   `SHARED_BIT`; после fork стороны видят одни байты (Linux-семантика
+///   анонимной разделяемой памяти).
+///
+/// `PROT_NONE` для shared отвергается: страницы отображены жадно, и
+/// «перезащита из PROT_NONE обратно» потребовала бы ленивого дозаполнения из
+/// файла, которого у этого слоя нет. Композитор всегда мапит `RW`.
+fn mmap_shared(
+    node: Option<Arc<dyn VfsNode>>,
+    backing: Option<MmapBacking>,
+    anon: bool,
+    fixed: bool,
+    addr: u64,
+    len: u64,
+    prot: u64,
+    writable: bool,
+    nx: bool,
+    off: u64,
+) -> Result<u64, Errno> {
+    if prot == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if !anon {
+        match node.as_ref() {
+            Some(n) if n.is_memfd() => {}
+            // MAP_SHARED обычного файла превращал бы чужие записи в видимые, не
+            // имея ни page cache, ни writeback. Отказ громкий и явный.
+            _ => return Err(Errno::EINVAL),
+        }
+    }
+    let pages = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    let span = pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+    let first_page = off / PAGE_SIZE;
+
+    let base = compat::with_current_compat(|cs| -> Result<u64, Errno> {
+        let vm = &mut cs.vm.lock();
+        let base = if fixed {
+            if addr == 0 || addr & (PAGE_SIZE - 1) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            addr
+        } else {
+            plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX).ok_or(Errno::ENOMEM)?
+        };
+        let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
+        if end > USER_ADDR_MAX {
+            return Err(Errno::ENOMEM);
+        }
+        if fixed {
+            for i in 0..pages {
+                let _ = vmm::release_user_leaf(base + i * PAGE_SIZE);
+            }
+            cut_regions(&mut vm.mmaps, base, pages);
+        }
+
+        let mut mapped: Vec<u64> = Vec::new();
+        let pte_flags = leaf_flags(writable, nx) | vmm::SHARED_BIT;
+        for i in 0..pages {
+            let frame = if anon {
+                let Some(frame) = pmm::alloc_frame() else {
+                    unwind(&mapped);
+                    return Err(Errno::ENOMEM);
+                };
+                zero_frame(frame);
+                frame
+            } else {
+                match node.as_ref().and_then(|n| n.shared_page(first_page + i)) {
+                    Some(frame) => frame,
+                    None => {
+                        unwind(&mapped);
+                        return Err(Errno::ENOMEM);
+                    }
+                }
+            };
+            // Ссылка отображения: кадр memfd уже пиннится файлом, анонимный —
+            // только этой ссылкой.
+            pmm::cow_ref(frame);
+            let page = base + i * PAGE_SIZE;
+            if vmm::map(frame, page, pte_flags).is_err() {
+                if pmm::cow_unref(frame) {
+                    pmm::free_frame(frame);
+                }
+                unwind(&mapped);
+                return Err(Errno::ENOMEM);
+            }
+            mapped.push(page);
+        }
+        vm.mmaps.push(MmapRegion {
+            base,
+            pages,
+            writable,
+            nx,
+            prot: prot as u32,
+            // Shared-страницы отображены жадно и НЕ должны лениво
+            // переподпираться обработчиком fault: иначе fork-разделённое
+            // отображение молча получило бы приватный нулевой кадр. Для
+            // memfd backing печатает identity в `/proc/<pid>/maps`; у
+            // анонимной shared-памяти её нет.
+            anon: false,
+            backing: backing.clone(),
+        });
+        if !fixed && end > vm.mmap_next_hint {
+            vm.mmap_next_hint = end;
+        }
+        Ok(base)
+    })
+    .unwrap_or(Err(Errno::EINVAL))?;
+    Ok(base)
+}
+
+/// `mmap(/dev/fb0)`: отобразить физический scanout Limine как MMIO.
+///
+/// Кадры framebuffer не принадлежат PMM, поэтому листья несут
+/// [`vmm::MMIO_BIT`]: `munmap`, exit и `fork` снимают/копируют только PTE и
+/// никогда не зовут `free_frame` на экране. `NO_CACHE|WRITE_THROUGH` — чтобы
+/// записи композитора доходили до scanout, а не застревали в кэше CPU.
+fn mmap_fb(
+    info: FbInfo,
+    backing: &Option<MmapBacking>,
+    fixed: bool,
+    addr: u64,
+    len: u64,
+    writable: bool,
+    nx: bool,
+    off: u64,
+) -> Result<u64, Errno> {
+    if info.phys & (PAGE_SIZE - 1) != 0 {
+        crate::error!(
+            "[fb0] framebuffer phys 0x{:x} is not page aligned - refusing mmap",
+            info.phys
+        );
+        return Err(Errno::EINVAL);
+    }
+    let pages = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    let span = pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+    // Границу проверяем по ЗАПРОШЕННОЙ длине, а не по округлённому span:
+    // `smem_len = pitch * height` не обязан быть кратен 4096, а композитор
+    // мапит ровно `smem_len` байт. Последняя неполная страница всё равно
+    // принадлежит scanout (framebuffer выделен страницами).
+    if off > info.smem_len || off.checked_add(len).map_or(true, |e| e > info.smem_len) {
+        return Err(Errno::EINVAL);
+    }
+
+    let base = compat::with_current_compat(|cs| -> Result<u64, Errno> {
+        let vm = &mut cs.vm.lock();
+        let base = if fixed {
+            if addr == 0 || addr & (PAGE_SIZE - 1) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            addr
+        } else {
+            plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX).ok_or(Errno::ENOMEM)?
+        };
+        let region_end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
+        if region_end > USER_ADDR_MAX {
+            return Err(Errno::ENOMEM);
+        }
+        if fixed {
+            for i in 0..pages {
+                let _ = vmm::release_user_leaf(base + i * PAGE_SIZE);
+            }
+            cut_regions(&mut vm.mmaps, base, pages);
+        }
+        // Write-combining, если boot запрограммировал IA32_PAT entry 4.
+        // WC-лист несёт PAT (bit 7) и не несёт NO_CACHE/WRITE_THROUGH;
+        // без PAT остаётся точная прежняя некешируемая пара (см.
+        // `memory::pat::fb0_pte_flags`, host-тесты проверяют обе композиции).
+        let pte_flags = PageTableFlags::from_bits_truncate(pat::fb0_pte_flags(
+            writable,
+            nx,
+            pat::wc_supported(),
+        ));
+        let mut mapped: Vec<u64> = Vec::new();
+        for i in 0..pages {
+            let page = base + i * PAGE_SIZE;
+            let phys = info.phys + off + i * PAGE_SIZE;
+            if vmm::map(phys, page, pte_flags).is_err() {
+                unwind(&mapped);
+                return Err(Errno::ENOMEM);
+            }
+            mapped.push(page);
+        }
+        vm.mmaps.push(MmapRegion {
+            base,
+            pages,
+            writable,
+            nx,
+            prot: super::mem::PROT_READ | if writable { super::mem::PROT_WRITE } else { 0 },
+            anon: false,
+            backing: backing.clone(),
+        });
+        if !fixed && region_end > vm.mmap_next_hint {
+            vm.mmap_next_hint = region_end;
+        }
+        Ok(base)
+    })
+    .unwrap_or(Err(Errno::EINVAL))?;
+    // Takeover подтверждаем и на mmap: дескриптор мог быть открыт до того, как
+    // консоль успела инициализироваться (в этом ядре это невозможно, но
+    // контракт «экран принадлежит тому, кто его отобразил» не должен зависеть
+    // от порядка open/mmap).
+    crate::drivers::framebuffer::takeover_acquire();
+    Ok(base)
+}
+
+/// `mmap(/dev/vtconsole0)`: read-only отображение shared VT surface.
+///
+/// Кадры поверхности запинены ядром; каждый лист получает ссылку отображения
+/// (`cow_ref`), которая отпускается `munmap`/exit. `WRITABLE` не ставится
+/// никогда, а `VT_RO_BIT` заставляет `mprotect` отказать в попытке добавить
+/// запись — userspace не может подменить экран, который публикует только ядро.
+fn mmap_vtconsole(
+    node: &Arc<dyn VfsNode>,
+    backing: &Option<MmapBacking>,
+    fixed: bool,
+    addr: u64,
+    len: u64,
+) -> Result<u64, Errno> {
+    let pages = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    let span = pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+    let base = compat::with_current_compat(|cs| -> Result<u64, Errno> {
+        let vm = &mut cs.vm.lock();
+        let base = if fixed {
+            if addr == 0 || addr & (PAGE_SIZE - 1) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            addr
+        } else {
+            plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX).ok_or(Errno::ENOMEM)?
+        };
+        let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
+        if end > USER_ADDR_MAX {
+            return Err(Errno::ENOMEM);
+        }
+        if fixed {
+            for i in 0..pages {
+                let _ = vmm::release_user_leaf(base + i * PAGE_SIZE);
+            }
+            cut_regions(&mut vm.mmaps, base, pages);
+        }
+        let pte_flags = leaf_flags(false, true) | vmm::VT_RO_BIT;
+        let mut mapped: Vec<u64> = Vec::new();
+        for i in 0..pages {
+            let Some(frame) = node.vtconsole_page(i) else {
+                unwind(&mapped);
+                return Err(Errno::ENOMEM);
+            };
+            pmm::cow_ref(frame);
+            let page = base + i * PAGE_SIZE;
+            if vmm::map(frame, page, pte_flags).is_err() {
+                if pmm::cow_unref(frame) {
+                    pmm::free_frame(frame);
+                }
+                unwind(&mapped);
+                return Err(Errno::ENOMEM);
+            }
+            mapped.push(page);
+        }
+        vm.mmaps.push(MmapRegion {
+            base,
+            pages,
+            writable: false,
+            nx: true,
+            prot: PROT_READ,
+            anon: false,
+            backing: backing.clone(),
+        });
+        if !fixed && end > vm.mmap_next_hint {
+            vm.mmap_next_hint = end;
+        }
+        Ok(base)
+    })
+    .unwrap_or(Err(Errno::EINVAL))?;
+    Ok(base)
+}
+
 /// `munmap` (11): снять отображение ранее `mmap`-нутого диапазона (R4.3) или
 /// отвергнуть невыровненный/непокрытый запрос с `-EINVAL` (R4.7).
 pub fn sys_munmap(addr: u64, len: u64) -> Result<u64, Errno> {
@@ -431,6 +772,20 @@ pub fn sys_mremap(
         .ok_or(Errno::ENOMEM)?;
     if new_pages == 0 {
         return Err(Errno::EINVAL);
+    }
+    // `mremap` копирует/переставляет листья как приватные. Для MAP_SHARED и
+    // MMIO это сломало бы владение (общий кадр или кадр устройства попал бы в
+    // приватную копию/освобождение), поэтому честный отказ, а не тихая порча.
+    for i in 0..old_pages {
+        if let Some(pte) = vmm::walk_pte(old_addr + i * PAGE_SIZE) {
+            let f = pte.flags();
+            if f.contains(vmm::SHARED_BIT)
+                || f.contains(vmm::VT_RO_BIT)
+                || f.contains(vmm::MMIO_BIT)
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
     }
     compat::with_current_compat(|cs| -> Result<u64, Errno> {
         let vm = &mut cs.vm.lock();
@@ -671,6 +1026,18 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
 
     let (writable, nx) = prot_to_flags(prot);
     let prot_none = prot == 0;
+    // Read-only shared VT surface нельзя сделать записываемой: экран публикует
+    // только ядро. Проверяем ВЕСЬ диапазон до первой мутации, чтобы отказ не
+    // оставил половину диапазона перезащищённой.
+    if writable {
+        for i in 0..pages {
+            if let Some(pte) = vmm::walk_pte(addr + i * PAGE_SIZE) {
+                if pte.flags().contains(vmm::VT_RO_BIT) {
+                    return Err(Errno::EACCES);
+                }
+            }
+        }
+    }
     // Второй проход: аппаратное состояние меняют только резидентные страницы.
     // PROT_NONE полностью убирает PTE (последующее касание обязано дать SIGSEGV,
     // а не заново подпереть страницу); всё остальное переотображается на месте с
@@ -704,7 +1071,28 @@ fn mprotect_impl(vm: &mut VmRegionSet, addr: u64, len: u64, prot: u32) -> Result
                 // fault, копирующий страницу приватно (cow_copy_page) и
                 // восстанавливающий WRITABLE только на приватной копии.
                 let mut new_flags = leaf_flags(writable, nx);
-                if old_flags.contains(vmm::COW_BIT) {
+                if old_flags.contains(vmm::MMIO_BIT) {
+                    // Framebuffer: сохранить MMIO-маркер (иначе следующий
+                    // munmap/exit попытается вернуть кадр устройства в PMM) и
+                    // ТУ ЖЕ политику кэша, что уже стоит на листе. Раньше здесь
+                    // безусловно возвращались NO_CACHE|WRITE_THROUGH, и первый
+                    // же mprotect на fb-регионе молча отменял write-combining.
+                    let cache = PageTableFlags::from_bits_truncate(pat::mmio_cache_bits_from(
+                        old_flags.bits(),
+                        pat::wc_supported(),
+                    ));
+                    new_flags |= vmm::MMIO_BIT | cache;
+                } else if old_flags.contains(vmm::VT_RO_BIT) {
+                    // Read-only VT-поверхность: маркер владения сохраняется,
+                    // WRITABLE сюда не приходит (см. pre-scan выше).
+                    new_flags |= vmm::VT_RO_BIT;
+                } else if old_flags.contains(vmm::SHARED_BIT) {
+                    // MAP_SHARED: кадр общий с файлом/другим процессом. Права
+                    // отображения меняются на месте, маркер и ссылка владения
+                    // сохраняются; write в PROT_READ-диапазон обязан дать
+                    // SIGSEGV (cow_copy_page не увидит COW_BIT).
+                    new_flags |= vmm::SHARED_BIT;
+                } else if old_flags.contains(vmm::COW_BIT) {
                     new_flags |= vmm::COW_BIT;
                     new_flags = new_flags - PageTableFlags::WRITABLE;
                     // Записать право записи ОТОБРАЖЕНИЯ на разделяемом листе:
@@ -824,8 +1212,12 @@ fn update_region_flags(
 /// (`RO_BIT`), поэтому запись туда всё равно даёт SIGSEGV, а не приватную
 /// записываемую копию. Работает и для отказов ring 3, и для отказов режима ядра на
 /// пользовательских адресах (`copy_out` по fork-разделённому буферу).
-fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
-    if !caused_by_write || compat::compat_lock_held() {
+///
+/// `user_mode` — из `PageFaultErrorCode::USER_MODE`: отказ ring 3 не бывает
+/// повторным входом в `COMPAT_STATES` (см.
+/// [`pf_registry_must_refuse`]), поэтому COW-копия для него разрешена всегда.
+fn handle_cow_fault(addr: u64, caused_by_write: bool, user_mode: bool) -> bool {
+    if !caused_by_write || pf_registry_must_refuse(user_mode, compat::compat_lock_held()) {
         return false;
     }
     // `cow_copy_page` сам проверяет оба маркера: присутствующая read-only
@@ -859,21 +1251,30 @@ fn handle_cow_fault(addr: u64, caused_by_write: bool) -> bool {
 ///
 /// Контракт со слоем syscall (см. doc модуля): код ядра никогда не трогает память
 /// пользователя под compat-локом реестра, поэтому этот обработчик всегда может
-/// взять лок. `compat::compat_lock_held()` — растяжка нарушений этого правила:
-/// такой отказ сообщается как segfault, а не блокирует CPU на нереентерабельном
-/// спинлоке.
+/// взять лок. Отказ ring 0 (U=0) внутри замыкания — растяжка нарушений этого
+/// правила: он сообщается как segfault/kill процесса, а не блокирует CPU на
+/// нереентерабельном спинлоке. Отказ ring 3 (U=1) обслуживается безусловно:
+/// исполнять пользовательский код и одновременно быть внутри замыкания
+/// невозможно, а глубина, поднятая вытесненной задачей, принадлежит не этой
+/// (см. `trap_frame::pf_registry_must_refuse` и `compat_guard`).
 pub fn handle_user_page_fault(
     addr: u64,
     protection_violation: bool,
     caused_by_write: bool,
+    user_mode: bool,
 ) -> bool {
     if addr >= USER_ADDR_MAX {
         return false;
     }
     if protection_violation {
-        return handle_cow_fault(addr, caused_by_write);
+        return handle_cow_fault(addr, caused_by_write, user_mode);
     }
-    if compat::compat_lock_held() {
+    // Отказ ring 3 обслуживается всегда: повторным входом в нереентерабельный
+    // реестр он быть не может (см. `pf_registry_must_refuse`). Раньше здесь
+    // стояла проверка «глубина > 0 на этом CPU», и тик, вытеснивший владельца
+    // между `enter` и `lock()`, превращал законную запись в ленивую страницу
+    // кучи/anon-региона в SIGSEGV постороннего процесса.
+    if pf_registry_must_refuse(user_mode, compat::compat_lock_held()) {
         crate::error!(
             "[PF] fault on user addr 0x{:x} inside with_current_compat - refusing re-entry",
             addr
@@ -883,42 +1284,120 @@ pub fn handle_user_page_fault(
     let page = addr & !(PAGE_SIZE - 1);
     compat::with_current_compat(|cs| {
         let vm = &mut cs.vm.lock();
-        // Куча brk: страницы в [brk_lazy_from, page_up(current_brk)) подпираются
-        // по первому касанию, всегда writable + NX.
+        // Классифицируем страницу для чистой политики [`validate::page_acceptance`]:
+        // вид отображения говорит, законно ли отсутствие страницы. Куча brk:
+        // страницы в [brk_lazy_from, page_up(current_brk)) подпираются по первому
+        // касанию, всегда writable + NX.
         let brk_end = vm.current_brk.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        if page >= vm.brk_lazy_from && page < brk_end {
-            if vmm::virt_to_phys(page).is_some() {
-                return true; // снова резидентна (гонка сжатия/роста); повтор
-            }
-            return map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(true, true));
-        }
-        // Отслеживаемые mmap-регионы.
-        let Some(r) = vm
+        let mut region_base = 0u64;
+        let (kind, writable, nx) = if page >= vm.brk_lazy_from && page < brk_end {
+            (MappingKind::LazyHeap, true, true)
+        } else if let Some(r) = vm
             .mmaps
             .iter()
             .find(|r| page >= r.base && page < r.base + r.pages * PAGE_SIZE)
-        else {
-            return false;
+        {
+            region_base = r.base;
+            let kind = if r.prot == 0 {
+                // PROT_NONE (например, guard-страница стека потока): касание —
+                // настоящий SIGSEGV, а не повод для отображения.
+                MappingKind::ProtNone
+            } else if !r.anon {
+                // File-backed регионы отображены жадно; отсутствующий PTE здесь —
+                // ошибка ядра, а не ленивое отображение.
+                MappingKind::Eager
+            } else {
+                MappingKind::LazyAnon
+            };
+            (kind, r.writable, r.nx)
+        } else {
+            (MappingKind::Outside, false, false)
         };
-        if r.prot == 0 {
-            // PROT_NONE (например, guard-страница стека потока): касание — это
-            // настоящий SIGSEGV, а не повод для отображения.
-            return false;
+        let present = vmm::virt_to_phys(page).is_some();
+        match validate::page_acceptance(present, kind) {
+            // Снова резидентна (гонка сжатия/роста) — инструкция просто повторится.
+            PageAcceptance::Accept => true,
+            PageAcceptance::Refuse => {
+                if kind == MappingKind::Eager {
+                    crate::error!(
+                        "[PF] missing PTE in eager file-backed region base=0x{:x} addr=0x{:x}",
+                        region_base,
+                        addr
+                    );
+                }
+                false
+            }
+            PageAcceptance::Populate => {
+                map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(writable, nx))
+            }
         }
-        if vmm::virt_to_phys(page).is_some() {
-            return true; // уже резидентна; повтор
-        }
-        if !r.anon {
-            // File-backed регионы отображены жадно; отсутствующий PTE здесь —
-            // ошибка ядра, а не ленивое отображение.
-            crate::error!(
-                "[PF] missing PTE in eager file-backed region base=0x{:x} addr=0x{:x}",
-                r.base,
-                addr
-            );
-            return false;
-        }
-        map_zeroed_range(page, page + PAGE_SIZE, leaf_flags(r.writable, r.nx))
     })
     .unwrap_or(false)
+}
+
+/// Подпереть page-by-page пользовательский диапазон, который ядро собирается
+/// **читать** (`write(2)`/`writev(2)`, `copy_in`), до копии.
+///
+/// Зачем это нужно: общая проверка присутствия ([`super::check_user_ptr`])
+/// отвергает ещё не подпертые страницы `EFAULT`'ом, а `copy_in` по ним штатно
+/// обслуживается обработчиком page fault (см. `idt.rs`) — то есть мешала только
+/// проверка. Источник `write(2)` у реальных приложений — свежий `Vec`/`Box` на
+/// ленивой куче `brk` или анонимный `mmap`: без этой подготовки `write` получал
+/// `EFAULT` на законной памяти процесса (тот же класс, что EFAULT на
+/// `/dev/vtconsole0`).
+///
+/// Политика — ровно [`handle_user_page_fault`] через чистое правило
+/// [`validate::page_acceptance`]: присутствующие страницы принимаются как есть;
+/// отсутствующие подпираются ТОЛЬКО внутри ленивой кучи `brk` или анонимного
+/// `mmap`-региона; `PROT_NONE`, eager-регион без PTE и адрес вне регионов
+/// остаются отказом (`EFAULT`), а не поводом что-то отобразить. Права листа
+/// берутся из региона, поэтому страница региона `PROT_READ` подпирается
+/// read-only (для чтения этого достаточно).
+///
+/// ПРЕДУСЛОВИЕ: вызывающий не держит `COMPAT_STATES` — [`handle_user_page_fault`]
+/// берёт его сам и в реентерабельном контексте отказывает.
+pub fn populate_user_in(start: u64, len: u64) -> Result<(), Errno> {
+    populate_user_range(start, len)
+}
+
+/// Подпереть page-by-page пользовательский диапазон, в который ядро собирается
+/// **писать** (`read(2)`/`readv(2)`/`pread(2)`, `copy_out`), до копии.
+///
+/// Отличие от [`populate_user_in`] — только в правах приёмника, и их проверяет
+/// не эта функция, а [`super::io_sys::copy_out_checked`] (присутствие +
+/// записываемость на единственном choke point'е копирования наружу), поэтому
+/// TOCTOU-контракт не ослаблен: подпирание лишь делает страницу резидентной,
+/// отказ по `PROT_READ`/`RO_BIT` приходит из повторной проверки перед записью.
+///
+/// ПРЕДУСЛОВИЕ: вызывающий не держит `COMPAT_STATES` (см. [`populate_user_in`]).
+pub fn populate_user_out(start: u64, len: u64) -> Result<(), Errno> {
+    populate_user_range(start, len)
+}
+
+/// Общий движок подпирания: обход страниц диапазона с политикой
+/// [`handle_user_page_fault`].
+///
+/// Диапазон обязан пройти [`super::validate::check_user_range`] до обхода
+/// (иначе — `EFAULT`); страницы, уже стоящие в PTE, пропускаются без работы.
+/// Направление копирования здесь не участвует: политика решается видом
+/// отображения (`MappingKind`), а не тем, читает ядро или пишет.
+fn populate_user_range(start: u64, len: u64) -> Result<(), Errno> {
+    use super::validate::{check_user_range, spanned_pages, PtrCheck};
+    if len == 0 {
+        return Ok(());
+    }
+    if check_user_range(start, len) != PtrCheck::Ok {
+        return Err(Errno::EFAULT);
+    }
+    for page in spanned_pages(start, len) {
+        if vmm::virt_to_phys(page).is_some() {
+            continue;
+        }
+        // Копия ядра: отказ здесь — kernel-mode (U=0), поэтому guard обязан
+        // сработать, если эта задача уже внутри `with_current_compat`.
+        if !handle_user_page_fault(page, false, true, false) {
+            return Err(Errno::EFAULT);
+        }
+    }
+    Ok(())
 }

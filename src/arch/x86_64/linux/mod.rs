@@ -13,6 +13,8 @@ pub mod regs;
 // каждый вначале компилируется как чистая заготовка и наполняется в своём
 // обработчике.
 pub mod abi;
+pub mod cmsg;
+pub mod compat_guard;
 pub mod cred;
 pub mod diag;
 pub mod dirent;
@@ -20,7 +22,10 @@ pub mod io;
 pub mod kill;
 pub mod mem;
 pub mod misc;
+pub mod net_if_abi;
 pub mod rand_clock;
+pub mod sock_shutdown;
+pub mod sock_wait;
 pub mod stat;
 pub mod timeconv;
 pub mod tty;
@@ -35,6 +40,7 @@ pub mod epoll_sys;
 pub mod inet_sock;
 pub mod io_sys;
 pub mod mem_sys;
+pub mod net_if_sys;
 pub mod process_sys;
 pub mod rtc;
 pub mod signal;
@@ -90,6 +96,30 @@ pub(crate) fn check_user_ptr(start: u64, len: u64) -> Result<(), Errno> {
         if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
             return Err(Errno::EFAULT);
         }
+    }
+    Ok(())
+}
+
+/// Проверить, что `[start, start + len)` — пользовательский диапазон, **не
+/// трогая PTE**.
+///
+/// Это диапазонная половина [`check_user_ptr`] для путей, которые копируют не
+/// весь `count`, а только реально доступную часть (`min(count, available)`, как
+/// `read(2)`/`pread(2)` в Linux): требовать PRESENT на всём `count` там нельзя —
+/// приёмник может быть свежим ленивым анонимным буфером, чьи страницы подпирает
+/// demand paging в точке копирования ([`mem_sys::populate_user_out`]), а сам
+/// запрос короче `count`.
+///
+/// Отказ (`EFAULT`) — только за заведомо не пользовательский адрес:
+/// `start >= User_Addr_Max`, переполнение `start + len` или конец выше границы.
+/// Наличие и права страниц проверяет копия
+/// ([`io_sys::copy_out_checked`]/[`check_user_ptr`]) уже по фактическому
+/// диапазону — иначе `EFAULT` возвращался бы за страницы, которые никто не
+/// трогал.
+pub(crate) fn check_user_ptr_bounds(start: u64, len: u64) -> Result<(), Errno> {
+    use validate::PtrCheck;
+    if validate::check_user_range(start, len) == PtrCheck::Efault {
+        return Err(Errno::EFAULT);
     }
     Ok(())
 }
@@ -187,7 +217,9 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::RENAME => io_sys::sys_rename(a[0], a[1]),
         sysno::RENAMEAT => io_sys::sys_renameat(a[0], a[1], a[2], a[3]),
         sysno::RENAMEAT2 => io_sys::sys_renameat2(a[0], a[1], a[2], a[3], a[4]),
+        sysno::STAT => io_sys::sys_stat(a[0], a[1]),
         sysno::FSTAT => io_sys::sys_fstat(a[0], a[1]),
+        sysno::LSTAT => io_sys::sys_lstat(a[0], a[1]),
         sysno::NEWFSTATAT => io_sys::sys_newfstatat(a[0], a[1], a[2], a[3]),
         sysno::IOCTL => io_sys::sys_ioctl(a[0], a[1], a[2]),
         sysno::ACCESS => io_sys::sys_access(a[0], a[1]),
@@ -277,17 +309,51 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             }
         }
         sysno::SENDTO => {
-            // Маршрутизировать по типу fd. Для подключённого UDP-сокета glibc
-            // передаёт dest_addr=NULL (стиль write); явный адрес побеждает.
-            let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
-                matches!(
-                    cs.fds.get(a[0] as u32),
-                    Some(crate::task::fd::OpenObject::InetUdp(_))
-                )
-            })
-            .unwrap_or(false);
-            if !is_inet_udp {
-                return Err(Errno::EINVAL);
+            // Маршрутизировать по типу fd. Rust-std зовёт `send()` (== `sendto`)
+            // для AF_UNIX и TCP, а не `write()`, поэтому одной UDP-ветки мало:
+            // без неё `UnixStream::write` из дочернего демо-клиента получал
+            // EINVAL. Для подключённого UDP-сокета glibc передаёт
+            // dest_addr=NULL (стиль write); явный адрес побеждает.
+            enum SendTarget {
+                Udp,
+                Tcp,
+                Unix,
+            }
+            let target =
+                crate::task::compat::with_current_compat(|cs| match cs.fds.get(a[0] as u32) {
+                    None => Err(Errno::EBADF),
+                    Some(crate::task::fd::OpenObject::InetUdp(_)) => Ok(SendTarget::Udp),
+                    Some(crate::task::fd::OpenObject::InetTcp(_)) => Ok(SendTarget::Tcp),
+                    Some(crate::task::fd::OpenObject::Socket { .. }) => Ok(SendTarget::Unix),
+                    Some(crate::task::fd::OpenObject::UnixListener(_))
+                    | Some(crate::task::fd::OpenObject::UnixSocketUnbound { .. }) => {
+                        Err(Errno::ENOTCONN)
+                    }
+                    Some(_) => Err(Errno::ENOTSOCK),
+                })
+                .unwrap_or(Err(Errno::EBADF))?;
+            if matches!(target, SendTarget::Unix) {
+                return crate::arch::x86_64::linux::unix_sock::sys_sendto_unix(
+                    a[0], a[1], a[2], a[3], a[4], a[5],
+                );
+            }
+            if matches!(target, SendTarget::Tcp) {
+                const STREAM_SEND_FLAGS: u64 = (crate::arch::x86_64::linux::cmsg::MSG_DONTWAIT
+                    | crate::arch::x86_64::linux::cmsg::MSG_EOR
+                    | crate::arch::x86_64::linux::cmsg::MSG_NOSIGNAL)
+                    as u64;
+                if a[3] & !STREAM_SEND_FLAGS != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                // TCP — поток байтов, а не датаграмма: длина больше
+                // [MAX_SOCKET_IO] здесь не ошибка (Linux копирует сколько
+                // помещается и возвращает короткую запись), поэтому предел
+                // работает как граница одной копии, а не как EMSGSIZE.
+                let len = crate::arch::x86_64::linux::abi::stream_send_len(a[2]);
+                check_user_ptr(a[1], len)?;
+                let data = crate::arch::x86_64::linux::io_sys::copy_in_pub(a[1], len);
+                let n = crate::arch::x86_64::linux::inet_sock::tcp_write(a[0], &data)?;
+                return Ok(n as u64);
             }
             // Класс аллокационного переполнения: обход указателя ниже ограничен,
             // но КОПИРОВАНИЕ обязано использовать ту же границу, иначе вызывающий
@@ -305,17 +371,49 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             Ok(n as u64)
         }
         sysno::RECVFROM => {
-            // Маршрутизировать по типу fd: сюда приходят AF_INET UDP-сокеты
-            // (резолвер glibc).
-            let is_inet_udp = crate::task::compat::with_current_compat(|cs| {
-                matches!(
-                    cs.fds.get(a[0] as u32),
-                    Some(crate::task::fd::OpenObject::InetUdp(_))
-                )
-            })
-            .unwrap_or(false);
-            if !is_inet_udp {
-                return Err(Errno::EINVAL);
+            // Маршрутизировать по типу fd: UDP-сокеты резолвера glibc,
+            // TCP/AF_UNIX — `recv()` из Rust-std (== `recvfrom` с NULL-адресом).
+            enum RecvTarget {
+                Udp,
+                Tcp,
+                Unix,
+            }
+            let target =
+                crate::task::compat::with_current_compat(|cs| match cs.fds.get(a[0] as u32) {
+                    None => Err(Errno::EBADF),
+                    Some(crate::task::fd::OpenObject::InetUdp(_)) => Ok(RecvTarget::Udp),
+                    Some(crate::task::fd::OpenObject::InetTcp(_)) => Ok(RecvTarget::Tcp),
+                    Some(crate::task::fd::OpenObject::Socket { .. }) => Ok(RecvTarget::Unix),
+                    Some(crate::task::fd::OpenObject::UnixListener(_))
+                    | Some(crate::task::fd::OpenObject::UnixSocketUnbound { .. }) => {
+                        Err(Errno::ENOTCONN)
+                    }
+                    Some(_) => Err(Errno::ENOTSOCK),
+                })
+                .unwrap_or(Err(Errno::EBADF))?;
+            if matches!(target, RecvTarget::Unix) {
+                return crate::arch::x86_64::linux::unix_sock::sys_recvfrom_unix(
+                    a[0], a[1], a[2], a[3], a[4], a[5],
+                );
+            }
+            if matches!(target, RecvTarget::Tcp) {
+                const STREAM_RECV_FLAGS: u64 =
+                    crate::arch::x86_64::linux::cmsg::MSG_DONTWAIT as u64;
+                if a[3] & !STREAM_RECV_FLAGS != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let cap = crate::arch::x86_64::linux::abi::socket_payload_len(a[2], false)?;
+                check_user_ptr_writable(a[1], cap)?;
+                let mut data = alloc::vec![0u8; cap as usize];
+                let n = crate::arch::x86_64::linux::inet_sock::tcp_read(a[0], &mut data)?;
+                crate::arch::x86_64::linux::io_sys::copy_out_pub(a[1], &data[..n])?;
+                if a[4] != 0 && a[5] != 0 {
+                    check_user_ptr_writable(a[5], 4)?;
+                    // SAFETY: 4-байтный socklen_t проверен выше; подключённый
+                    // stream-сокет адреса отправителя не имеет.
+                    unsafe { core::ptr::write_unaligned(a[5] as *mut u32, 0) };
+                }
+                return Ok(n as u64);
             }
             // Та же ошибка границы аллокации, что в sendto: счётчик — это только
             // ёмкость буфера вызывающего, поэтому ограничиваем его MAX_SOCKET_IO,
@@ -380,9 +478,47 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
             }
             Ok(n as u64)
         }
+        // ── AF_UNIX SCM_RIGHTS: fd passing для userspace-композитора ──
+        sysno::SENDMSG => unix_sock::sys_sendmsg(a[0], a[1], a[2]),
+        sysno::RECVMSG => unix_sock::sys_recvmsg(a[0], a[1], a[2]),
+        // ── shutdown: половинное закрытие направления (48) ──
+        // AF_UNIX ставит флаги на очередях направлений, AF_INET TCP заказывает
+        // FIN; и то и другое будит заблокированного читателя/писателя.
+        sysno::SHUTDOWN => unix_sock::sys_shutdown(a[0], a[1]),
         sysno::ACCEPT => unix_sock::sys_accept(a[0], a[1], a[2]),
-        sysno::BIND => unix_sock::sys_bind(a[0], a[1], a[2]),
-        sysno::LISTEN => unix_sock::sys_listen(a[0], a[1]),
+        sysno::BIND => {
+            // Маршрутизировать по типу fd, как у connect/sendto: у AF_INET-сокета
+            // bind(2) — это порт-гейт и резервирование порта в собственном стеке,
+            // а не путь AF_UNIX (который разбирает sockaddr_un).
+            let is_inet = crate::task::compat::with_current_compat(|cs| {
+                matches!(
+                    cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetTcp(_))
+                        | Some(crate::task::fd::OpenObject::InetUdp(_))
+                )
+            })
+            .unwrap_or(false);
+            if is_inet {
+                crate::arch::x86_64::linux::inet_sock::sys_bind_inet(a[0], a[1], a[2])
+            } else {
+                unix_sock::sys_bind(a[0], a[1], a[2])
+            }
+        }
+        sysno::LISTEN => {
+            let is_inet = crate::task::compat::with_current_compat(|cs| {
+                matches!(
+                    cs.fds.get(a[0] as u32),
+                    Some(crate::task::fd::OpenObject::InetTcp(_))
+                        | Some(crate::task::fd::OpenObject::InetUdp(_))
+                )
+            })
+            .unwrap_or(false);
+            if is_inet {
+                crate::arch::x86_64::linux::inet_sock::sys_listen_inet(a[0], a[1])
+            } else {
+                unix_sock::sys_listen(a[0], a[1])
+            }
+        }
         sysno::GETSOCKNAME => unix_sock::sys_getsockname(a[0], a[1], a[2]),
         sysno::ACCEPT4 => unix_sock::sys_accept4(a[0], a[1], a[2], a[3]),
         sysno::SETSOCKOPT => unix_sock::sys_setsockopt(a[0], a[1], a[2], a[3], a[4]),
@@ -415,6 +551,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::DUP2 => io_sys::sys_dup2(a[0], a[1]),
         sysno::DUP3 => io_sys::sys_dup3(a[0], a[1], a[2]),
         sysno::FCNTL => io_sys::sys_fcntl(a[0], a[1], a[2]),
+        sysno::TRUNCATE => io_sys::sys_truncate(a[0], a[1]),
+        sysno::FTRUNCATE => io_sys::sys_ftruncate(a[0], a[1]),
         sysno::READLINK => io_sys::sys_readlink(a[0], a[1], a[2]),
         sysno::READLINKAT => io_sys::sys_readlinkat(a[0], a[1], a[2], a[3]),
         sysno::STATFS => io_sys::sys_statfs(a[0], a[1]),
@@ -448,6 +586,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::SETGID => misc::sys_setgid(a[0]),
         sysno::SETREUID => misc::sys_setreuid(a[0], a[1]),
         sysno::SETREGID => misc::sys_setregid(a[0], a[1]),
+        sysno::GETGROUPS => misc::sys_getgroups(a[0], a[1]),
+        sysno::SETGROUPS => misc::sys_setgroups(a[0], a[1]),
         sysno::SETRESUID => misc::sys_setresuid(a[0], a[1], a[2]),
         sysno::SETRESGID => misc::sys_setresgid(a[0], a[1], a[2]),
         sysno::GETRESUID => misc::sys_getresuid(a[0], a[1], a[2]),
@@ -731,15 +871,28 @@ pub fn inflight_refresh(pid: u64) {
 }
 
 /// Человеческое имя syscall'ов, в которых задача реально может блокироваться.
+///
+/// `sendto`/`sendmsg` здесь, потому что запись в полную очередь AF_UNIX уступает
+/// CPU так же, как чтение. `recvfrom`/`recvmsg` были главным пробелом: именно они
+/// печатались как `stuck in syscall ? (nr=45 arg0=0x3 closed)`, пока не был
+/// закрыт класс вечного ожидания на закрытом fd (`sock_wait`). `lstat`(6) и
+/// `shutdown`(48) не блокируются, но названы, чтобы такой же лог никогда не
+/// показывал «?» для сисколла, который кто-то увидит в профиле.
 fn wd_sys_name(nr: u64) -> &'static str {
     match nr {
         0 => "read",
         1 => "write",
+        6 => "lstat",
         7 => "poll",
         20 => "writev",
         23 => "select",
         35 => "nanosleep",
         43 => "accept",
+        44 => "sendto",
+        45 => "recvfrom",
+        46 => "sendmsg",
+        47 => "recvmsg",
+        48 => "shutdown",
         61 => "wait4",
         202 => "futex",
         232 => "epoll_wait",

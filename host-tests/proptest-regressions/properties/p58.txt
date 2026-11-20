@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 75990611e1aa9eeeabcf954e2958997ae90b731ef860816cdb3180c8383f37ec # shrinks to users = [UserEntry { name: "a", uid: 2, gid: 0, gecos: "test", home: "/home/test", shell: "/bin/sh" }, UserEntry { name: "b", uid: 2, gid: 0, gecos: "test", home: "/home/test", shell: "/bin/sh" }], groups = []
+cc e728bfebbd39ecd32e18e402d09e5fcc565a0abe3d48a6915ee283dcda0324f2 # shrinks to users = [UserEntry { name: "q", uid: 0, gid: 0, gecos: "test", home: "/home/test", shell: "/bin/sh" }, UserEntry { name: "q", uid: 0, gid: 7, gecos: "test", home: "/home/test", shell: "/bin/sh" }], groups = [GroupEntry { name: "a", gid: 7, members: ["q"] }]

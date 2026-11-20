@@ -347,21 +347,56 @@ pub fn sys_execve(regs: &mut SavedRegs, path: u64, argv: u64, envp: u64) -> Resu
     // с образом/памятью. Root всё равно нуждается хотя бы в одном x-бите
     // (`Creds::may`); отсутствующий путь оставляется `exec_linux_image`, который
     // сообщает ENOENT.
-    if let Some(node) = crate::task::process::exec_target_node(&path) {
-        let creds = crate::task::compat::current_creds();
-        if !creds.may(
-            node.mode(),
-            node.owner(),
-            crate::arch::x86_64::linux::cred::Access::Execute,
-        ) {
-            return Err(Errno::EACCES);
+    //
+    // Заодно запоминаются `mode`/`owner` цели: по ним Linux (`bprm_fill_uid`)
+    // решает setuid/setgid уже ПОСЛЕ успешной загрузки образа, поэтому биты
+    // применяются ниже, а не здесь — неудачный exec не должен менять ids.
+    let exec_bits = match crate::task::process::exec_target_node(&path) {
+        Some(node) => {
+            let mode = node.mode();
+            let owner = node.owner();
+            let creds = crate::task::compat::current_creds();
+            if !creds.may(
+                mode,
+                owner,
+                crate::arch::x86_64::linux::cred::Access::Execute,
+            ) {
+                return Err(Errno::EACCES);
+            }
+            Some((mode, owner))
         }
-    }
+        None => None,
+    };
     let av = exec_vec(argv, &mut budget)?;
     let ev = exec_vec(envp, &mut budget)?;
     let ar: Vec<&[u8]> = av.iter().map(|v| v.as_slice()).collect();
     let er: Vec<&[u8]> = ev.iter().map(|v| v.as_slice()).collect();
     let image = crate::task::process::exec_linux_image(&path, &ar, &er).map_err(runerr)?;
+    // ── setuid/setgid-on-exec (A1) ──────────────────────────────────────────
+    // Linux применяет биты только к успешному exec; образ уже установлен, так
+    // что дальше ошибки нет. `S_ISUID` → `euid = suid =` владелец файла,
+    // `S_ISGID` → `egid = sgid =` группа файла; real ids и supplementary-наборы
+    // не трогаются (это делает `su` через `setgroups(2)`).
+    if let Some((mode, owner)) = exec_bits {
+        let current = crate::task::compat::current_creds();
+        let next = current.exec_setid(mode, owner);
+        if next != current {
+            crate::task::compat::set_current_creds(next);
+            if next.runs_privileged() {
+                crate::info!(
+                    "[linux] execve '{}': setuid/setgid mode={:o} owner={}:{} -> euid={} egid={} uid={} gid={}",
+                    path,
+                    mode & 0o7777,
+                    owner.0,
+                    owner.1,
+                    next.euid,
+                    next.egid,
+                    next.uid,
+                    next.gid
+                );
+            }
+        }
+    }
     let flags = regs.r11;
     *regs = SavedRegs::default();
     regs.r11 = flags | 2;
@@ -370,6 +405,10 @@ pub fn sys_execve(regs: &mut SavedRegs, path: u64, argv: u64, envp: u64) -> Resu
     // per-task слота по +120 прямо над фреймом SavedRegs, поэтому execve обязан
     // переписать ИМЕННО этот слот; старый глобал на выходе не читается.
     unsafe { ((regs as *mut SavedRegs as *mut u64).add(15)).write(image.initial_rsp) };
+    // vfork/posix_spawn: успешный exec — момент, когда родитель имеет право
+    // продолжиться (Linux CLONE_VFORK будит его именно здесь). Вызов дешёвый и
+    // no-op для обычных задач: карта ожиданий пуста.
+    crate::task::scheduler::vfork_child_done(crate::task::scheduler::current_pid());
     Ok(0)
 }
 
@@ -383,6 +422,12 @@ const CLONE_SETTLS: u64 = 0x80000;
 const CLONE_PARENT_SETTID: u64 = 0x100000;
 const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 const CLONE_CHILD_SETTID: u64 = 0x01000000;
+/// `CLONE_DETACHED` (0x400000): устаревший флаг «не нужен ptrace-родитель»,
+/// современный Linux его игнорирует, но musl `pthread_create` его передаёт.
+/// Без него каждый `std::thread::spawn` из static-musl-бинаря получал ENOSYS,
+/// а musl превращал это в `EAGAIN` ("failed to spawn thread") — именно так
+/// падал reader-поток `pagh-desktop` на первом подключении клиента.
+const CLONE_DETACHED: u64 = 0x400000;
 const CLONE_SUPPORTED: u64 = 0xff
     | CLONE_VM
     | CLONE_FS
@@ -393,16 +438,26 @@ const CLONE_SUPPORTED: u64 = 0xff
     | CLONE_SETTLS
     | CLONE_PARENT_SETTID
     | CLONE_CHILD_CLEARTID
-    | CLONE_CHILD_SETTID;
+    | CLONE_CHILD_SETTID
+    | CLONE_DETACHED;
 const CLONE_VFORK: u64 = 0x4000;
 const FORK_SUPPORTED: u64 = 0xff | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
-/// `clone` поддерживает обе формы, нужные libuv в nvim:
+/// vfork/`posix_spawn` (`CLONE_VM|CLONE_VFORK`, без CLONE_THREAD) использует
+/// тот же набор, что fork, плюс два флага формы.
+const VFORK_SUPPORTED: u64 = FORK_SUPPORTED | CLONE_VM | CLONE_VFORK;
+/// `clone` поддерживает три формы, встречающиеся в compat-бинарях:
 ///   * thread clone (CLONE_VM|CLONE_THREAD) — общее адресное пространство;
 ///   * fork (без CLONE_VM; glibc fork() = SIGCHLD|CHILD_SETTID|CHILD_CLEARTID)
 ///     — глубоко скопированное адресное пространство, ребёнок получает rax=0,
-///     родитель — pid.
-/// CLONE_VM БЕЗ CLONE_THREAD (vfork / glibc posix_spawn) намеренно остаётся
-/// ENOSYS: тогда libuv откатывается к обычному пути fork+exec.
+///     родитель — pid;
+///   * vfork/posix_spawn (CLONE_VM|CLONE_VFORK без CLONE_THREAD, так зовут
+///     musl/glibc `posix_spawn`, а за ними Rust-std `Command::spawn` на
+///     static-musl). Реализовано через COW-fork + блокировку родителя до
+///     `execve`/выхода ребёнка: совместная память vfork не нужна
+///     `posix_spawn`, а копия безопаснее (см.
+///     `process::vfork_linux_process`). Раньше эта форма отвечала ENOSYS, и
+///     `pagh-desktop` не мог запустить ребёнка (`os error 38`).
+/// CLONE_VM БЕЗ CLONE_THREAD и CLONE_VFORK (прямой vfork-хак) остаётся ENOSYS.
 pub fn sys_clone(
     regs: &SavedRegs,
     flags: u64,
@@ -473,6 +528,55 @@ pub fn sys_clone(
             }
             Ok(child)
         })?;
+        return Ok(child);
+    }
+    // ── путь vfork / posix_spawn ──
+    if flags & CLONE_VM != 0 && flags & CLONE_VFORK != 0 {
+        if flags & !VFORK_SUPPORTED != 0 {
+            crate::debug!("[clone] unsupported vfork flags {:#x} -> ENOSYS", flags);
+            return Err(Errno::ENOSYS);
+        }
+        // musl `__clone` передаёт стек ребёнка явно; glibc posix_spawn — свой
+        // mmap-стек. Ноль — бесполезный кадр (упадёт первым push'ем), поэтому
+        // отвергаем до появления ребёнка.
+        if child_stack == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let clear = if flags & CLONE_CHILD_CLEARTID != 0 {
+            child_tid
+        } else {
+            0
+        };
+        let parent_tid_out = if flags & CLONE_PARENT_SETTID != 0 {
+            parent_tid
+        } else {
+            0
+        };
+        let child_tid_out = if flags & CLONE_CHILD_SETTID != 0 {
+            child_tid
+        } else {
+            0
+        };
+        let parent = crate::task::scheduler::current_pid();
+        let child = crate::task::process::vfork_linux_process(
+            regs,
+            child_stack,
+            clear,
+            parent_tid_out,
+            child_tid_out,
+        )
+        .map_err(|e| {
+            crate::error!("[linux] vfork failed: {:?}", e);
+            e
+        })?;
+        // Как Linux: не возвращаться в userspace, пока ребёнок не exec'нёт или
+        // не выйдет. Ребёнок будит нас из execve/reap-пути.
+        crate::task::scheduler::vfork_wait(child);
+        crate::info!(
+            "[linux] vfork: parent pid={} child pid={} exec-or-exit",
+            parent,
+            child
+        );
         return Ok(child);
     }
     // ── путь fork ──

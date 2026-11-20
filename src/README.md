@@ -42,7 +42,9 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 Точный порядок:
 1. `enable_sse()` — первым (Limine отдаёт управление с CR4.OSFXSR=0, а прологи
    `x86-interrupt` эмитят `movaps` — иначе `#UD`-хендлер рекурсирует в triple fault).
-2. `serial::init` (COM1).
+2. `serial::init` (COM1); `pat::init` — `IA32_PAT` entry 4/5 = WC, чтобы
+   `/dev/fb0` можно было отобразить write-combined (до первого fb0 mmap;
+   без PAT — fallback `NO_CACHE|WRITE_THROUGH` и лог `fb0: PAT missing, uncached`).
 3. Проверка Limine base revision; чтение HHDM/KERNEL_ADDR ответов.
 4. `gdt::init` + `idt::init`.
 5. `syscall::init` (после GDT — STAR читает селекторы).
@@ -61,8 +63,13 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
     устройство `nvme0p1`/`virtio-blk0p1`) → `boot_menu::run()`: список разделов и
     RAM-диска с тем, что каждый держит (`pagh volume` по WAL-маркеру, `empty`,
     `FOREIGN fs`, `unknown data`). `Enter` монтирует, `F` форматирует **только после
-    ввода имени устройства**, таймаут 20 с уходит в недеструктивный выбор. Без выбора:
-    свой том (WAL-маркер) → RAM-диск с носителя → virtio-blk0 → NVMe.
+    ввода имени устройства**, таймаут 20 с уходит в недеструктивный выбор. Меню — вопрос
+    «один раз на машину»: рисуется, только пока не записан ВЫБОР монтирования
+    (`fs::mount_choice`, сырой сектор 1 тома), а после успешного монтирования маркер
+    пишется последним и следующие загрузки рисуют «boot disk menu skipped». Наличие
+    готового pagh-тома меню НЕ скипает: образ из `tools/mkimage.py` приезжает с уже
+    провижненным томом, и скип по тому навсегда скрывал вопрос от того, кто его не видел.
+    Без выбора: свой том (WAL-маркер) → RAM-диск с носителя → virtio-blk0 → NVMe.
     Раздел форматируется исключительно по явной команде человека из меню;
     автоматически форматируется лишь RAM-диск (scratch). `fs::format_policy` осталась
     политикой для `disk setup` и для этого автоматического пути; ext3/ext4 отсекаются по
@@ -93,7 +100,17 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 — меню бежит в `init_fs`, когда прерывания ещё выключены, поэтому оба драйвера
 опрашиваются синхронно, и это же делает меню рабочим на машине без PS/2.
 Между `framebuffer::is_initialized()` и пустым списком устройств меню не показывается
-вовсе, так что неинтерактивная загрузка не блокируется.
+вовсе, так что неинтерактивная загрузка не блокируется. Скипает меню ровно одно —
+ЗАПИСАННЫЙ ВЫБОР (`boot_menu::record_choice` пишет `fs::mount_choice` в сектор 1 тома
+после монтирования и посева, `boot::init_fs`). «Том уже есть» вопросом не является:
+провижненный диск без маркера (любой образ `mkimage`, любой диск с прошлой версии) меню
+ОДИН раз покажет, а дальше молча монтирует свой том — то, что просил оператор («показывать
+один раз, а не 4334»), вместо прежних двух крайностей: вопрос на каждой загрузке и вопрос,
+не показанный ни разу. Порча/чужой сектор читается как «выбора нет» (меню спросит снова),
+поэтому пропустить вопрос случайно нельзя. Если при наличии своего тома нужно
+занять/смонтировать другой диск, это делается из shell (`disk mount` / `disk setup`).
+Ограничение названо: образ, приехавший модулем Limine (`ram0`), распаковывается в память
+заново, и записанный в него маркер до следующей загрузки не доживает.
 
 ### `log.rs`, `logfile.rs` (зеркало лога в файл на диске) — логгирование
 Leveled-фасад: `error!/warn!/info!/debug!/trace!` + runtime-фильтр (`ACTIVE_LEVEL`, дефолт Info).
@@ -104,10 +121,15 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 
 ### `provision.rs` — первичный userland
 - `seed()` — идемпотентный посев ФС первого бута (guard `/mnt/etc/pagh-release`):
-  `etc/`, `home/user/`, `usr/share/pagh/`, `examples/hello/`; `resolv.conf` (10.0.2.3),
-  `hosts`, `motd`, README, LICENSE-NOTICE, hello-пример. `write_once` — не перезаписывает.
+  `etc/`, `home/user/`, `usr/share/pagh/`; `resolv.conf` (10.0.2.3),
+  `hosts`, `motd`, README, LICENSE-NOTICE. `write_once` — не перезаписывает,
+  а сам маркер `pagh-release` пишется последним: оборванный посев доделывается на
+  следующей загрузке, а не считается завершённым.
+- `record_mount_choice()` — человекочитаемое зеркало выбора монтирования
+  (`/mnt/etc/pagh-mount-choice`, `write_once`). Boot-решение принимает не этот файл, а
+  сырой `fs::mount_choice` в секторе 1 тома: `/mnt` до монтирования прочитать нельзя.
   Зависит только от `vfs` (`VfsNode`/`VfsError`): никакого apt/python в этой функции уже
-  нет — юзерленд ставится из shell по явной команде (`apt update` + `apt install python3`).
+  нет — юзерленд ставится из shell по явной команде (`ppkg update` + `ppkg install python3`).
 
 ### `selftest_lx.rs` — Linux-совместимость selftests (feature-gated)
 Компилируется только под `lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`.
@@ -118,7 +140,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
   getcwd/chdir/dup/gettimeofday/getdents.
 - `run_post_net_checks()` — apt E2E через локальное мини-зеркало (`tools/mini_repo.py`) +
   HTTPS smoke (реальный TLS 1.3 GET на deb.debian.org).
-- `run_live_update_check()` (`lx_livetest`) — полный live `apt update` **по HTTPS** (TLS 1.3;
+- `run_live_update_check()` (`lx_livetest`) — полный live `ppkg update` **по HTTPS** (TLS 1.3;
   зеркало из `apt::DEFAULT_MIRROR_HOST/BASE`; на cleartext-конфиге харнесс не стартует и
   печатает FAIL, так что «случайный PASS по HTTP» невозможен), assert count ≥ 50 000.
   Стойки на больших стримах нет — issue #19 опровергнут байт-трейсом (13 332 733 B одним

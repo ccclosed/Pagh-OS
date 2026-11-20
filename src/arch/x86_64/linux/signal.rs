@@ -707,6 +707,18 @@ pub fn tick_action(cur_rsp: u64) -> TickAction {
         begin_group_stop(sig);
         return TickAction::Park;
     }
+    // SIG_DFL без работы в обработчике — Ignore (SIGCHLD, SIGURG, ...) и Cont
+    // (SIGCONT: возобновление уже сделано `resume_group` на генерации). Такой
+    // сигнал не должен строить rt_sigframe на handler=0 — иначе ядро
+    // возвращается в RIP=0 и валит процесс SIGSEGV; именно так тик убивал
+    // композитор сразу после `bg` (pending SIGCONT попадал в tick раньше, чем
+    // в эпилог syscall-пути). Syscall-путь уже делает это через `_ => return`;
+    // tick-путь обязан вести себя так же.
+    if action.handler == SIG_DFL && super::signal_frame::default_action_is_silent(sig) {
+        let _ = compat::pick_pending_signal();
+        PENDING_APPROX.fetch_sub(1, Ordering::Relaxed);
+        return TickAction::None;
+    }
     // (3) Ядерный фрейм: пользовательского контекста здесь нет, поэтому НИЧЕГО
     // не потребляем.
     if !frame.is_user_frame() {

@@ -15,17 +15,89 @@ use alloc::vec::Vec;
 
 use crate::arch::x86_64::linux::epoll_sys::EpollEntry;
 use crate::arch::x86_64::linux::errno::Errno;
+use crate::arch::x86_64::linux::sock_shutdown;
 use crate::sync::spinlock::Spinlock;
 use crate::vfs::VfsNode;
 
 use super::fd_alloc::FdSlots;
 
 const PIPE_CAPACITY: usize = 64 * 1024;
+
+/// Переданный через `SCM_RIGHTS` дескриптор: dup объекта и его `f_flags`.
+///
+/// Linux `dup`/`SCM_RIGHTS` сохраняют режим доступа (`f_flags`): принятый
+/// memfd должен остаться writable, если отправитель открыл его на запись, —
+/// иначе `mmap(MAP_SHARED, PROT_WRITE)` получателя отвечал бы `EACCES`.
+/// `FD_CLOEXEC` сюда не входит: он появляется только по `MSG_CMSG_CLOEXEC`.
+pub struct PassedFd {
+    pub object: OpenObject,
+    pub flags: u64,
+}
+
+/// `SCM_RIGHTS`, привязанный к позиции байтового потока AF_UNIX.
+///
+/// `pos`/`end` — абсолютные (с начала потока) позиции первого байта и конца
+/// чанка `sendmsg`, вместе с которым пришли `objects`. Linux доставляет
+/// ancillary data с первым байтом записи и не даёт одному `recvmsg` перейти
+/// границу этой записи, поэтому приём останавливается на `end`: дескрипторы
+/// приходят ровно один раз и не «уезжают» в середину следующего сообщения.
+pub struct StreamCmsg {
+    /// Абсолютная позиция первого байта sendmsg.
+    pub pos: u64,
+    /// Абсолютная позиция сразу за чанком sendmsg (граница чтения).
+    pub end: u64,
+    /// dup'ы переданных дескрипторов; закрываются, когда cmsg отброшен,
+    /// доставлен получателю или сокет уничтожен.
+    pub objects: Vec<PassedFd>,
+}
+
 struct PipeState {
     bytes: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    /// Читающая половина этой стороны закрыта `shutdown(SHUT_RD)`: `read`
+    /// отвечает `Eof` (Linux: последующие `recv` → 0), а пир при записи в эту
+    /// очередь получает `EPIPE` — байты больше никто не заберёт.
+    read_shut: bool,
+    /// Пишущая половина этой стороны закрыта `shutdown(SHUT_WR)`: читатель
+    /// очереди видит `Eof`, хотя `Arc` пишущего конца ещё жив (обычный `close`
+    /// выставил бы то же самое, сняв счётчик `writers`).
+    write_shut: bool,
+    /// Сколько байт всего записано в очередь (абсолютная позиция конца).
+    written_total: u64,
+    /// Сколько байт всего прочитано (абсолютная позиция начала доступного).
+    read_total: u64,
+    /// Ждущие `SCM_RIGHTS`; строго возрастают по `pos`, все `pos >= read_total`.
+    cmsgs: VecDeque<StreamCmsg>,
+    /// `SO_RCVTIMEO` для блокирующего чтения этой очереди, в миллисекундах;
+    /// `0` — ждать бесконечно. Настройка живёт на ОЧЕРЕДИ, а не на fd: у пары
+    /// AF_UNIX очередь направления принадлежит ровно одному читающему концу, а
+    /// `dup`/`fork` по Linux делят настройку сокета между дескрипторами.
+    rcv_timeout_ms: u64,
+    /// `SO_SNDTIMEO` для блокирующей записи в эту очередь, в миллисекундах;
+    /// `0` — ждать бесконечно. Отдельное поле, а не общий «таймаут сокета»:
+    /// `recv` и `send` одной пары смотрят в РАЗНЫЕ очереди, и их настройки не
+    /// должны перетирать друг друга.
+    snd_timeout_ms: u64,
 }
+
+impl PipeState {
+    fn new() -> Self {
+        Self {
+            bytes: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+            read_shut: false,
+            write_shut: false,
+            written_total: 0,
+            read_total: 0,
+            cmsgs: VecDeque::new(),
+            rcv_timeout_ms: 0,
+            snd_timeout_ms: 0,
+        }
+    }
+}
+
 pub struct PipeEndpoint {
     state: Arc<Spinlock<PipeState>>,
     read_end: bool,
@@ -41,6 +113,19 @@ pub enum PipeWriteResult {
     WouldBlock,
     Broken,
 }
+
+/// Результат `recvmsg`-чтения: байты и забранный cmsg (если он пришёлся на
+/// это чтение). `objects` непусто, только когда поток достиг позиции cmsg.
+pub struct ScmRead {
+    pub n: usize,
+    pub objects: Vec<PassedFd>,
+}
+
+pub enum ScmReadResult {
+    Data(ScmRead),
+    WouldBlock,
+    Eof,
+}
 impl PipeEndpoint {
     pub fn nonblocking(&self) -> bool {
         self.nonblocking
@@ -52,16 +137,115 @@ impl PipeEndpoint {
             for b in dst.iter_mut().take(n) {
                 *b = s.bytes.pop_front().unwrap();
             }
+            s.read_total += n as u64;
+            // `read(2)`/`readv(2)` не принимают ancillary data: Linux при
+            // проходе мимо позиции SCM_RIGHTS отбрасывает (закрывает) fd.
+            // Забираем записи из-под лока и отпускаем после него: Drop объекта
+            // может отпускать Arc-сокеты и брать лок их очереди.
+            let mut skipped: Vec<StreamCmsg> = Vec::new();
+            while let Some(front) = s.cmsgs.front() {
+                if front.pos < s.read_total {
+                    skipped.push(s.cmsgs.pop_front().unwrap());
+                } else {
+                    break;
+                }
+            }
+            drop(s);
+            drop(skipped);
             PipeReadResult::Data(n)
-        } else if s.writers == 0 {
+        } else if sock_shutdown::read_at_eof(s.writers, s.read_shut, s.write_shut) {
             PipeReadResult::Eof
         } else {
             PipeReadResult::WouldBlock
         }
     }
+
+    /// Записать первые байты `sendmsg` и атомарно привязать к их позиции
+    /// дескрипторы `objects` (одна блокировка: позиция и cmsg не разъедутся).
+    ///
+    /// `objects` снимаются только при успешной записи: на `WouldBlock`/`Broken`
+    /// они остаются у вызывающего, который обязан либо повторить, либо закрыть
+    /// их сам (не переданный fd не должен исчезать у отправителя). Пустой
+    /// `objects` (`Some(empty)`) — обычная запись без cmsg.
+    pub fn write_scm(&self, src: &[u8], objects: &mut Option<Vec<PassedFd>>) -> PipeWriteResult {
+        let mut s = self.state.lock();
+        if !sock_shutdown::write_alive(s.readers, s.read_shut, s.write_shut) {
+            return PipeWriteResult::Broken;
+        }
+        if src.is_empty() {
+            return PipeWriteResult::Data(0);
+        }
+        let room = PIPE_CAPACITY.saturating_sub(s.bytes.len());
+        if room == 0 {
+            return PipeWriteResult::WouldBlock;
+        }
+        let n = core::cmp::min(room, src.len());
+        let pos = s.written_total;
+        s.bytes.extend(src[..n].iter().copied());
+        s.written_total += n as u64;
+        if let Some(objs) = objects.take() {
+            if !objs.is_empty() {
+                s.cmsgs.push_back(StreamCmsg {
+                    pos,
+                    end: pos + n as u64,
+                    objects: objs,
+                });
+            }
+        }
+        PipeWriteResult::Data(n)
+    }
+
+    /// `recvmsg`-чтение: те же байты, что `read`, но с доставкой стоящего на
+    /// текущей позиции SCM_RIGHTS и остановкой на границе его чанка.
+    ///
+    /// Границы (повторяют Linux): данные перед cmsg читаются обычным
+    /// `recvmsg`-вызовом; как только чтение входит в чанк с cmsg, cmsg
+    /// забирается, а вызов не идёт дальше `end` этого чанка; cmsg, позицию
+    /// которого прошёл обычный `read(2)`, уже отброшен [`Self::read`].
+    pub fn read_scm(&self, dst: &mut [u8]) -> ScmReadResult {
+        let mut s = self.state.lock();
+        if s.bytes.is_empty() {
+            return if sock_shutdown::read_at_eof(s.writers, s.read_shut, s.write_shut) {
+                ScmReadResult::Eof
+            } else {
+                ScmReadResult::WouldBlock
+            };
+        }
+        // Инвариант: read() отбрасывает пройденные cmsg. Защитно повторяем,
+        // забирая записи из-под лока.
+        let mut skipped: Vec<StreamCmsg> = Vec::new();
+        while let Some(front) = s.cmsgs.front() {
+            if front.pos < s.read_total {
+                skipped.push(s.cmsgs.pop_front().unwrap());
+            } else {
+                break;
+            }
+        }
+        let avail = s.bytes.len() as u64;
+        let mut take = core::cmp::min(dst.len() as u64, avail);
+        let mut objects: Vec<PassedFd> = Vec::new();
+        if let Some(front) = s.cmsgs.front() {
+            let rel = front.pos - s.read_total;
+            if take > rel {
+                // Чтение вошло в чанк с cmsg: доставить его и остановиться на
+                // границе чанка (или на конце буфера вызывающего).
+                let end_rel = front.end.saturating_sub(s.read_total);
+                take = core::cmp::min(take, end_rel.max(rel + 1));
+                objects = s.cmsgs.pop_front().map(|c| c.objects).unwrap_or_default();
+            }
+        }
+        let n = take as usize;
+        for b in dst.iter_mut().take(n) {
+            *b = s.bytes.pop_front().unwrap();
+        }
+        s.read_total += n as u64;
+        drop(s);
+        drop(skipped);
+        ScmReadResult::Data(ScmRead { n, objects })
+    }
     pub fn write(&self, src: &[u8]) -> PipeWriteResult {
         let mut s = self.state.lock();
-        if s.readers == 0 {
+        if !sock_shutdown::write_alive(s.readers, s.read_shut, s.write_shut) {
             return PipeWriteResult::Broken;
         }
         let room = PIPE_CAPACITY.saturating_sub(s.bytes.len());
@@ -70,24 +254,93 @@ impl PipeEndpoint {
         }
         let n = core::cmp::min(room, src.len());
         s.bytes.extend(src[..n].iter().copied());
+        // Обычная запись двигает абсолютную позицию потока ровно так же, как
+        // [`Self::write_scm`]: `written_total` — это координата, в которой
+        // [`Self::write_scm`] регистрирует `SCM_RIGHTS`, а `read_total` — сколько
+        // байт потока уже потреблено. Если `write(2)` пишет мимо счётчика,
+        // координаты расходятся: первое же `sendmsg` с fd получает `pos = 0`
+        // (счётчик не двигался, хотя байты ушли), регистрирует cmsg ПОЗАДИ
+        // `read_total`, и [`Self::read_scm`] выбрасывает её как «пройденную» —
+        // дескриптор молча теряется, а `recvmsg` возвращает данные без cmsg.
+        // Именно так SHM_OFFER убивал соединение с каждым реальным клиентом:
+        // `hello`/`create` уходят через `write(2)`, а fd — следующим `sendmsg`.
+        s.written_total += n as u64;
         PipeWriteResult::Data(n)
     }
     pub fn read_ready(&self) -> bool {
         let s = self.state.lock();
-        !s.bytes.is_empty() || s.writers == 0
+        sock_shutdown::read_ready(!s.bytes.is_empty(), s.writers, s.read_shut, s.write_shut)
     }
     pub fn write_ready(&self) -> bool {
         let s = self.state.lock();
-        s.readers > 0 && s.bytes.len() < PIPE_CAPACITY
+        sock_shutdown::write_ready(
+            s.readers,
+            s.read_shut,
+            s.write_shut,
+            s.bytes.len() < PIPE_CAPACITY,
+        )
     }
     pub fn peer_closed(&self) -> bool {
         let s = self.state.lock();
         if self.read_end {
-            s.writers == 0
+            // EOF пира: последний пишущий конец уничтожен либо закрыл свою
+            // половину через `shutdown(SHUT_WR)`.
+            s.writers == 0 || s.write_shut
         } else {
-            s.readers == 0
+            !sock_shutdown::write_alive(s.readers, s.read_shut, s.write_shut)
         }
     }
+    /// Закрыть читающую половину этого конца (`shutdown(SHUT_RD)`, nr 48).
+    ///
+    /// Флаг на общей очереди, поэтому `dup`-дубликаты и форкнутые процессы
+    /// видят то же самое — как в Linux, где `shutdown` действует на сокет, а не
+    /// на номер дескриптора. Повторный вызов идемпотентен.
+    pub fn shutdown_read(&self) {
+        self.state.lock().read_shut = true;
+    }
+    /// Закрыть пишущую половину этого конца (`shutdown(SHUT_WR)`): пир-читатель
+    /// увидит `Eof` / `POLLHUP`, собственная запись — `EPIPE`.
+    pub fn shutdown_write(&self) {
+        self.state.lock().write_shut = true;
+    }
+    /// Идентичность очереди: у всех концов (pipe и обоих концов socketpair)
+    /// одинаковый указатель на общее состояние. Блокирующее чтение по нему
+    /// спрашивает таблицу fd, жив ли ещё хоть один дескриптор этой очереди, — и
+    /// так отличает «пир ещё может написать» от «читающий fd закрыли из
+    /// соседнего потока, и ждать больше некому» (см. `linux::sock_wait`).
+    pub fn queue_id(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+    /// Остались ли пишущие концы: для читающего конца это `writers == 0` (EOF).
+    ///
+    /// `shutdown(SHUT_WR)` на пишущей стороне закрывает направление раньше
+    /// `close`, поэтому очередь сообщает 0 и тогда: блокирующее чтение обязано
+    /// проснуться с `Ok(0)`, а не ждать, пока Arc пишущего конца исчезнет.
+    pub fn writers(&self) -> usize {
+        let s = self.state.lock();
+        if s.write_shut {
+            0
+        } else {
+            s.writers
+        }
+    }
+    /// `SO_RCVTIMEO` этой очереди в миллисекундах (`0` — бесконечно).
+    pub fn rcv_timeout_ms(&self) -> u64 {
+        self.state.lock().rcv_timeout_ms
+    }
+    /// `SO_SNDTIMEO` этой очереди в миллисекундах (`0` — бесконечно).
+    pub fn snd_timeout_ms(&self) -> u64 {
+        self.state.lock().snd_timeout_ms
+    }
+    /// Задать `SO_RCVTIMEO` (миллисекунды, `0` — снять таймаут).
+    pub fn set_rcv_timeout_ms(&self, ms: u64) {
+        self.state.lock().rcv_timeout_ms = ms;
+    }
+    /// Задать `SO_SNDTIMEO` (миллисекунды, `0` — снять таймаут).
+    pub fn set_snd_timeout_ms(&self, ms: u64) {
+        self.state.lock().snd_timeout_ms = ms;
+    }
+
     /// Клонировать этот конец pipe с другим флагом O_NONBLOCK (fcntl
     /// F_SETFL). Клон регистрируется как дополнительный читатель/писатель на
     /// общей очереди; счётчик оригинала падает, когда отпускается последний
@@ -452,12 +705,61 @@ impl FdTable {
         self.slots.get_mut(fd)
     }
 
+    /// Ссылается ли ХОТЬ ОДИН дескриптор процесса на ЧИТАЮЩИЙ конец очереди
+    /// `queue_id`.
+    ///
+    /// Этот вопрос задаёт блокирующее чтение на каждой уступке CPU: закрытый из
+    /// соседнего потока дескриптор не выставляет EOF (счётчики очереди считают
+    /// живые концы, а не fd), и без этой проверки `recvfrom` ждал бы вечно —
+    /// watchdog печатал `stuck in syscall ? (nr=45 arg0=0x3 closed)`. `dup`
+    /// другого fd на ту же очередь по-прежнему считается владением, поэтому
+    /// закрытие одного из дубликатов законное ожидание не прерывает.
+    ///
+    /// Учитываются именно ЧИТАЮЩИЕ концы: оставшийся в таблице пишущий конец
+    /// (self-pipe, второй конец `socketpair` в том же процессе) данные в очередь
+    /// класть может, но забрать их после закрытия читающего fd некому — это
+    /// `EBADF`, а не продолжение ожидания.
+    pub fn holds_read_end(&self, queue_id: usize) -> bool {
+        self.slots.any(|obj| match obj {
+            OpenObject::PipeRead(e) => e.queue_id() == queue_id,
+            OpenObject::Socket { rx, .. } => rx.queue_id() == queue_id,
+            _ => false,
+        })
+    }
+
+    /// Ссылается ли ХОТЬ ОДИН дескриптор процесса на ПИШУЩИЙ конец очереди
+    /// `queue_id`.
+    ///
+    /// Зеркало [`Self::holds_read_end`] для блокирующей ЗАПИСИ: `sendto`/
+    /// `sendmsg`/`write` на полной очереди уступают CPU и перечитывают её, а
+    /// закрытие пишущего fd из соседнего потока не меняет счётчики очереди —
+    /// syscall держит её `Arc` сам. Без этой проверки такой `write` крутил бы
+    /// `yield_current()` вечно (watchdog печатал `stuck in syscall ? (nr=1
+    /// arg0=0x3 closed)`); `dup` другого fd на ту же очередь — по-прежнему
+    /// владение.
+    pub fn holds_write_end(&self, queue_id: usize) -> bool {
+        self.slots.any(|obj| match obj {
+            OpenObject::PipeWrite(e) => e.queue_id() == queue_id,
+            OpenObject::Socket { tx, .. } => tx.queue_id() == queue_id,
+            _ => false,
+        })
+    }
+
+    /// Ссылается ли ХОТЬ ОДИН дескриптор процесса на TCP-сокет `id`
+    /// (идентичность — адрес `Arc<InetTcp>`, как [`Self::holds_read_end`]).
+    ///
+    /// Тот же вопрос задаёт блокирующее чтение TCP: закрытый из соседнего
+    /// потока fd не выставляет EOF на соединении, поэтому без проверки
+    /// `recvfrom`/`read` спал бы вечно (watchdog `nr=45 arg0=0x3 closed`).
+    pub fn holds_inet_tcp(&self, id: usize) -> bool {
+        self.slots.any(|obj| match obj {
+            OpenObject::InetTcp(t) => Arc::as_ptr(t) as usize == id,
+            _ => false,
+        })
+    }
+
     pub fn pipe(&mut self, nonblocking: bool) -> Result<(u32, u32), Errno> {
-        let state = Arc::new(Spinlock::new(PipeState {
-            bytes: VecDeque::new(),
-            readers: 1,
-            writers: 1,
-        }));
+        let state = Arc::new(Spinlock::new(PipeState::new()));
         let r = Arc::new(PipeEndpoint {
             state: Arc::clone(&state),
             read_end: true,
@@ -608,16 +910,8 @@ impl FdTable {
     /// поэтому ОБА fd читаемы и записываемы (в отличие от pipe). Закрытие одного
     /// конца даёт партнёру EOF на чтении и EPIPE на записи.
     pub fn socketpair(&mut self, nonblocking: bool) -> Result<(u32, u32), Errno> {
-        let q_ab = Arc::new(Spinlock::new(PipeState {
-            bytes: VecDeque::new(),
-            readers: 1,
-            writers: 1,
-        }));
-        let q_ba = Arc::new(Spinlock::new(PipeState {
-            bytes: VecDeque::new(),
-            readers: 1,
-            writers: 1,
-        }));
+        let q_ab = Arc::new(Spinlock::new(PipeState::new()));
+        let q_ba = Arc::new(Spinlock::new(PipeState::new()));
         let a = OpenObject::Socket {
             rx: Arc::new(PipeEndpoint {
                 state: Arc::clone(&q_ba),
@@ -702,16 +996,8 @@ pub fn socket_pair_endpoints(
     (Arc<PipeEndpoint>, Arc<PipeEndpoint>),
     (Arc<PipeEndpoint>, Arc<PipeEndpoint>),
 ) {
-    let q_cs = Arc::new(Spinlock::new(PipeState {
-        bytes: VecDeque::new(),
-        readers: 1,
-        writers: 1,
-    }));
-    let q_sc = Arc::new(Spinlock::new(PipeState {
-        bytes: VecDeque::new(),
-        readers: 1,
-        writers: 1,
-    }));
+    let q_cs = Arc::new(Spinlock::new(PipeState::new()));
+    let q_sc = Arc::new(Spinlock::new(PipeState::new()));
     let client = (
         Arc::new(PipeEndpoint {
             state: Arc::clone(&q_sc),

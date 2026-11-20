@@ -600,6 +600,15 @@ pub fn is_attached() -> bool {
     E1000_DEV.lock().is_some()
 }
 
+/// Состояние линка подключённой карты (`STATUS.LU`); нет карты — `false`.
+///
+/// Модульная обёртка над [`E1000::link_up`]: `net::link::running` и ioctl
+/// спрашивают «линк поднят?» у канала, не имея доступа к экземпляру драйвера.
+pub fn link_up() -> bool {
+    let guard = E1000_DEV.lock();
+    guard.as_ref().map(|nic| nic.link_up()).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

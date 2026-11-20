@@ -1,0 +1,35 @@
+[package]
+name = "pagh-ui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Pagh desktop B UI toolkit: widgets, theme, headless RGBA renderer, protocol client"
+
+# Отдельный workspace: корневой workspace репозитория собирает bare-metal ядро
+# под кастомный target и с -Zbuild-std (см. корневой .cargo/config.toml), а
+# пользовательские приложения собираются под хост (тесты) и статический musl.
+[workspace]
+
+[lib]
+name = "pagh_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pagh-ui-gallery"
+path = "src/bin/gallery.rs"
+
+[dev-dependencies]
+# Только для тестов: сверяем клиентский кодек PDP/1 с серверным кодеком
+# композитора (общий провод, независимые реализации).
+pagh-desktop = { path = "../pagh-desktop" }
+
+# opt-level=3 для render-крейтов: P1 плана frame time. На "s"/"z" LLVM
+# отключает автовекторизацию и разворот циклов, а горячий путь композитора —
+# это попиксельные циклы blend/тени и построчный copy_row. Ядро (корневой
+# Cargo.toml, "z") не меняется: это другой workspace и другой бинарь.
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+strip = true

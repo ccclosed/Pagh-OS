@@ -3,15 +3,21 @@
 //
 // The kernel part is `idt.rs::page_fault_handler`: a fault that
 // `mem_sys::handle_user_page_fault` refuses used to be either "kill the ring-3
-// Compat_Process" (USER_MODE) or "halt the machine" (everything else). A
-// syscall handler that dereferences a user buffer AFTER a sibling thread
-// unmapped it (F-x86a-4) faults in KERNEL mode on a user address, so the
-// otherwise-correct halt turned a ring-3 triggerable stale pointer into a
-// machine kill. `trap_frame::page_fault_action` adds that one case — and this
-// file pins the boundaries, in particular the one the fix must NOT move:
+// Compat_Process" (USER_MODE) or "halt the machine" (everything else). Two
+// machine kills were fixed here:
 //
-//   * ring-3 fault + compat process          -> kill the process (historical);
-//   * ring-3 fault + non-compat task         -> fatal (historical);
+//   * F-x86a-4: a syscall handler that dereferences a user buffer AFTER a
+//     sibling thread unmapped it faults in KERNEL mode on a user address, so the
+//     otherwise-correct halt turned a ring-3 triggerable stale pointer into a
+//     machine kill. `page_fault_action` adds that one backstop case.
+//   * S4b: a ring-3 fault only killed a `Compat_Process`, so a userspace client
+//     without compat state (native ring-3 task before `install_compat`) and any
+//     future non-Linux userspace died into `halt()` along with the machine. The
+//     ring-3 branch is now unconditional.
+//
+// This file pins the boundaries, in particular the one the fix must NOT move:
+//
+//   * ring-3 fault (compat OR native task)  -> kill the task, never the machine;
 //   * ring-0 fault on a USER address (>= the first mappable page, < the user
 //     half) + compat process                -> kill the process, NOT the machine;
 //   * ring-0 fault on a KERNEL address      -> fatal, ALWAYS: a real kernel bug
@@ -27,22 +33,30 @@ use proptest::prelude::*;
 const KERNEL_ADDR: u64 = 0xffff_ffff_8000_0000;
 
 #[test]
-fn ring3_fault_keeps_the_historical_rule() {
+fn ring3_fault_always_kills_the_task() {
     // A compatible process is killed; the machine keeps running.
     assert_eq!(
         page_fault_action(true, 0x40_0000, USER_ADDR_MAX, true),
         PageFaultAction::KillProcess
     );
-    // A native task (no compat state) still takes the fatal path.
+    // S4b: a native ring-3 task (no compat state) must be killed too — it used
+    // to fall through to `halt()` and take the machine down.
     assert_eq!(
         page_fault_action(true, 0x40_0000, USER_ADDR_MAX, false),
-        PageFaultAction::Halt
-    );
-    // The ring-3 rule never depended on the faulting address.
-    assert_eq!(
-        page_fault_action(true, 0, USER_ADDR_MAX, true),
         PageFaultAction::KillProcess
     );
+    // The ring-3 rule never depended on the faulting address: a wild jump or a
+    // kernel-address dereference from userspace still kills only the task.
+    for addr in [0u64, 4095, 4096, KERNEL_ADDR, u64::MAX] {
+        assert_eq!(
+            page_fault_action(true, addr, USER_ADDR_MAX, false),
+            PageFaultAction::KillProcess
+        );
+        assert_eq!(
+            page_fault_action(true, addr, USER_ADDR_MAX, true),
+            PageFaultAction::KillProcess
+        );
+    }
 }
 
 #[test]
@@ -123,16 +137,16 @@ proptest! {
         );
     }
 
-    /// Ring-3 faults keep their historical rule for every address.
+    /// Ring-3 faults always kill the faulting task for every address and every
+    /// compat state (S4b: they must never halt the machine).
     #[test]
-    fn ring3_faults_depend_only_on_compat_state(addr in any::<u64>()) {
+    fn ring3_faults_never_halt_the_machine(
+        addr in any::<u64>(),
+        compat in any::<bool>(),
+    ) {
         prop_assert_eq!(
-            page_fault_action(true, addr, USER_ADDR_MAX, true),
+            page_fault_action(true, addr, USER_ADDR_MAX, compat),
             PageFaultAction::KillProcess
-        );
-        prop_assert_eq!(
-            page_fault_action(true, addr, USER_ADDR_MAX, false),
-            PageFaultAction::Halt
         );
     }
 }

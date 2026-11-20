@@ -16,7 +16,7 @@
 | `switch.rs` | Контекст-свитч на asm: раскладка сохранённого фрейма, `yield_switch()`, `irq32_stub`, `kernel_thread_trampoline`, `scheduler_exit_thread` |
 | `process.rs` | Создание user-процессов: ring-3 стартовые фреймы, `create_user_process`, `run_linux_binary`, `exec_linux_image`, `fork_linux_process`, `spawn_linux_thread` |
 | `compat.rs` | Per-pid реестр `CompatState` (`COMPAT_STATES`): fd-таблица, VM-состояние, TLS, tid/tgid/ppid/**pgid**, cwd, umask, rlimits, exit-коды, зомби (`EXITED_CHILDREN`), сигнальное состояние (pending/blocked/dispositions) и флаг **`tty_job`** — «терминал передан этому процессу как заданию» (терминальный SIGTTIN/SIGTTOU применяется только к job'ам; наследуется fork/clone) |
-| `fd.rs` | Ядровая fd-таблица: `OpenObject` (консоль, файл, dir, pipes, сокеты, epoll, eventfd), `FdTable` с per-fd open/status flags (для `fdinfo`), `PipeEndpoint`, plumbing AF_UNIX-слушателей |
+| `fd.rs` | Ядровая fd-таблица: `OpenObject` (консоль, файл, dir, pipes, сокеты, epoll, eventfd), `FdTable` с per-fd open/status flags (для `fdinfo`), `PipeEndpoint`, plumbing AF_UNIX-слушателей; `holds_read_end`/`holds_inet_tcp` — на каждой уступке CPU отвечают блокирующему чтению, жив ли ещё его дескриптор |
 | `fd_alloc.rs` | Чистая bookkeeping fd-слотов (`FdSlots<T>`, `lowest_free_index`); core+alloc, шарится в host-tests |
 | `fpu.rs` | FPU/SSE per-task: eager FXSAVE/FXRSTOR (`FxArea`, 512 B, align 64) |
 | `stack.rs` | Чистый энкодер стартового стека System V + auxv (`build_initial_stack`, `AuxInputs`); хост-тестируемый |
@@ -95,10 +95,16 @@
 - `run_linux_binary` → `exec_linux_image`: чтение файла, ELF-загрузка (`vfs::elf::ElfLoader::load_linux`,
   ET_EXEC и ET_DYN/static-PIE с bias), поиск интерпретатора (`/lib64/ld-linux-x86-64.so.2`
   с фоллбэком в merged-usr пути), маппинг стека через `stack_map::map_initial_stack`.
-- `sys_clone` (в `arch/.../linux/process_sys.rs`) различает тред (`CLONE_VM|CLONE_THREAD` →
-  общий CR3, `spawn_linux_thread`) и fork (→ `fork_linux_process`, COW через
-  `vmm::fork_user_space_cow`, с eager-фоллбэком при huge pages). `CLONE_VM` без
-  `CLONE_THREAD` (vfork/posix_spawn) — сознательно ENOSYS, чтобы libuv шла через fork+exec.
+- `sys_clone` (в `arch/.../linux/process_sys.rs`) различает три формы: тред
+  (`CLONE_VM|CLONE_THREAD` → общий CR3, `spawn_linux_thread`), fork (→
+  `fork_linux_process`, COW через `vmm::fork_user_space_cow`, с eager-фоллбэком при
+  huge pages) и vfork/`posix_spawn` (`CLONE_VM|CLONE_VFORK` без `CLONE_THREAD` → тот же
+  COW-fork с явным `child_stack`, `process::vfork_linux_process`; родитель ждёт
+  `execve`/выхода ребёнка через `scheduler::vfork_wait`, ребёнок будит его из
+  `sys_execve` и reap-пути). Совместная память vfork намеренно заменена копией:
+  `posix_spawn` передаёт статус через pipe, а не через общую память, поэтому копия
+  ненаблюдаема и безопаснее. `CLONE_VM` без обоих `CLONE_THREAD`/`CLONE_VFORK` —
+  по-прежнему ENOSYS.
 - Зомби: `finish_compat_exit` кладёт детей в `EXITED_CHILDREN`; `sys_wait4` опрашивает
   `reap_child`, уступая между проверками.
 - Треды: `clone_current_compat` регистрирует тред под его pid с общим `tgid` и общим
@@ -113,7 +119,7 @@
 ## Реализованные Linux syscall'ы (кратко)
 
 Полный список — в `dispatch_supported` (`arch/x86_64/linux/mod.rs`):
-I/O (read/write/writev, open/openat, lseek, rename, fstat/statx, ioctl, poll/select, pipe,
+I/O (read/write/writev, open/openat, lseek, rename, stat/fstat/newfstatat/statx, ioctl, poll/select, pipe,
 getdents64, getcwd/chdir, dup/fcntl, socketpair), память (brk, mmap, munmap, mremap, mprotect),
 сокеты AF_UNIX и AF_INET/6 (TCP/UDP), epoll/eventfd, время (clock_gettime, nanosleep,
 gettimeofday), процессы (getpid/getppid/gettid, wait4, clone, execve, exit/exit_group,
@@ -142,18 +148,37 @@ sched_yield, tgkill и др.).
 
 - `COMPAT_STATES` спинлок **нереентерабелен**: замыкания `with_current_compat` не должны
   блокироваться на device I/O и не должны реэнтерить реестр; page-fault-обработчик
-  проверяет `compat_lock_held()` (`COMPAT_DEPTH`), чтобы не дедлокнуться:
-  `epoll_wait`→`poll_fd` уже держит реестр, поэтому signalfd-ветка читает
-  `sig_pending`/`sig_blocked` из уже захваченного `CompatState`, а не зовёт
+  проверяет `compat_lock_held()` — «внутри ли замыкания ЭТА задача», а не «глубина > 0
+  на CPU» (учёт `compat_guard::CompatEntry` хранит pid владельца и его глубину), чтобы
+  не дедлокнуться: `epoll_wait`→`poll_fd` уже держит реестр, поэтому signalfd-ветка
+  читает `sig_pending`/`sig_blocked` из уже захваченного `CompatState`, а не зовёт
   `signalfd_readable()` (тот теперь debug-assert'ит, что реестр не удерживается).
-  Kill-путь исключений (#PF/#GP/синхронные) отвечает `compat_exists_for_exit` без входа в
-  реестр и `abandon_held_registry` аварийно отпускает лок, удерживаемый прерванным
-  замыканием, прежде чем завершить задачу.
+  Голый счётчик глубины был дефектом: тик, вытеснивший задачу между `enter` и `lock()`
+  или между снятием guard'а и `exit` (IF уже восстановлен, лок уже свободен), оставлял
+  глубину >0, пока CPU исполнял ДРУГУЮ задачу: её законный ленивый отказ отвергался
+  (SIGSEGV), а kill-путь сбрасывал чужую глубину — возобновившийся владелец вычитал из
+  нуля (underflow) и отравлял guard для всех последующих отказов. Kill-путь исключений (#PF/#GP/синхронные)
+  отвечает `compat_exists_for_exit` без входа в реестр, а `abandon_held_registry`
+  аварийно отпускает лок **только у настоящего владельца** учёта, прежде чем завершить
+  задачу.
 - **fd-таблица ограничена `NOFILE_MAX`/`FD_TABLE_LIMIT` = 1024** (см. `SECURITY.md`):
   `dup2`/`dup3` отвергают `newfd >= предела` с `EBADF`, `fcntl(F_DUPFD/F_DUPFD_CLOEXEC)` —
   `EINVAL` до аллокации; `FdSlots::alloc`/`try_alloc`/`try_set` независимо не дают вектору
   вырасти за предел (`EMFILE`), поэтому `open`/`pipe`/`socketpair` на полной таблице
   возвращают `EMFILE`, а `pipe` освобождает первый конец, если второй не помещается.
+- **Координаты байтового потока в `PipeState` — одна шкала, и двигают её ОБА
+  пути записи.** `written_total` — координата, в которой `write_scm` регистрирует
+  `SCM_RIGHTS`; `read_total` — сколько байт потока уже потреблено, и `read_scm`
+  выбрасывает cmsg с `pos < read_total` как «пройденную» (семантика `read(2)`,
+  который ancillary data не принимает). Поэтому `PipeEndpoint::write` обязан
+  двигать `written_total` ровно так же, как `write_scm`: без этого первое
+  `sendmsg` с fd после любой обычной записи получает `pos = 0`, fd молча
+  теряется, а `recvmsg` возвращает данные без cmsg. Именно так `SHM_OFFER`
+  терял memfd (`hello`/`create` уходят `write(2)`, memfd — следующим
+  `sendmsg`), клиент получал `EPIPE`, а окно навсегда оставалось с
+  плейсхолдером; same-process selftest этого не видел, потому что весь его
+  трафик идёт через `sendmsg`/`recvmsg`. Регрессия —
+  `desktop-b::SCM_RIGHTS after plain write (SHM_OFFER shape)`.
 - `spawn`/`requeue` дропают дубликат уже стоящего в очереди pid (лог `[SCHED] DOUBLE ENQUEUE`).
 - `setup_task_kernel_stack` перепрограммирует единственный глобальный слот RSP0/syscall-стека —
   fork/clone обязаны вернуть его на РОДИТЕЛЯ перед возвратом.

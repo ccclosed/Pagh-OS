@@ -886,6 +886,235 @@ pub fn run_apt_e2e() {
     }
 }
 
+// ───────────────────────── apt performance benchmark ─────────────────────────
+
+/// Measure the cost a **temp-file spool** alternative to the two-pass streaming
+/// install would pay, for the W1 design decision.
+///
+/// The alternative design is "decompress `data.tar` once into a temp file, then
+/// read it twice (plan + extract)". It saves one decompression pass but must write
+/// and re-read the whole decompressed tar on ext2. `bytes` are written
+/// sequentially in 256 KiB pieces and read back the same way (the data content is
+/// irrelevant to the throughput); the scratch file is removed afterwards.
+///
+/// Returns `(write_ms, read_ms)`, or `None` if the probe could not run (no space,
+/// VFS refusal) — a benchmark footnote, never a failure.
+#[cfg(feature = "lx_apt_bench")]
+fn bench_spool_probe(bytes: usize) -> Option<(u64, u64)> {
+    const CHUNK: usize = 256 * 1024;
+    const NAME: &str = "apt-spool-probe";
+    let root = crate::vfs::lookup_path("/mnt").ok()?;
+    if !root.is_directory() {
+        return None;
+    }
+    let _ = root.remove(NAME);
+    let file = root.create_file(NAME).ok()?;
+
+    let chunk = alloc::vec![0xA5u8; CHUNK];
+    let mut written = 0usize;
+    let write_start = scheduler::ticks();
+    while written < bytes {
+        let n = core::cmp::min(CHUNK, bytes - written);
+        match file.write(written as u64, &chunk[..n]) {
+            Ok(k) if k == n => written += n,
+            _ => {
+                let _ = root.remove(NAME);
+                return None;
+            }
+        }
+    }
+    let write_ms = scheduler::ticks().saturating_sub(write_start);
+
+    let mut buf = alloc::vec![0u8; CHUNK];
+    let mut read = 0usize;
+    let read_start = scheduler::ticks();
+    while read < bytes {
+        let n = core::cmp::min(CHUNK, bytes - read);
+        match file.read(read as u64, &mut buf[..n]) {
+            Ok(k) if k > 0 => read += k,
+            _ => {
+                let _ = root.remove(NAME);
+                return None;
+            }
+        }
+    }
+    let read_ms = scheduler::ticks().saturating_sub(read_start);
+
+    let _ = root.remove(NAME);
+    Some((write_ms, read_ms))
+}
+
+/// In-guest apt performance benchmark (cargo feature `lx_apt_bench`).
+///
+/// Spawned as a kernel thread from `boot::kernel_main` (after interrupts/DHCP).
+/// It points apt at the signed benchmark repo on the QEMU host gateway
+/// (`tools/mini_repo.py bench OUT --serve 8000`, suite `bench`) and runs:
+///
+///   1. `apt update` **round 1** — fetches the signed Release + `Packages.gz`,
+///      stream-parses the whole index (`--stanzas`, 5k/50k in the harnesses);
+///   2. `apt update` **round 2** — with the W3 persistent index cache this must
+///      NOT re-decompress/re-parse the index when the signed Release digest is
+///      unchanged; without the cache it simply repeats round 1 (still a useful
+///      "warm" number);
+///   3. `apt install bench-large` — a four-package transaction (`bench-large` +
+///      two deps + those deps' shared dep chain) that writes `--size-mib` MiB
+///      onto ext2 in one go, exercising the streaming `.deb` path and the
+///      once-per-transaction `sync`.
+///
+/// Every step is observed through the `apt: timings …` lines `apt` itself emits
+/// (phase ms + `heap_peak_kib`); this driver adds a correctness check (the
+/// installed payload's size and first bytes) and the terminal
+/// `LXSELFTEST apt_bench PASS` line the e2e harness gates on. It never panics and
+/// never hangs: a failed step logs exactly one FAIL line and returns.
+#[cfg(feature = "lx_apt_bench")]
+pub fn run_apt_bench() {
+    let name = "apt_bench";
+
+    // Wait up to ~60 s for an interface address (DHCP, then static fallback).
+    let deadline = scheduler::ticks() + WAIT_IFACE_TICKS;
+    while crate::net::ip_config().is_none() {
+        if scheduler::ticks() >= deadline {
+            fail(
+                name,
+                "no interface address within 60 s (DHCP/static fallback did not configure)",
+            );
+            return;
+        }
+        scheduler::sleep_ticks(10);
+    }
+
+    let (size, used, free) = crate::memory::heap::stats();
+    crate::info!(
+        "LXSELFTEST apt_bench: iface up; heap used {} KiB / free {} KiB / size {} KiB",
+        used / 1024,
+        free / 1024,
+        size / 1024
+    );
+
+    // The benchmark repo is served from the mirror ROOT (like the other local
+    // harnesses), suite `bench` (signed by the deterministic TEST key that only
+    // the harness builds anchor).
+    crate::pkg::apt::set_mirror("http://10.0.2.2:8000", Some("/"));
+    crate::pkg::apt::set_suite("bench");
+    let cfg = crate::pkg::apt::config();
+    crate::info!(
+        "LXSELFTEST apt_bench: mirror {}://{}{} suite={}/{}/{}",
+        cfg.scheme(),
+        cfg.host,
+        cfg.base,
+        cfg.suite,
+        cfg.component,
+        cfg.arch
+    );
+
+    // 1+2. Two update rounds. Round 2 is the W3 cache-hit scenario: with an
+    // unchanged signed Release it must skip the Packages download+parse (its
+    // `apt: timings` line then has no index_parse_ms) instead of failing.
+    for round in 1..=2u32 {
+        match crate::pkg::apt::update() {
+            Ok(n) => {
+                let ms = crate::pkg::apt::last_total_ms().unwrap_or(0);
+                crate::info!(
+                    "LXSELFTEST apt_bench update round={} pkgs={} total_ms={}",
+                    round,
+                    n,
+                    ms
+                );
+                if n < 2 {
+                    fail(name, "index must contain at least the benchmark packages");
+                    return;
+                }
+            }
+            Err(e) => {
+                crate::error!(
+                    "LXSELFTEST apt_bench FAIL update round={}: {}",
+                    round,
+                    e.message()
+                );
+                return;
+            }
+        }
+    }
+
+    // 3. One multi-package transaction: the resolver pulls the dependency-first
+    // plan, and each `.deb` goes through the streaming install path.
+    match crate::pkg::apt::install("bench-large") {
+        Ok(installed) => {
+            let ms = crate::pkg::apt::last_total_ms().unwrap_or(0);
+            crate::info!(
+                "LXSELFTEST apt_bench install pkgs={} total_ms={}",
+                installed.len(),
+                ms
+            );
+            if installed.len() < 2 {
+                fail(name, "install planned fewer packages than expected");
+                return;
+            }
+        }
+        Err(e) => {
+            crate::error!("LXSELFTEST apt_bench FAIL install: {}", e.message());
+            return;
+        }
+    }
+
+    // W1 decision evidence: what the temp-file (spool) alternative would cost on
+    // this exact filesystem. 8 MiB is enough to measure sequential throughput and
+    // small enough that it cannot exhaust the 64 MiB disk after the install.
+    if let Some((write_ms, read_ms)) = bench_spool_probe(8 * 1024 * 1024) {
+        let per_mib = |ms: u64| -> u64 { (ms.saturating_mul(1024) / 8192) as u64 };
+        crate::info!(
+            "LXSELFTEST apt_bench spool probe_bytes=8388608 write_ms={} read_ms={} \
+             write_ms_per_mib={} read_ms_per_mib={}",
+            write_ms,
+            read_ms,
+            per_mib(write_ms),
+            per_mib(read_ms)
+        );
+    } else {
+        crate::warn!("LXSELFTEST apt_bench spool probe skipped (no space/VFS refusal)");
+    }
+
+    // Correctness: the last package to write `file-0000` is `bench-large`
+    // (12 MiB / 128 files = 98304 bytes), whose payload starts with the
+    // benchmark pattern. A zero-filled or truncated file would fail here, so a
+    // PASS does not just mean "the install returned Ok".
+    const BENCH_FILE: &str = "/mnt/usr/share/bench/file-0000";
+    const BENCH_PREFIX: &[u8] = b"pagh-apt-benchma";
+    match crate::vfs::lookup_path(BENCH_FILE) {
+        Ok(node) => {
+            let file_size = node.size();
+            let mut head = [0u8; 16];
+            let read = node.read(0, &mut head).unwrap_or(0);
+            if read != head.len() || head != BENCH_PREFIX {
+                crate::error!(
+                    "LXSELFTEST apt_bench FAIL payload head read={} bytes={:?}",
+                    read,
+                    head
+                );
+                return;
+            }
+            crate::info!(
+                "LXSELFTEST apt_bench payload {} size={} head=ok",
+                BENCH_FILE,
+                file_size
+            );
+            let (_, used_after, _) = crate::memory::heap::stats();
+            crate::info!(
+                "LXSELFTEST apt_bench PASS (2 update rounds, install, payload verified; \
+                 heap used {} KiB after)",
+                used_after / 1024
+            );
+        }
+        Err(e) => {
+            crate::error!(
+                "LXSELFTEST apt_bench FAIL payload missing {}: {:?}",
+                BENCH_FILE,
+                e
+            );
+        }
+    }
+}
+
 // ───────────────────────── Part B: bigindex parse-crash repro ─────────────────────────
 
 /// DIAGNOSTIC (Part B): reproduce the `apt update` parse-stage crash (#14 PF,
@@ -2481,9 +2710,11 @@ fn check_out_writable() {
         fail(name, "scratch map failed");
         return;
     }
-    // Write the input mask while the page is still writable (the kernel stores
-    // through the same PTE, so this must happen before the RO switch).
+    // Write the input mask and a guest path while the page is still writable
+    // (the kernel stores through the same PTE, so this must happen before the
+    // RO switch).
     scratch_write_at(0, &(1u64 << (10 - 1)).to_le_bytes());
+    scratch_write_at(64, b"/mnt\0");
     // Drop WRITABLE but keep the page present and USER_ACCESSIBLE.
     let ro = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
     if vmm::set_user_leaf_flags(SCRATCH_VA, ro).is_err() {
@@ -2505,6 +2736,12 @@ fn check_out_writable() {
             match misc::sys_uname(SCRATCH_VA) {
                 Err(Errno::EFAULT) => {}
                 _ => return Err("uname(RO buffer) did not return EFAULT"),
+            }
+            // `stat` (4) copies a 144-byte record out; the writability-aware
+            // choke point must reject the RO page, not fault in ring 0.
+            match io_sys::sys_stat(SCRATCH_VA + 64, SCRATCH_VA) {
+                Err(Errno::EFAULT) => {}
+                _ => return Err("stat(RO statbuf) did not return EFAULT"),
             }
             // A readable RO page is still a valid INPUT: SIG_BLOCK with one bit
             // set (SIGUSR1 = bit 10) must succeed and actually update the mask.
@@ -4271,6 +4508,60 @@ fn check_links() {
                 if u64_at(STAT_OFF + 16) != 2 {
                     return Err("a hard-linked file must report st_nlink 2");
                 }
+            }
+
+            // ── stat(2) nr 4: the old number musl std still calls ───────
+            // Runtime `Command::spawn` and `Path::exists()` in static musl
+            // binaries reach this handler, not `newfstatat`; pin file/dir/
+            // symlink-follow semantics and the error set here.
+            scratch_write_at(PATH_OFF, b"/mnt/lx_target\0");
+            io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                .map_err(|_| "stat(file) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFREG {
+                return Err("stat(file) must report S_IFREG");
+            }
+            if u64_at(STAT_OFF + 48) as usize != target_payload.len() {
+                return Err("stat(file).st_size must be the file size");
+            }
+            if u64_at(STAT_OFF + 8) != target_ino {
+                return Err("stat(file) must report the target inode");
+            }
+            scratch_write_at(PATH_OFF, b"/mnt\0");
+            io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                .map_err(|_| "stat(dir) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFDIR {
+                return Err("stat(dir) must report S_IFDIR");
+            }
+            // `stat` (unlike `lstat`/`newfstatat(NOFOLLOW)`) follows the link.
+            scratch_write_at(PATH_OFF, b"/mnt/lx_abs\0");
+            io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                .map_err(|_| "stat(symlink) failed")?;
+            if u32_at(STAT_OFF + 24) & S_IFMT != S_IFREG {
+                return Err("stat(symlink) must follow to S_IFREG");
+            }
+            if u64_at(STAT_OFF + 48) as usize != target_payload.len() {
+                return Err("stat(symlink).st_size must be the target size");
+            }
+            // Absent path, non-directory component and both pointer forms are
+            // rejected before any VFS lookup / store.
+            scratch_write_at(PATH_OFF, b"/mnt/lx_absent\0");
+            if io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                != Err(Errno::ENOENT)
+            {
+                return Err("stat(absent) must be ENOENT");
+            }
+            scratch_write_at(PATH_OFF, b"/mnt/lx_target/child\0");
+            if io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, SCRATCH_VA + STAT_OFF as u64)
+                != Err(Errno::ENOTDIR)
+            {
+                return Err("stat(file/child) must be ENOTDIR");
+            }
+            scratch_write_at(PATH_OFF, b"/mnt/lx_target\0");
+            if io_sys::sys_stat(SCRATCH_VA + PATH_OFF as u64, 0) != Err(Errno::EFAULT) {
+                return Err("stat(NULL statbuf) must be EFAULT");
+            }
+            if io_sys::sys_stat(0, SCRATCH_VA + STAT_OFF as u64) != Err(Errno::EFAULT) {
+                return Err("stat(NULL path) must be EFAULT");
             }
 
             // ── dangling link ────────────────────────────────────────────

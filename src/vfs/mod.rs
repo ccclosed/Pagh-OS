@@ -1,6 +1,8 @@
 // vfs/mod.rs — виртуальная файловая система: трейт VfsNode, /dev/null, /dev/serial
 // 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
+/// Символьные устройства варианта B: `/dev/fb0` и `/dev/input/event0`.
+pub mod desktop_dev;
 pub mod elf;
 /// Чистый `core`-only классификатор ELF + выбор bias для static-PIE
 /// (host-тестируемо, R11.6). Отделён от `elf`, чтобы не тянуть зависимости ядра и
@@ -10,6 +12,8 @@ pub mod elf_classify;
 /// стек `..`, относительные/абсолютные цели ссылок, бюджет `SYMLOOP_MAX`.
 /// Адаптер ниже подаёт ему хендлы `Arc<dyn VfsNode>`.
 pub mod link_walk;
+/// `memfd_create`: анонимный файл с общими страницами для `mmap(MAP_SHARED)`.
+pub mod memfd;
 /// Синтетический `/proc`: узлы, ленивый рендер, per-pid и per-thread view.
 pub mod procfs;
 /// Чистый (`core`+`alloc`) рендеринг текста + таблица путей/inode для
@@ -28,12 +32,24 @@ use alloc::vec::Vec;
 
 pub type VfsResult<T> = Result<T, VfsError>;
 
+/// Бит sticky (`S_ISVTX`) в `VfsNode::mode` — тот же бит, что у Linux.
+///
+/// VFS его только *хранит* (например, `/tmp` — `0o1777`); решение о том, кому
+/// разрешено удалить запись в sticky-каталоге, принимает syscall-слой через
+/// `cred::Creds::may_delete_child`. Никакой проверки идентичности внутри VFS
+/// нет — инвариант `AGENTS.md` §11.
+pub const S_ISVTX: u32 = 0o1000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsError {
     NotFound,
     NotSupported,
     InvalidArgument,
     IoError,
+    /// Нет места на устройстве (`ENOSPC`): `/dev/full` отвергает любую запись,
+    /// как Linux; файловые системы, которым не хватило блоков, пока сообщают
+    /// `IoError` (историческое поведение ext2).
+    NoSpace,
     AlreadyExists,
 }
 
@@ -195,6 +211,68 @@ pub trait VfsNode: Send + Sync {
     /// Сбрасывает буферизованное состояние на стабильный носитель. По умолчанию
     /// no-op.
     fn sync(&self) {}
+
+    // ── символьные устройства варианта B (desktop) ─────────────────────────
+    //
+    // Трейт описывает и обычные файлы, и устройства, поэтому device-specific
+    // ответы — это дефолтные `None`/`false`: ext2/ramfs/proc о них не знают, а
+    // syscall-слой (open/mmap/ioctl/read/poll) ветвится по ним. Сами узлы живут
+    // в [`desktop_dev`]; здесь только контракт, чтобы `VfsNode` оставался
+    // единственной точкой, через которую syscall-слой видит открытый объект.
+
+    /// Геометрия Limine-фреймбуфера, если узел — `/dev/fb0`.
+    fn fb_info(&self) -> Option<crate::drivers::framebuffer::FbInfo> {
+        None
+    }
+
+    /// Является ли узел `/dev/fb0` (даже если фреймбуфер не поднялся —
+    /// `open(2)` должен вернуть `ENODEV`, а не открыть обычный «файл»).
+    fn is_fbdev(&self) -> bool {
+        false
+    }
+
+    /// Является ли узел `/dev/input/event0` (read/poll идут через очередь
+    /// [`crate::drivers::evdev`], а не через байтовое смещение файла).
+    fn is_evdev(&self) -> bool {
+        false
+    }
+
+    /// Кадр страницы `index` файла для `mmap(MAP_SHARED)`, либо `None`, если
+    /// узел не поддерживает общие страницы (тогда `MAP_SHARED` — `EINVAL`).
+    ///
+    /// Возвращённый кадр пинится самим файлом; вызывающий обязан добавить
+    /// ссылку отображения (`pmm::cow_ref`) и пометить лист `SHARED_BIT`.
+    fn shared_page(&self, _index: u64) -> Option<u64> {
+        None
+    }
+
+    /// Является ли узел `memfd` (единственный файловый тип с общими
+    /// страницами). `MAP_SHARED` на обычном файле отвергается, а не
+    /// превращается в приватную копию.
+    fn is_memfd(&self) -> bool {
+        false
+    }
+
+    /// Является ли узел `/dev/vtconsole0` (read-only shared VT surface).
+    fn is_vtconsole(&self) -> bool {
+        false
+    }
+
+    /// Геометрия shared VT surface; `None` — поверхность не поднялась
+    /// (open вернёт `ENODEV`).
+    fn vtconsole_info(&self) -> Option<crate::drivers::vtsurface::VtConsoleInfo> {
+        None
+    }
+
+    /// Физический кадр страницы shared VT surface для read-only `mmap`.
+    fn vtconsole_page(&self, _index: u64) -> Option<u64> {
+        None
+    }
+
+    /// Является ли узел `/dev/vtinput` (write-only приём VT-байтов).
+    fn is_vtinput(&self) -> bool {
+        false
+    }
 }
 
 // ─── /dev/null ────────────────────────────────────────────────────────────
@@ -215,6 +293,68 @@ impl VfsNode for NullDevice {
 
     fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
         Ok(buf.len())
+    }
+
+    /// `/dev/null` — 0666: это не ресурс, а сток; его доступность не должна
+    /// зависеть от идентичности (иначе редирект `2>/dev/null` ломается у
+    /// непривилегированного процесса).
+    fn mode(&self) -> u32 {
+        0o666
+    }
+}
+
+// ─── /dev/zero и /dev/full ─────────────────────────────────────────────────
+
+/// `/dev/zero`: чтение даёт нули, запись отбрасывается. Linux-совместимый узел
+/// для `mmap`-паддинга/POSIX-программ; 0666, как `/dev/null`.
+struct ZeroDevice;
+
+impl VfsNode for ZeroDevice {
+    fn name(&self) -> &str {
+        "zero"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        buf.fill(0);
+        Ok(buf.len())
+    }
+
+    fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        Ok(buf.len())
+    }
+
+    fn mode(&self) -> u32 {
+        0o666
+    }
+}
+
+/// `/dev/full`: чтение даёт нули, запись всегда `ENOSPC`. Linux-тест-узел для
+/// обработки ошибок записи; 0666, потому что отказ — часть контракта узла, а не
+/// вопрос прав.
+struct FullDevice;
+
+impl VfsNode for FullDevice {
+    fn name(&self) -> &str {
+        "full"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+
+    fn read(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        buf.fill(0);
+        Ok(buf.len())
+    }
+
+    fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
+        Err(VfsError::NoSpace)
+    }
+
+    fn mode(&self) -> u32 {
+        0o666
     }
 }
 
@@ -365,6 +505,33 @@ impl VfsNode for MountNode {
     fn sync(&self) {
         self.inner.sync()
     }
+    fn fb_info(&self) -> Option<crate::drivers::framebuffer::FbInfo> {
+        self.inner.fb_info()
+    }
+    fn is_fbdev(&self) -> bool {
+        self.inner.is_fbdev()
+    }
+    fn is_evdev(&self) -> bool {
+        self.inner.is_evdev()
+    }
+    fn shared_page(&self, index: u64) -> Option<u64> {
+        self.inner.shared_page(index)
+    }
+    fn is_memfd(&self) -> bool {
+        self.inner.is_memfd()
+    }
+    fn is_vtconsole(&self) -> bool {
+        self.inner.is_vtconsole()
+    }
+    fn vtconsole_info(&self) -> Option<crate::drivers::vtsurface::VtConsoleInfo> {
+        self.inner.vtconsole_info()
+    }
+    fn vtconsole_page(&self, index: u64) -> Option<u64> {
+        self.inner.vtconsole_page(index)
+    }
+    fn is_vtinput(&self) -> bool {
+        self.inner.is_vtinput()
+    }
 }
 
 // ─── корневой каталог ───────────────────────────────────────────────────────
@@ -439,14 +606,41 @@ pub fn init() {
     crate::debug!("Mounting /dev...");
     let null = Arc::new(NullDevice) as Arc<dyn VfsNode>;
     crate::debug!("/dev/null — ready");
+    let zero = Arc::new(ZeroDevice) as Arc<dyn VfsNode>;
+    crate::debug!("/dev/zero — ready");
+    let full = Arc::new(FullDevice) as Arc<dyn VfsNode>;
+    crate::debug!("/dev/full — ready");
     let serial = Arc::new(SerialDevice) as Arc<dyn VfsNode>;
     crate::debug!("/dev/serial — ready");
+    // Устройства desktop-варианта B. Узлы создаются всегда: если фреймбуфера
+    // нет (serial-only boot), open(/dev/fb0) сообщит ENODEV, а не ENOENT — так
+    // композитор отличает «железа нет» от «путь не смонтирован».
+    let fb0 = desktop_dev::fb0();
+    crate::debug!("/dev/fb0 — ready");
+    let input = desktop_dev::input_dir();
+    crate::debug!("/dev/input/event0 — ready");
+    let vtconsole = desktop_dev::vtconsole0();
+    crate::debug!("/dev/vtconsole0 — ready");
+    let vtinput = desktop_dev::vtinput();
+    crate::debug!("/dev/vtinput — ready");
     let dev = Arc::new(DevDirectory {
-        children: vec![Arc::clone(&null), Arc::clone(&serial)],
+        children: vec![
+            Arc::clone(&null),
+            Arc::clone(&zero),
+            Arc::clone(&full),
+            Arc::clone(&serial),
+            Arc::clone(&fb0),
+            Arc::clone(&input),
+            Arc::clone(&vtconsole),
+            Arc::clone(&vtinput),
+        ],
     }) as Arc<dyn VfsNode>;
     // Записываемый in-memory /tmp: Linux-userspace считает, что он есть, —
     // nvim в vim_mktempdir делает mkdir("/tmp/nvim.XXXXXX").
-    let tmp = Arc::new(ramfs::RamDir::new("tmp")) as Arc<dyn VfsNode>;
+    // 1777 + sticky: POSIX-контракт общего временного каталога. Без sticky
+    // любой мог бы удалять чужие файлы, а без `w` для other не-root вообще не
+    // смог бы создавать свои (прежние 0755).
+    let tmp = Arc::new(ramfs::RamDir::new_with_mode("tmp", 0o1777)) as Arc<dyn VfsNode>;
     crate::debug!("/tmp (ramfs) - ready");
     let root = Arc::new(RootDirectory {
         children: Spinlock::new(vec![Arc::clone(&dev), tmp]),

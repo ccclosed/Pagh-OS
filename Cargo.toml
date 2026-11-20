@@ -1,6 +1,6 @@
 [package]
 name = "pagh"
-version = "2.23.0"
+version = "2.24.0"
 edition = "2021"
 # SPDX identifier for the MIT license in `LICENSE` (Copyright (c) 2026 ccclosed).
 # Declared here as well as in the file: packaging tools, grant paperwork and
@@ -63,6 +63,18 @@ lx_bigindex = []
 # tight single-threaded loop with NO concurrent socket/NET work — isolating the
 # parse/heap path from the net/scheduler interaction. OFF by default.
 lx_bigindex_inram = []
+
+# In-guest apt performance benchmark (apt-fast task: streaming .deb, once-per-
+# transaction sync, phase timings). OFF by default and SEPARATE from the other
+# harnesses: when set, `boot::kernel_main` spawns `selftest_lx::run_apt_bench`,
+# which points apt at the LOCAL signed benchmark repo on the QEMU host gateway
+# (`tools/mini_repo.py bench OUT --serve 8000`) and drives two `apt update`
+# rounds plus one multi-package `apt install`, printing the `apt: timings …`
+# phase lines and an `LXSELFTEST apt_bench PASS` verdict. It is also the only
+# added anchor for the deterministic TEST-ONLY signing key (like the other local
+# harnesses), never for a production build. Build with
+# `cargo build --release --features lx_apt_bench`.
+lx_apt_bench = []
 
 # Large-stream HTTPS regression (issue #19). OFF by default and SEPARATE from the
 # other harnesses: when set, `boot::kernel_main` spawns

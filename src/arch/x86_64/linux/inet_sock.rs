@@ -7,7 +7,7 @@
 //! опроса сети двигает стек.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use super::errno::Errno;
 use crate::net::{self, IpEndpoint};
@@ -19,6 +19,7 @@ const AF_INET6: u64 = 10;
 
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
+const SOCK_RAW: u64 = 3;
 const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = 0o_4000;
 const SOCK_CLOEXEC: u64 = 0o_2000000;
@@ -36,16 +37,33 @@ pub struct InetTcp {
     pub so_error: AtomicU32,
     pub connected: AtomicBool,
     pub eof: AtomicBool,
+    /// `shutdown(SHUT_RD)` (nr 48): приём закрыт, последующие `recv` → `Ok(0)`.
+    /// Флаг на сокете, а не на fd: `dup`-дубликаты видят то же самое.
+    pub read_shut: AtomicBool,
+    /// `shutdown(SHUT_WR)` (nr 48): передача закрыта, FIN уже заказан, а
+    /// собственная запись отвечает `EPIPE` (`EPIPE`, не `ENOTCONN`: соединение
+    /// ещё принимает).
+    pub write_shut: AtomicBool,
+    /// Порт, зарезервированный `bind(2)` (`0` — сокет не привязан). Слушатель
+    /// создаётся уже в `bind`, поэтому порт занят до `listen(2)`, как в Linux.
+    pub bound_port: AtomicU32,
+    /// `listen(2)` был вызван: сокет принимает соединения.
+    pub listening: AtomicBool,
 }
 
 /// Один AF_INET datagram-сокет, привязанный к эфемерному локальному порту.
 pub struct InetUdp {
-    pub handle: net::SocketHandle,
+    /// Текущий UDP-хэндл: `bind(2)` перепривязывает сокет на другой порт,
+    /// закрывая старый слот (поэтому это атомарное значение, а не `Copy`-поле,
+    /// которое пришлось бы менять через `Spinlock` на пути `recvfrom`).
+    pub handle: AtomicUsize,
     pub nonblocking: AtomicBool,
     /// Назначение по умолчанию, запомненное connect(2): последующие
     /// write(2)/send(2) без адреса идут сюда (именно так резолвер glibc шлёт
     /// запросы через подключённый UDP-сокет).
     pub peer: crate::sync::spinlock::Spinlock<Option<IpEndpoint>>,
+    /// `bind(2)` уже вызван; повторный — `EINVAL`, как в Linux.
+    pub bound: AtomicBool,
 }
 
 /// Разобрать `sockaddr_in` ИЛИ `sockaddr_in6` в [`IpEndpoint`].
@@ -110,6 +128,15 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
         return Err(Errno::EAFNOSUPPORT);
     }
     let base = ty & SOCK_TYPE_MASK;
+    if base == SOCK_RAW {
+        // Пакетный уровень (raw IP/AF_PACKET) не реализован. Гейт — тот же,
+        // что в Linux (`CAP_NET_RAW`): непривилегированному процессу `EPERM`,
+        // root'у — честный `EOPNOTSUPP`, а не выдуманный сокет.
+        if !compat::current_creds().may_use_raw_socket() {
+            return Err(Errno::EPERM);
+        }
+        return Err(Errno::EOPNOTSUPP);
+    }
     if base != SOCK_STREAM && base != SOCK_DGRAM {
         return Err(Errno::EINVAL);
     }
@@ -124,6 +151,10 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
                 so_error: AtomicU32::new(0),
                 connected: AtomicBool::new(false),
                 eof: AtomicBool::new(false),
+                read_shut: AtomicBool::new(false),
+                write_shut: AtomicBool::new(false),
+                bound_port: AtomicU32::new(0),
+                listening: AtomicBool::new(false),
             });
             let fd = cs.fds.alloc_with_flags(
                 OpenObject::InetTcp(sock),
@@ -137,9 +168,10 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
         _ => {
             let handle = net::udp_open().map_err(|_| Errno::ENOMEM)?;
             let sock = Arc::new(InetUdp {
-                handle,
+                handle: AtomicUsize::new(handle),
                 nonblocking: AtomicBool::new(nonblocking),
                 peer: crate::sync::spinlock::Spinlock::new(None),
+                bound: AtomicBool::new(false),
             });
             let fd = cs.fds.alloc_with_flags(
                 OpenObject::InetUdp(sock),
@@ -152,6 +184,105 @@ pub fn sys_socket_in(domain: u64, ty: u64) -> Result<u64, Errno> {
         }
     })
     .unwrap_or(Err(Errno::EBADF))
+}
+
+/// Отказ стека в errno `bind(2)`/`listen(2)`.
+fn bind_errno(e: net::BindError) -> Errno {
+    match e {
+        net::BindError::AddrInUse => Errno::EADDRINUSE,
+        net::BindError::NoDevice => Errno::ENETDOWN,
+    }
+}
+
+/// Достать объект AF_INET-сокета по fd (ровно один из двух вариантов).
+fn inet_object(fd: u64) -> (Option<Arc<InetTcp>>, Option<Arc<InetUdp>>) {
+    compat::with_current_compat(|cs| match cs.fds.get(fd as u32) {
+        Some(OpenObject::InetTcp(t)) => (Some(Arc::clone(t)), None),
+        Some(OpenObject::InetUdp(u)) => (None, Some(Arc::clone(u))),
+        _ => (None, None),
+    })
+    .unwrap_or((None, None))
+}
+
+/// `bind` (49) на AF_INET/INET6-сокете.
+///
+/// Порядок как в Linux: разобрать `sockaddr`, затем проверить право на порт.
+/// Порт `< 1024` требует `CAP_NET_BIND_SERVICE` — в этой модели `euid == 0`
+/// ([`super::cred::Creds::may_bind_port`]); иначе `EACCES` (именно так Linux
+/// отвечает непривилегированному процессу). Порт `0` — эфемерный, гейта нет.
+///
+/// Локальный адрес: у стека один интерфейс, поэтому принимается только
+/// wildcard (`0.0.0.0`/`::`); явный адрес — `EADDRNOTAVAIL`, как у `bind(2)` на
+/// адрес, которого на машине нет.
+///
+/// Порт резервируется здесь же (у TCP — созданием слушателя, у UDP — сменой
+/// порта), поэтому второй `bind` того же порта получает `EADDRINUSE`, а не
+/// тихую перезапись, и непривилегированный процесс не может занять порт,
+/// который уже держит root.
+pub fn sys_bind_inet(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
+    let ep = parse_sockaddr_ep(addr, len)?;
+    if !compat::current_creds().may_bind_port(ep.port) {
+        return Err(Errno::EACCES);
+    }
+    let wildcard = match ep.addr {
+        net::IpAddr::V4(a) => a == net::Ipv4Addr::UNSPECIFIED,
+        net::IpAddr::V6(a) => a == net::Ipv6Addr::UNSPECIFIED,
+    };
+    if !wildcard {
+        return Err(Errno::EADDRNOTAVAIL);
+    }
+    let (tcp, udp) = inet_object(fd);
+    if let Some(sock) = tcp {
+        // Уже привязан или уже подключён — `bind(2)` не перепривязывает (EINVAL).
+        if sock.bound_port.load(Ordering::Relaxed) != 0 || sock.handle.lock().is_some() {
+            return Err(Errno::EINVAL);
+        }
+        let (handle, port) = net::tcp_listen(ep.port).map_err(bind_errno)?;
+        sock.bound_port.store(port as u32, Ordering::Relaxed);
+        *sock.handle.lock() = Some(handle);
+        return Ok(0);
+    }
+    if let Some(sock) = udp {
+        if sock.bound.load(Ordering::Relaxed) {
+            return Err(Errno::EINVAL);
+        }
+        let old = sock.handle.load(Ordering::Relaxed);
+        let handle = net::udp_bind(old, ep.port).map_err(bind_errno)?;
+        sock.handle.store(handle, Ordering::Relaxed);
+        sock.bound.store(true, Ordering::Relaxed);
+        return Ok(0);
+    }
+    Err(Errno::ENOTSOCK)
+}
+
+/// `listen` (50) на AF_INET TCP-сокете.
+///
+/// Linux: `listen(2)` на непривязанном сокете неявно выбирает эфемерный порт, а
+/// повторный вызов идемпотентен. `backlog` не моделируется — очередь
+/// полуоткрытых соединений ограничена стеком (`TcpTable::half_open_for`), и
+/// этот факт назван, а не подразумевается.
+///
+/// У UDP нет состояний соединения: `listen(2)` для него — `EOPNOTSUPP`, как в
+/// Linux.
+pub fn sys_listen_inet(fd: u64, _backlog: u64) -> Result<u64, Errno> {
+    let (tcp, udp) = inet_object(fd);
+    let Some(sock) = tcp else {
+        return if udp.is_some() {
+            Err(Errno::EOPNOTSUPP)
+        } else {
+            Err(Errno::ENOTSOCK)
+        };
+    };
+    if sock.listening.load(Ordering::Relaxed) {
+        return Ok(0);
+    }
+    if sock.bound_port.load(Ordering::Relaxed) == 0 {
+        let (handle, port) = net::tcp_listen(0).map_err(bind_errno)?;
+        sock.bound_port.store(port as u32, Ordering::Relaxed);
+        *sock.handle.lock() = Some(handle);
+    }
+    sock.listening.store(true, Ordering::Relaxed);
+    Ok(0)
 }
 
 /// `connect` на AF_INET TCP fd.
@@ -215,15 +346,31 @@ pub fn sys_connect_tcp(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
 }
 
 /// `send`/`sendto`/`write` на AF_INET TCP fd.
+///
+/// `shutdown(SHUT_WR)` (nr 48) закрывает передачу раньше `close`, поэтому
+/// запись после него — `EPIPE`; закрытие самого fd из соседнего потока
+/// пробуждает ожидание `EBADF` (та же проверка владения, что у [`tcp_read`]).
 pub fn tcp_write(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     let sock = tcp_sock(fd)?;
     if !sock.connected.load(Ordering::Relaxed) {
         return Err(Errno::ENOTCONN);
     }
-    let handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
     let nb = sock.nonblocking.load(Ordering::Relaxed);
     let mut sent_all: usize = 0;
     loop {
+        // Половина, закрытая `shutdown(SHUT_WR)`, больше не принимает байты.
+        // Повторная проверка в цикле нужна, потому что соседний поток может
+        // позвать `shutdown` по этому же сокету во время ожидания.
+        if sock.write_shut.load(Ordering::Relaxed) {
+            return Err(Errno::EPIPE);
+        }
+        // `close` забрал сетевой handle: соединения больше нет. `None` здесь —
+        // именно `EPIPE`, а не `EBADF`: дескриптор мог остаться (`dup`), но
+        // писать в освобождённый сокет нельзя.
+        let handle = match *sock.handle.lock() {
+            Some(h) => h,
+            None => return Err(Errno::EPIPE),
+        };
         let n = net::tcp_send_chunk(handle, &data[sent_all..]);
         sent_all += n;
         if sent_all >= data.len() {
@@ -240,15 +387,38 @@ pub fn tcp_write(fd: u64, data: &[u8]) -> Result<usize, Errno> {
             return Err(Errno::EPIPE);
         }
         crate::task::scheduler::yield_current();
+        // Тот же вопрос, что у чтения: закрытый из соседнего потока дескриптор
+        // не меняет состояние TCP, поэтому без проверки владения ожидание было
+        // бы вечным (`stuck in syscall ? (nr=1 arg0=0x3 closed)`).
+        if !tcp_socket_owned(&sock) {
+            return if sent_all > 0 {
+                Ok(sent_all)
+            } else {
+                Err(Errno::EBADF)
+            };
+        }
     }
 }
 
 /// `recv`/`read` на AF_INET TCP fd.
 pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
     let sock = tcp_sock(fd)?;
-    let handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
+    let mut handle = sock.handle.lock().ok_or(Errno::ENOTCONN)?;
     let nb = sock.nonblocking.load(Ordering::Relaxed);
     loop {
+        // `shutdown(SHUT_RD)` закрывает приём: `recv` отвечает `0`, как после
+        // EOF пира, хотя FIN от него не приходил.
+        if sock.read_shut.load(Ordering::Relaxed) {
+            // Linux отбрасывает входящие байты после `SHUT_RD`. Здесь они
+            // осушаются при следующем `recv`: иначе очередь приёма заполнилась
+            // бы и окно закрылось, подвесив пира. Названное упрощение —
+            // отбрасывание не асинхронное, а по вызову.
+            if let Some(h) = *sock.handle.lock() {
+                let mut sink = [0u8; 1024];
+                while net::tcp_recv_chunk(h, &mut sink) > 0 {}
+            }
+            return Ok(0);
+        }
         if sock.eof.load(Ordering::Relaxed) {
             return Ok(0);
         }
@@ -264,7 +434,33 @@ pub fn tcp_read(fd: u64, dst: &mut [u8]) -> Result<usize, Errno> {
             return Err(Errno::EAGAIN);
         }
         crate::task::scheduler::yield_current();
+        // Проснувшись, первым делом спрашиваем таблицу fd. Закрытый из
+        // соседнего потока дескриптор EOF на TCP не выставляет (`Arc<InetTcp>`
+        // и сетевой handle живут сами по себе), поэтому без этой проверки
+        // ожидание было бы вечным — watchdog печатал
+        // `stuck in syscall ? (nr=45 arg0=0x3 closed)`. Идентичность сокета
+        // сохраняет ожидание при `dup`: пока хоть один дескриптор ссылается на
+        // этот `Arc`, читать его законно.
+        if !tcp_socket_owned(&sock) {
+            return Err(Errno::EBADF);
+        }
+        // `close` мог забрать handle, пока мы спали; не трогаем освобождённый
+        // сетевой handle. Такой сокет освобождён, то есть это конец потока.
+        handle = match *sock.handle.lock() {
+            Some(h) => h,
+            None => return Ok(0),
+        };
     }
+}
+
+/// Ссылается ли ещё хоть один дескриптор текущего процесса на `sock`.
+///
+/// Зеркало [`crate::task::fd::FdTable::holds_read_end`] для TCP: `dup`-дубликат —
+/// владение, закрытие последнего fd — потеря владения и повод разбудить
+/// блокирующее чтение `EBADF`.
+fn tcp_socket_owned(sock: &Arc<InetTcp>) -> bool {
+    let id = Arc::as_ptr(sock) as usize;
+    compat::with_current_compat(|cs| cs.fds.holds_inet_tcp(id)).unwrap_or(false)
 }
 
 /// `close` на AF_INET TCP fd.
@@ -272,6 +468,28 @@ pub fn tcp_close_fd(fd: u64) {
     if let Ok(sock) = tcp_sock(fd) {
         if let Some(h) = sock.handle.lock().take() {
             net::tcp_close(h);
+        }
+    }
+}
+
+/// Применить `shutdown(2)` (nr 48) к AF_INET TCP-сокету.
+///
+/// `SHUT_WR` заказывает FIN через [`net::tcp_shutdown_wr`] — сокет при этом
+/// остаётся в таблице стека и продолжает ПРИНИМАТЬ, в отличие от
+/// [`tcp_close_fd`], снимающего слот; FIN отправляется один раз, повторный
+/// `shutdown` той же половины идемпотентен. `SHUT_RD` поднимает флаг приёма,
+/// который [`tcp_read`] превращает в `Ok(0)`.
+///
+/// `sock.handle.lock()` берётся на один оператор (копия [`net::SocketHandle`])
+/// и отпускается до `NET`-лока внутри `tcp_shutdown_wr` — порядок «handle →
+/// NET» тот же, что у записи и закрытия.
+pub fn tcp_apply_shutdown(sock: &Arc<InetTcp>, read: bool, write: bool) {
+    if read {
+        sock.read_shut.store(true, Ordering::Relaxed);
+    }
+    if write && !sock.write_shut.swap(true, Ordering::Relaxed) {
+        if let Some(h) = *sock.handle.lock() {
+            net::tcp_shutdown_wr(h);
         }
     }
 }
@@ -296,8 +514,9 @@ pub fn udp_connect_fd(fd: u64, addr: u64, len: u64) -> Result<u64, Errno> {
 pub fn udp_write_fd(fd: u64, data: &[u8]) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let peer = sock.peer.lock().ok_or(Errno::ENOTCONN)?;
+    let handle = sock.handle.load(Ordering::Relaxed);
 
-    net::udp_sendto(sock.handle, data, peer)
+    net::udp_sendto(handle, data, peer)
         .map(|_| data.len())
         .map_err(|_| Errno::EIO)
 }
@@ -318,8 +537,9 @@ fn udp_sock(fd: u64) -> Result<Arc<InetUdp>, Errno> {
 pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize, Errno> {
     let sock = udp_sock(fd)?;
     let ep = parse_sockaddr_ep(addr, len)?;
+    let handle = sock.handle.load(Ordering::Relaxed);
 
-    net::udp_sendto(sock.handle, data, ep)
+    net::udp_sendto(handle, data, ep)
         .map(|_| data.len())
         .map_err(|_| Errno::EIO)
 }
@@ -327,12 +547,15 @@ pub fn udp_sendto_fd(fd: u64, data: &[u8], addr: u64, len: u64) -> Result<usize,
 /// `recvfrom` на AF_INET/INET6 UDP fd; возвращает (байты, эндпоинт-источник).
 pub fn udp_recvfrom_fd(fd: u64, dst: &mut [u8]) -> Result<(usize, IpEndpoint), Errno> {
     let sock = udp_sock(fd)?;
+    // `bind(2)` может заменить хэндл между вызовами; читаем его один раз за
+    // вызов и не держим спинлок через `yield` ниже.
+    let handle = sock.handle.load(Ordering::Relaxed);
     static RECV_LOGGED: AtomicU32 = AtomicU32::new(0);
     if RECV_LOGGED.fetch_or(1 << (fd.min(31)), Ordering::Relaxed) & (1 << (fd.min(31))) == 0 {}
     let deadline_spins: u32 = 5000;
     let mut spins = 0u32;
     loop {
-        if let Some((n, ep)) = net::udp_recvfrom(sock.handle, dst) {
+        if let Some((n, ep)) = net::udp_recvfrom(handle, dst) {
             return Ok((n, ep));
         }
         if sock.nonblocking.load(Ordering::Relaxed) || spins >= deadline_spins {

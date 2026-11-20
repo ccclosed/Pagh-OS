@@ -1,0 +1,38 @@
+[package]
+name = "pagh-files"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Files — файловый менеджер рабочего стола Pagh (клиент Pagh desktop B)"
+
+# Отдельный workspace: см. комментарий в rust-apps/pagh-ui/Cargo.toml.
+[workspace]
+
+[lib]
+name = "pagh_files"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pagh-files"
+path = "src/main.rs"
+
+[dependencies]
+pagh-ui = { path = "../pagh-ui" }
+
+[dev-dependencies]
+# Только для e2e: поднимаем реальный композитор в процессе и подключаем к нему
+# собранный бинарник pagh-files по настоящему AF_UNIX-сокету (PDP/1).
+pagh-desktop = { path = "../pagh-desktop" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true
+
+# pagh-ui — render-крейт (виджеты, блиты, damage): P1 плана frame time.
+# Своя profile.release у pagh-ui не действует, когда он собран зависимостью,
+# поэтому целевой opt-level задаётся здесь.
+[profile.release.package.pagh-ui]
+opt-level = 3

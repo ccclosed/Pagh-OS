@@ -20,6 +20,8 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 |---|---|
 | `mod.rs` | Ядро VFS: трейт `VfsNode`, `VfsError`, `FsStat`, резолв путей (`lookup_path`), монтирование (`mount_at`/`MountNode`), синтетический `/dev` (`NullDevice`, `SerialDevice`, `DevDirectory`), корень (`RootDirectory`), `init()` |
 | `ramfs.rs` | In-memory ФС для `/tmp`; единственная in-memory-ФС с настоящими `create_dir`/`create_file`/`remove` (на диске то же умеет ext2-каталог под `/mnt`) |
+| `memfd.rs` | `memfd_create`-узел: анонимный файл, чьи страницы — кадры PMM в карте `page_index -> phys`. `read`/`write`/`truncate` и `mmap(MAP_SHARED)` видят одни байты; файл держит pin-ссылку кэша, отображения — свои (`SHARED_BIT`), поэтому `munmap`/exit/fork не вырывают страницы из-под живого отображения. Kernel-only |
+| `desktop_dev.rs` | Символьные устройства desktop-варианта B: `/dev/fb0` (`FramebufferDevice`, `root:video 0660`), `/dev/input/event0` (`EventDevice`, `root:input 0660`), `/dev/vtconsole0` (read-only shared VT surface, `root:tty 0660`), `/dev/vtinput` (write-only, `root:input 0660`) + `DeviceDirectory` для `/dev/input`. Реальная работа (ioctl/mmap/read/poll) — в syscall-слое; групповые права — `docs/security/groups.md` |
 | `procfs.rs` | Синтетический `/proc`: узлы `ProcDir`/`ProcFile`, ленивый рендер текста на `size()`/`read()`, источники — PMM/heap/тики/счётчики планировщика/`CompatState`/CPUID. `DirKind::TaskDir(tgid)` листает живые треды группы из `compat::thread_group_pids`, узел `task/<tid>` — это `pid_dir(tid)`. Kernel-only |
 | `procfs_format.rs` | Чистое (`core`+`alloc`) форматирование текстов procfs (включая `/proc/version`, `/proc/filesystems`, `/proc/loadavg`, `/proc/sys/kernel/*`, `fdinfo` и `limits`), таблица путей и inode'ов (`pid_task_dir_ino`) — включается в host-tests (свойства `procfs_*`) |
 | `elf.rs` | Эффектный загрузчик ELF64: `ElfLoader::load` (нативный `ET_EXEC`), `ElfLoader::load_linux` (`ET_EXEC`, static-PIE `ET_DYN` и glibc-dynamic образы — `PT_INTERP` подшивается отдельно через `map_interpreter`), `ElfLoader::map_interpreter`; `ElfProcess` |
@@ -34,6 +36,9 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   `read/write/truncate/readdir/create_dir/create_file/remove/create_symlink/link` →
   `Err(NotSupported)`, `lookup` → `Err(NotFound)`, `fs_stat` → `None`, `size`/`fs_ino` → `0`,
   `is_symlink` → `false`, `read_link` → `None`, `nlink` → `1`, `sync` → no-op.
+  Desktop-устройства добавляют `fb_info()`/`is_fbdev()`/`is_evdev()`/`shared_page()`/
+  `is_memfd()`/`is_vtconsole()`/`vtconsole_info()`/`vtconsole_page()`/`is_vtinput()`
+  (все с дефолтами `None`/`false`; `MountNode` форвардит).
 - `init()`, `mount_at(path, node)`, `lookup_path(path)` (одношаговый, **не** следует за ссылкой),
   `lookup_path_walk(path, follow_final)` (обход с переходом по ссылкам → `link_walk::WalkError`)
   и `lookup_path_walk_checked(path, follow_final, may_search)` — тот же обход с предикатом
@@ -65,7 +70,8 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
   **Ограничение v1: только одноуровневые монтирования** (`"/a/b"` → `InvalidArgument`).
 
 ### Синтетика и ramfs
-- `/dev/null` (read=0, write всасывает), `/dev/serial` (COM1; read — поллинг LSR 0x3FD / DATA 0x3F8,
+- `/dev/null` (read=0, write всасывает, 0666), `/dev/zero` (read — нули, write всасывает, 0666),
+  `/dev/full` (read — нули, write — `ENOSPC`, 0666), `/dev/serial` (COM1; read — поллинг LSR 0x3FD / DATA 0x3F8,
   write через `drivers::serial::write_bytes` — побайтово, без UTF-8-энкода).
 - ramfs: `RamDir` = `Spinlock<BTreeMap<String, Arc<dyn VfsNode>>>`, `RamFile` = `Spinlock<Vec<u8>>`;
   запись за EOF заполняет дыры нулями (`try_reserve` заранее — чтобы огромный offset не абортнул
@@ -78,8 +84,13 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 ### procfs (контракт `docs/procfs.md`)
 - Поверхность: `/proc` + `/proc/self` + `self/{exe,cmdline,status,maps,stat,statm,mounts,cgroup,mountinfo,limits}`
   + `{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}` + read-only
-  `/proc/sys/kernel/{ostype,osrelease,hostname}` + per-pid
+  `/proc/sys/kernel/{ostype,osrelease,hostname}` + `/proc/net/dev` (живые счётчики
+  канала; каталог `net` и файл `dev` — отдельные inode, §15) + per-pid
   `{cmdline,stat,status,maps,cgroup,mountinfo,limits,fd/*,fdinfo/*,task/*}`.
+  `/proc/net/dev` рендерится тем же ленивым проходом, что остальные файлы, из
+  `net::iface_stats()`: имя `eth0`, байты/пакеты RX/TX, драйверские `errs`/`drop`
+  (`usb-rndis`; у e1000 — нули), остальные Linux-колонки — нули. Формат и ширины —
+  в чистом `procfs_format::format_net_dev`.
   `/proc/<pid>/task/` (и `/proc/self/task/`) — per-thread view: по каталогу на каждый
   живой тред группы (`COMPAT_STATES`-запись с `tgid == pid`), сортировка по tid;
   `task/<tgid>/task/<tid>` резолвится в `pid_dir(tid)`, то есть это ТОТ ЖЕ VFS-объект/

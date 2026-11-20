@@ -1,7 +1,7 @@
 // task/process.rs — создание пользовательских процессов.
 
 use crate::arch::x86_64::gdt;
-use crate::arch::x86_64::linux::cred::Access;
+use crate::arch::x86_64::linux::cred::{Access, Creds};
 use crate::arch::x86_64::linux::mem::VmRegionSet;
 use crate::memory::{pmm, vmm};
 use crate::task::compat::{self, CompatState};
@@ -195,49 +195,27 @@ pub fn create_user_process(elf_data: &[u8]) -> Result<u64, &'static str> {
     Ok(pid)
 }
 
-/// Собрать в памяти минимальный статически слинкованный `ET_EXEC` x86_64 ELF,
-/// чья программа выдаёт `SYS_WRITE(fd=1, msg, len)`, затем `SYS_EXIT(0)` через
-/// `int 0x80`.
-///
-/// Всё изображение — один `PT_LOAD` RWX-сегмент, загруженный по виртуальной базе
-/// `0x40_0000` (каноническая нижняя половина, поэтому валидация указателя в
-/// `sys_write` принимает буфер сообщения). Сообщение живёт внутри отображённого
-/// сегмента, то есть `USER_ACCESSIBLE` в пользовательском PML4 и достижимо из
-/// ring 3.
+/// База виртуальных адресов, по которой грузится собранный в памяти тестовый
+/// ELF (нижняя каноническая половина — валидация пользовательских указателей
+/// принимает адреса оттуда).
+const TEST_ELF_VBASE: u64 = 0x40_0000;
+
+/// Файловое смещение (оно же смещение в vaddr) первого байта кода: сразу за
+/// ELF-заголовком и единственным program header'ом.
+const TEST_ELF_CODE_OFF: u64 = 64 + 56; // sizeof(Elf64Header) + sizeof(Elf64ProgramHeader)
+
+/// Собрать в памяти статически слинкованный `ET_EXEC` x86_64 ELF: один
+/// `PT_LOAD` RWX-сегмент по [`TEST_ELF_VBASE`], в начале которого лежит код
+/// `code`, а за ним — данные `data`.
 ///
 /// Байты собираются здесь, а не коммитятся бинарём, чтобы ядру не нужен был
 /// внешний ассемблер/линкер при сборке.
-fn build_test_elf() -> Vec<u8> {
-    const VBASE: u64 = 0x40_0000;
+fn assemble_test_elf(code: &[u8], data: &[u8]) -> Vec<u8> {
     const EHSIZE: usize = 64; // sizeof(Elf64Header)
     const PHSIZE: usize = 56; // sizeof(Elf64ProgramHeader)
-    let code_off = EHSIZE + PHSIZE; // файловое смещение (и смещение vaddr) кода
-
-    let msg: &[u8] = b"Hello from ring3 user process!\n";
-
-    // ── Машинный код, собранный вручную (см. комментарии к байтам) ───────────
-    // Сообщение идёт сразу за кодом, поэтому сначала вычисляем его адрес.
-    const CODE_LEN: usize = 33;
-    let msg_off = code_off + CODE_LEN;
-    let msg_addr = VBASE + msg_off as u64;
-    let len = msg.len() as u32;
-
-    let mut code: Vec<u8> = Vec::with_capacity(CODE_LEN);
-    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1  (SYS_WRITE)
-    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1  (fd = stdout)
-    code.push(0xBE);
-    code.extend_from_slice(&(msg_addr as u32).to_le_bytes()); // mov esi, msg_addr
-    code.push(0xBA);
-    code.extend_from_slice(&len.to_le_bytes()); // mov edx, len
-    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
-    code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2  (SYS_EXIT)
-    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi (код = 0)
-    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
-    code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b (запасной цикл)
-    debug_assert_eq!(code.len(), CODE_LEN);
-
-    let entry = VBASE + code_off as u64;
-    let total_len = (msg_off + msg.len()) as u64;
+    let code_off = TEST_ELF_CODE_OFF as usize;
+    let entry = TEST_ELF_VBASE + code_off as u64;
+    let total_len = (code_off + code.len() + data.len()) as u64;
 
     let mut elf: Vec<u8> = Vec::new();
 
@@ -268,19 +246,67 @@ fn build_test_elf() -> Vec<u8> {
     elf.extend_from_slice(&1u32.to_le_bytes()); // p_type  = PT_LOAD
     elf.extend_from_slice(&7u32.to_le_bytes()); // p_flags = PF_R|PF_W|PF_X
     elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset (segment starts at file 0)
-    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_vaddr
-    elf.extend_from_slice(&VBASE.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&TEST_ELF_VBASE.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&TEST_ELF_VBASE.to_le_bytes()); // p_paddr
     elf.extend_from_slice(&total_len.to_le_bytes()); // p_filesz
     elf.extend_from_slice(&total_len.to_le_bytes()); // p_memsz
     elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
     debug_assert_eq!(elf.len(), EHSIZE + PHSIZE);
 
-    // ── Код + сообщение ──────────────────────────────────────────────────────
-    elf.extend_from_slice(&code);
-    elf.extend_from_slice(msg);
+    // ── Код + данные ────────────────────────────────────────────────────────
+    elf.extend_from_slice(code);
+    elf.extend_from_slice(data);
     debug_assert_eq!(elf.len() as u64, total_len);
 
     elf
+}
+
+/// Собрать в памяти минимальный статически слинкованный `ET_EXEC` x86_64 ELF,
+/// чья программа выдаёт `SYS_WRITE(fd=1, msg, len)`, затем `SYS_EXIT(0)` через
+/// `int 0x80`.
+///
+/// Сообщение живёт внутри отображённого сегмента, то есть `USER_ACCESSIBLE` в
+/// пользовательском PML4 и достижимо из ring 3.
+fn build_test_elf() -> Vec<u8> {
+    let msg: &[u8] = b"Hello from ring3 user process!\n";
+
+    // ── Машинный код, собранный вручную (см. комментарии к байтам) ───────────
+    // Сообщение идёт сразу за кодом, поэтому сначала вычисляем его адрес.
+    const CODE_LEN: usize = 33;
+    let msg_addr = TEST_ELF_VBASE + TEST_ELF_CODE_OFF + CODE_LEN as u64;
+    let len = msg.len() as u32;
+
+    let mut code: Vec<u8> = Vec::with_capacity(CODE_LEN);
+    code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1  (SYS_WRITE)
+    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1  (fd = stdout)
+    code.push(0xBE);
+    code.extend_from_slice(&(msg_addr as u32).to_le_bytes()); // mov esi, msg_addr
+    code.push(0xBA);
+    code.extend_from_slice(&len.to_le_bytes()); // mov edx, len
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2  (SYS_EXIT)
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi (код = 0)
+    code.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+    code.extend_from_slice(&[0xEB, 0xFE]); // 1: jmp 1b (запасной цикл)
+    debug_assert_eq!(code.len(), CODE_LEN);
+
+    assemble_test_elf(&code, msg)
+}
+
+/// Собрать ELF нативной ring-3 задачи, которая пишет в НЕотображённую
+/// пользовательскую страницу `0x1337_0000` и потому гарантированно получает
+/// #PF (`P=false, W=true, U=true`).
+///
+/// Нужен in-QEMU регрессии `test::ring3_fault_tests`: задача создаётся нативно,
+/// БЕЗ `CompatState`, поэтому до фикса MVP S4b обработчик #PF уводил такой
+/// отказ в `halt()` и машина умирала.
+fn build_faulting_test_elf() -> Vec<u8> {
+    let code: &[u8] = &[
+        0xB8, 0x00, 0x00, 0x37, 0x13, // mov eax, 0x13370000
+        0xC7, 0x00, 0x41, 0x00, 0x00, 0x00, // mov dword [rax], 0x41
+        0xEB, 0xFE, // 1: jmp 1b (не исполняется: запись падает)
+    ];
+    assemble_test_elf(code, &[])
 }
 
 /// Собрать встроенный тестовый ELF и запустить его как ring-3 пользовательский
@@ -292,6 +318,16 @@ fn build_test_elf() -> Vec<u8> {
 pub fn spawn_test_user_process() -> Result<u64, &'static str> {
     let elf = build_test_elf();
     create_user_process(&elf)
+}
+
+/// Запустить нативную ring-3 задачу, которая сразу падает на записи в
+/// неотображённую пользовательскую страницу (регрессия MVP S4b: ring-3 отказ
+/// убивает задачу, а ядро выживает).
+///
+/// Как и [`spawn_test_user_process`], вызывать с выключенными прерываниями:
+/// создание процесса временно ставит пользовательский CR3.
+pub fn spawn_faulting_test_user_process() -> Result<u64, &'static str> {
+    create_user_process(&build_faulting_test_elf())
 }
 
 /// Режимы отказа [`run_linux_binary`] (R7.3, R7.4, R7.5).
@@ -536,6 +572,62 @@ fn map_linux_images(data: &[u8], interpreter: Option<&[u8]>) -> Result<LoadedLin
 /// чужое адресное пространство. Чтение ext2 на шаге 2 выполняется *до* заслона,
 /// поэтому может блокироваться на дисковом I/O.
 pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u64, RunError> {
+    run_linux_binary_as(Creds::ROOT, path, argv, envp)
+}
+
+/// [`run_linux_binary`] с явной идентичностью запускаемого процесса.
+///
+/// Используется shell-командой `lxrun`, когда сессия сменилась через `su`:
+/// ребёнок стартует с этими креденшелами (включая дополнительные группы), и все
+/// проверки прав слоя syscall дальше применяются к нему обычным путём.
+///
+/// Для **не-root** сессии образ проверяется на execute+read по тем же битам,
+/// что и `execve` (root-сессия сохраняет историческое поведение лаунчера,
+/// документированное в `SECURITY.md`: kernel-лаунчеры обходят проверку
+/// сисколлов). Обход пути для не-root сессии проверяет и search-биты
+/// промежуточных каталогов.
+///
+/// Как и `execve(2)`, лаунчер применяет `S_ISUID`/`S_ISGID` цели (см.
+/// [`Creds::exec_setid`]) — иначе бинарь с setuid-битом, запущенный из
+/// непривилегированной сессии, вёл бы себя не как под Linux. Права
+/// проверяются по **исходным** креденшелам, биты применяются после проверки.
+pub fn run_linux_binary_as(
+    mut creds: Creds,
+    path: &str,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Result<u64, RunError> {
+    // Разрешить путь один раз: узел нужен и для проверок не-root сессии, и для
+    // `mode`/`owner` setuid-on-exec. Ошибку разрешения сообщает сам запуск
+    // (ENOENT/ENOEXEC), поэтому для root её здесь не поднимаем.
+    let resolved = resolve_exec_path(path);
+    let node = if creds.is_root() {
+        crate::vfs::lookup_path_walk(&resolved, true).ok()
+    } else {
+        let may_search = |node: &Arc<dyn crate::vfs::VfsNode>| {
+            creds.may(node.mode(), node.owner(), Access::Execute)
+        };
+        let node = crate::vfs::lookup_path_walk_checked(&resolved, true, &may_search)
+            .map_err(|_| RunError::AccessDenied)?;
+        if !creds.may(node.mode(), node.owner(), Access::Read)
+            || !creds.may(node.mode(), node.owner(), Access::Execute)
+        {
+            return Err(RunError::AccessDenied);
+        }
+        Some(node)
+    };
+    if let Some(node) = node {
+        creds = creds.exec_setid(node.mode(), node.owner());
+    }
+    run_linux_binary_inner(creds, path, argv, envp)
+}
+
+fn run_linux_binary_inner(
+    creds: Creds,
+    path: &str,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Result<u64, RunError> {
     // ── 1. Гейт аргументов (R7.5) ────────────────────────────────────────────
     if !arg_gate(argv) {
         return Err(RunError::ArgsTooLarge);
@@ -598,6 +690,10 @@ pub fn run_linux_binary(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<u6
         );
         // Запомнить путь образа для readlink("/proc/self/exe").
         state.exe_path = path.to_string();
+        // Идентичность запускающего: ROOT для kernel-лаунчеров и обычной
+        // сессии shell, креденшелы `su` для `lxrun` из непривилегированной
+        // сессии. Всё остальное (fork/clone/execve) наследует их.
+        state.creds = creds;
         // Состояние procfs: argv, склеенные NUL для /proc/self/cmdline
         // (начальный стек хранит копию, но она живёт в памяти пользователя),
         // загруженные PT_LOAD сегменты для /proc/self/maps и путь интерпретатора.
@@ -863,6 +959,55 @@ pub fn fork_linux_process(
     parent_tid: u64,
     child_tid: u64,
 ) -> Result<(u64, u64), crate::arch::x86_64::linux::errno::Errno> {
+    fork_linux_process_inner(regs, clear_child_tid, parent_tid, child_tid, None, false)
+}
+
+/// `clone(CLONE_VM | CLONE_VFORK)` — форма, которой musl и glibc реализуют
+/// `posix_spawn` (Rust-std `Command::spawn` на static-musl идёт именно сюда).
+///
+/// Ребёнку нужен только пользовательский RSP из `child_stack` и остановка
+/// родителя до его `execve`/выхода; фактическое совместное адресное
+/// пространство vfork (ребёнок исполняется на стеке родителя) здесь заменено
+/// обычным COW-fork:
+///
+///   * это безопасно: ребёнок не может переписать стек родителя, а родитель не
+///     может снять страницы у ребёнка;
+///   * единственное наблюдаемое отличие от Linux — прямой пользователь
+///     `clone(CLONE_VM|CLONE_VFORK)`, пишущий в память до `execve`, не увидит
+///     записей в родителе. `posix_spawn` (единственный реальный потребитель в
+///     этом compat-слое) так не делает: он передаёт результат через pipe, а не
+///     через общую память, и после `execve` адресные пространства всё равно
+///     расходятся.
+///
+/// Родитель ждёт ребёнка в [`crate::task::scheduler::vfork_wait`]; ребёнок
+/// будит его из `execve` (успех) или из reap-пути (выход/убийство), так что
+/// зависания на неудачном exec нет.
+pub fn vfork_linux_process(
+    regs: &crate::arch::x86_64::linux::regs::SavedRegs,
+    child_stack: u64,
+    clear_child_tid: u64,
+    parent_tid: u64,
+    child_tid: u64,
+) -> Result<u64, crate::arch::x86_64::linux::errno::Errno> {
+    let (child, _child_pml4) = fork_linux_process_inner(
+        regs,
+        clear_child_tid,
+        parent_tid,
+        child_tid,
+        Some(child_stack),
+        true,
+    )?;
+    Ok(child)
+}
+
+fn fork_linux_process_inner(
+    regs: &crate::arch::x86_64::linux::regs::SavedRegs,
+    clear_child_tid: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    user_rsp_override: Option<u64>,
+    vfork: bool,
+) -> Result<(u64, u64), crate::arch::x86_64::linux::errno::Errno> {
     use crate::arch::x86_64::linux::errno::Errno;
     crate::arch::cpu::without_interrupts(|| {
         // Проверить выходы TID ДО появления ребёнка, чтобы плохой указатель дал
@@ -892,17 +1037,28 @@ pub fn fork_linux_process(
         let parent_top = crate::memory::layout::kernel_stack_for_pid(parent).2;
         gdt::set_kernel_stack(parent_top);
         crate::arch::x86_64::syscall::set_syscall_kernel_stack(parent_top);
-        // Ребёнок возобновляется на return RIP родителя с user RSP родителя из
-        // per-task слота по +120 над фреймом SavedRegs.
-        let user_rsp = unsafe {
-            ((regs as *const crate::arch::x86_64::linux::regs::SavedRegs as *const u64).add(15))
-                .read()
+        // Ребёнок возобновляется на return RIP родителя. Обычный fork берёт
+        // user RSP родителя из per-task слота по +120 над фреймом SavedRegs;
+        // vfork/posix_spawn передаёт собственный `child_stack` (мусловая
+        // `__clone` строит на нём кадр ребёнка).
+        let user_rsp = match user_rsp_override {
+            Some(rsp) => rsp,
+            None => unsafe {
+                ((regs as *const crate::arch::x86_64::linux::regs::SavedRegs as *const u64).add(15))
+                    .read()
+            },
         };
         let krsp = unsafe { build_clone_frame(child_top, regs, regs.rcx, user_rsp) };
         // Зарегистрировать CompatState ребёнка ДО постановки в очередь, чтобы его
         // первый же syscall уже шёл с полной семантикой Linux.
         if !compat::fork_current_compat(child, clear_child_tid) {
             return Err(Errno::EINVAL);
+        }
+        if vfork {
+            // Зарегистрировать ожидание ДО постановки ребёнка в очередь: иначе
+            // он мог бы exec'нуть/выйти раньше, чем родитель начнёт ждать, и
+            // уведомление потерялось бы (вечный yield-цикл).
+            scheduler::vfork_register(child, parent);
         }
         scheduler::spawn(Tcb::new(child, krsp, child_pml4));
         // SAFETY: оба указателя проверены выше, всё ещё внутри окна с
@@ -919,7 +1075,8 @@ pub fn fork_linux_process(
             }
         }
         crate::info!(
-            "[linux] fork: parent pid={} pml4=0x{:x} -> child pid={} pml4=0x{:x}",
+            "[linux] {}: parent pid={} pml4=0x{:x} -> child pid={} pml4=0x{:x}",
+            if vfork { "vfork" } else { "fork" },
             parent,
             parent_pml4,
             child,

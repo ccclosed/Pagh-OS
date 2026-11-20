@@ -89,6 +89,13 @@ pub fn start() -> ! {
     step_begin(visible, "init_serial");
     init_serial();
     step(visible, "serial");
+    // PAT программируется сразу после serial: это ещё до PMM/VMM и до любого
+    // отображения `/dev/fb0`, поэтому WC-лист не может сослаться на entry 4,
+    // пока там write-back. Лог fallback'а (`fb0: PAT missing, uncached`) тоже
+    // попадает в serial.
+    step_begin(visible, "init_pat");
+    init_pat();
+    step(visible, "pat");
     step_begin(visible, "check_base_revision");
     check_base_revision();
     step(visible, "base revision");
@@ -149,10 +156,36 @@ pub fn start() -> ! {
     kernel_main();
 }
 
+/// Маркер boot identity для E2E-драйвера (`tools/e2e.py`).
+///
+/// Драйвер переписывает этот ровно 28-байтный placeholder внутри своей
+/// **staged**-копии ELF на per-run тег и требует тег обратно на serial — это
+/// доказывает, что гость выполнил именно staged-образ, а не устаревшее ядро,
+/// загруженное с другого устройства. Во всём остальном поведение идентично
+/// любой другой строке стартового лога.
+///
+/// ИНВАРИАНТ: `[BOOTID]` — часть serial-поверхности регрессий (см. `AGENTS.md`
+/// → «Соглашения»): не переименовывать и не переформатировать маркер, не менять
+/// длину placeholder'а (драйвер патчит его на месте).
+pub const BOOT_ID: &str = "PAGH-BOOTID-0000000000000000";
+
 /// Шаг 1: поднять COM1 (основной приёмник логов).
 fn init_serial() {
     drivers::serial::init();
     info!("serial");
+    // Печатается первой, сразу после подъёма UART, чтобы тег уцелел, даже если
+    // поздняя фаза загрузки упадёт.
+    info!("[BOOTID] {}", BOOT_ID);
+}
+
+/// Шаг 1.5: включить write-combining в `IA32_PAT` (MSR 0x277).
+///
+/// До первого `mmap(/dev/fb0)`: лист выбирает кэш-политику битом PAT (bit 7
+/// 4 КиБ PTE) и записью 4 `IA32_PAT`. Если PAT нет, фиксируется fallback —
+/// `mmap` останется на прежней паре `NO_CACHE|WRITE_THROUGH` и залогирует это
+/// один раз (`arch::x86_64::pat::init`).
+fn init_pat() {
+    arch::x86_64::pat::init();
 }
 
 /// Шаг 2: проверить, что Limine дал поддерживаемую базовую ревизию.
@@ -420,12 +453,29 @@ fn init_fs() {
     // занята: ядро не отличит раздел, предназначенный pagh, от просто пустого,
     // а ошибка стоит данных. Меню истекает в неразрушающий вариант по
     // умолчанию, так что загрузка без оператора не меняется.
+    // ИСКЛЮЧЕНИЕ — записанный ВЫБОР монтирования: `boot_menu::run` возвращает
+    // Skip без меню и рисования, поэтому повторная загрузка монтирует свой том
+    // молча, а «first-boot ритуал» с выбором диска остаётся ровно на один раз.
+    // Наличие pagh-тома само по себе меню НЕ скипает: образ, собранный
+    // `tools/mkimage.py`, приезжает с уже готовым томом, и такой скип навсегда
+    // скрывал вопрос от того, кто его ни разу не видел. Маркер выбора
+    // (`fs::mount_choice`) пишется ниже, после успешного монтирования, и только
+    // он означает «уже спросили». Это тот же `Skip`, что и таймаут меню,
+    // поэтому ниже форматируется ровно то же, что и раньше.
     // Классифицировать один раз и передать тот же список меню: то, что видит
     // оператор, должно быть ровно тем, с чем работает boot-путь. Пропущенное
     // меню затем переиспользует его, и ни один раздел не проверяется дважды за
     // загрузку.
     let partitions = drivers::partition::candidates();
     let menu = crate::boot_menu::run(&partitions);
+    // Какое действие записать в маркер, решается ДО `match menu` ниже: `Choice`
+    // переезжает в него. `Skip` (таймаут/`s`/Esc) означает «пусть boot-путь
+    // монтирует сам» — а он монтирует ровно тот том, который меню и предложило
+    // бы, поэтому в маркер это идёт как монтирование.
+    let menu_action = match &menu {
+        crate::boot_menu::Choice::Format(_) => crate::fs::mount_choice::Action::Format,
+        _ => crate::fs::mount_choice::Action::Mount,
+    };
 
     // SAFETY-CRITICAL, и поэтому ниже ничего не форматирует само по себе: без
     // выбора в меню boot-путь только МОНТИРУЕТ том, который уже несёт
@@ -607,6 +657,15 @@ fn init_fs() {
             info!("ext2 mounted at /mnt");
             fs_boot_demo();
             crate::provision::seed();
+            // МАРКЕР ВЫБОРА МОНТИРОВАНИЯ ПИШЕТСЯ ПОСЛЕДНИМ, как и
+            // `/mnt/etc/pagh-release` в посеве: сначала том смонтирован и засеян,
+            // потом мы обещаем больше не спрашивать. Оборванная загрузка между
+            // этими шагами оставляет маркер недописанным, и меню честно спросит
+            // ещё раз — в отличие от маркера, поставленного заранее, который
+            // скрыл бы вопрос, на который никто не ответил.
+            if crate::boot_menu::record_choice(&*blk, menu_action) {
+                crate::provision::record_mount_choice(blk.name(), menu_action.name());
+            }
         }
         Err(e) => error!("fs: mount_at(/mnt) failed: {:?}", e),
     }
@@ -808,6 +867,13 @@ fn kernel_main() -> ! {
         crate::selftest_lx::run_post_net_checks,
         "lx-selftest",
     );
+
+    // In-guest apt performance benchmark (cargo feature `lx_apt_bench`).
+    // Spawned as its own thread so it runs after interrupts/DHCP are up, and
+    // separate from `lx_selftest` so the benchmark is not preceded by the whole
+    // Linux-compat suite (which itself writes to /mnt).
+    #[cfg(feature = "lx_apt_bench")]
+    task::scheduler::kernel_thread_spawn_named(crate::selftest_lx::run_apt_bench, "lx-apt-bench");
 
     // Живая проверка полного обновления (cargo feature `lx_livetest`).
     // Спавнится отдельным потоком, чтобы идти после поднятия прерываний/DHCP.

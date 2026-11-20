@@ -138,9 +138,11 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
     same style voluntarily — keep it).
 11. **Учётные данные — состояние слоя сисколлов, никогда не политика VFS.**
     `CompatState::creds` (`src/task/compat.rs`) — единственный владелец шести ids процесса;
-    стартует как `Creds::ROOT`, наследуется `fork`/`clone` и сохраняется `execve`
-    (setuid-бинарники не моделируются). Чистые решения живут в
-    `src/arch/x86_64/linux/cred.rs` (host-свойство P56). Инварианты:
+    стартует как `Creds::ROOT`, наследуется `fork`/`clone`, а успешный `execve` применяет
+    `S_ISUID`/`S_ISGID` (`Creds::exec_setid`, как `bprm_fill_uid()` в Linux): `euid`/`egid`
+    и соответствующие saved id берутся у владельца образа, real id и дополнительные
+    группы не меняются, неудачный exec ids не трогает. Чистые решения живут в
+    `src/arch/x86_64/linux/cred.rs` (host-свойства P56/P61). Инварианты:
     * `VfsNode` несёт только метаданные (`mode`/`owner`/`set_mode`/`set_owner`). Никогда не
       добавляйте проверку учётных данных внутрь реализации `VfsNode` — boot provisioning,
       установщик пакетов и shell вызывают VFS напрямую и должны работать без идентичности.
@@ -168,7 +170,7 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
   вычерпывавшую весь пул.
 - **Linux-compat end-to-end → `selftest_lx`** (фича-гейтед harness'ы) плюс гостевой драйвер
   `tools/e2e.py` (режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`):
-  локальный mini-repo, живой apt update, bigindex-репро, многомегабайтный TLS-поток через
+  локальный mini-repo, живой `ppkg update`, bigindex-репро, многомегабайтный TLS-поток через
   `lx_tlsbig`. Harness'ы `tools/e2e_*.ps1` — Windows-only legacy-эквиваленты тех же
   сценариев, см. *Canonical entry points*; новая работа идёт в `tools/e2e.py` (Linux и CI
   могут его запускать).
@@ -231,7 +233,7 @@ critical/high verified security finding или регрессией, блоки�
 - **PATCH** — фиксы, диагностика, доки, тулинг, обновления vendored-зависимостей без
   изменения поведения. Docs-only коммиты (этот файл, README'шки) версию не бампают.
 
-**Текущие версии и недавняя история.** **`dev` currently reads 2.23.0**; **`main` reads 2.22.9** — hotfix раунда 4:
+**Текущие версии и недавняя история.** **`dev` currently reads 2.24.0**; **`main` reads 2.22.9** — hotfix раунда 4:
 read-only out-указатель сисколла больше не вешает CPU, FPU/SSE изолированы между
 процессами, установщик не разворачивает чужие pre-existing symlink'и, `SFMASK` как в
 Linux, fd-таблица ограничена на всех путях. До него 2.22.8 — перевод комментариев и
@@ -245,7 +247,29 @@ installer spelling-split;
 2026-11-13 audit-пакеты: 2.22.0 закрыл пути ring3-to-ring0, 2.22.1 ограничил установщик
 пакетов, 2.22.2 ужесточил VFS/ext2, 2.22.3 закрыл класс user-buffer TOCTOU.
 
-**`dev`** (2.23.0) — USB-тетеринг телефона: нативный RNDIS поверх xHCI.
+**`dev`** (2.24.0) — desktop-вариант B: kernel-примитивы userspace-композитора.
+`/dev/fb0` — Limine scanout: `open`/`mmap(MAP_SHARED)` забирают экран (kernel
+console flush останавливается, serial-логи идут), `FBIOGET_VSCREENINFO`
+(0x4600)/`FBIOGET_FSCREENINFO` (0x4602) отдают точные `fb_var/fix_screeninfo`
+(160/80 байт, сверено с Linux UAPI); fb-листья помечены MMIO-битом и никогда не
+возвращаются в PMM. `memfd_create` + `ftruncate` (76/77) + `mmap(MAP_SHARED)`:
+общие физические страницы одного файла в нескольких отображениях, `fork`
+разделяет их без COW, `munmap`/exit отпускают ссылку, кадр живёт пока его держит
+файл или другое отображение; `MAP_SHARED` не-memfd — честный `EINVAL`.
+`/dev/input/event0` — evdev-подобный поток 24-байтных `input_event` (timeval,
+EV_KEY/EV_REL/EV_SYN) из PS/2 и USB HID, blocking/`O_NONBLOCK`/`poll`/`select`,
+кольцо 256 событий; ввод дублируется, поэтому shell-stdin и `/dev/stdin` не
+ломаются. `sendmsg`/`recvmsg` (46/47) несут `SOL_SOCKET`/`SCM_RIGHTS`: клиент
+передаёт композитору memfd (массив fd, `MSG_CMSG_CLOEXEC`, `MSG_CTRUNC`,
+`EINVAL`/`ENOBUFS`/`EBADF`); получатель получает dup в свою таблицу, отправитель
+свой дескриптор сохраняет. ABI и ограничения — `docs/desktop-b.md`. Проверка:
+host-тесты ABI (`fb_abi`, `input_event`, `cmsg`) + шесть in-QEMU routine
+`desktop-b::*` (fb ioctl/mmap/пиксель, event0 read/poll, memfd coherence,
+MAP_SHARED после fork, SCM_RIGHTS fd passing, SCM_RIGHTS truncation/errors).
+Пробелы: DMA-BUF/GPU, Wayland, EV_ABS/touch, fb modeset.
+Предыдущая версия `dev`:
+
+**`dev` до 2.24.0** (2.23.0) — USB-тетеринг телефона: нативный RNDIS поверх xHCI.
 `drivers/usb_desc.rs` находит communication+CDC Data пару по тройкам
 `EF/04/01`, `E0/01/03`, `02/02/FF` (VID:PID не используются), `drivers/xhci.rs`
 получил control-OUT с data-стадией, bulk-кольца/контексты и bulk-IN разбор
@@ -419,16 +443,23 @@ slice 4; 2.10.0 — procfs slice 3; 2.9.x — правда о памяти и `/
   перезагрузки), нет SMART/self-test и shutdown notification, а невыровненные записи —
   read-modify-write на LBA, а не батчем.
   (Бывший пробел «embedded-tls встаёт на больших потоках» закрыт: многомегабайтная
-  TLS-загрузка проходит end to end — `lx_tlsbig`, issue #19, — а живой `apt update` идёт
+  TLS-загрузка проходит end to end — `lx_tlsbig`, issue #19, — а живой `ppkg update` идёт
   по HTTPS.)
 - Учётные данные процессов и права файловой системы реализованы (контракт
   `docs/security-model.md`): per-process real/effective/saved uid+gid в `CompatState`,
   семейство `set*id`, проверки owner/group/other на `open`, `execve`, мутациях каталогов,
-  `chmod`/`chown` и `kill`, плюс write-back ext2 `i_mode`/`i_uid`/`i_gid`. Чего всё ещё
-  нет и что названо в `SECURITY.md`: логина/аккаунтов (shell и все порождённые ядром
-  процессы стартуют root), повышения через setuid-бинарники на `execve`, дополнительных
-  групп/ACL/`fsuid`, наборов capabilities/seccomp/LSM/audit, проверок sticky-бита и
-  владельца каталога; синтетические узлы (`/dev`, `/proc`, ramfs) не могут сохранить
-  владельца и держат исторический per-process override для `stat`; SMEP — единственная
-  аппаратная митигация (SMAP/KPTI отсутствуют). `access(2)` проверяет real ids; `stat`
-  сообщает реальные метаданные inode.
+  `chmod`/`chown` и `kill`, write-back ext2 `i_mode`/`i_uid`/`i_gid`, дополнительные
+  группы (до 32, nr 115/116) и setuid/setgid-on-exec (`S_ISUID`/`S_ISGID` ставят
+  `euid`/`egid` и соответствующие saved id по владельцу образа; real id и группы
+  сохраняются). Вход и пароли появились частично: `/etc/passwd` + `/etc/group` +
+  `/etc/shadow` (`0600 root:root`, `$6$` SHA-512-crypt, fail-closed проверка),
+  `su`/`login` с паролем цели, `passwd`, `whoami` и опция `/etc/pagh-session` для
+  не-root сессии. Чего всё ещё нет и что названо в `docs/security-model.md`:
+  `getty`/PAM и per-user сессий (`su` из root-сессии пароля не спрашивает, как в Linux;
+  shell-встроенные команды остаются ring 0), `login.defs`, блокировок после N неудачных
+  попыток, `wheel`-гейта для `su`, аудита попыток входа, ACL/`fsuid`, наборов
+  capabilities/seccomp/LSM, `MS_NOSUID`/`ptrace`/`dumpable` для setuid-модели; синтетические
+  узлы (`/dev`, `/proc`) не могут сохранить владельца и держат исторический per-process
+  override для `stat` (ramfs `/tmp` с фазы 2 хранит `mode`/`owner` на узле); SMEP —
+  единственная аппаратная митигация (SMAP/KPTI отсутствуют). `access(2)` проверяет real
+  ids; `stat` сообщает реальные метаданные inode.

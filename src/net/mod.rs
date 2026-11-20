@@ -37,6 +37,7 @@ pub mod http;
 pub mod http_fetch;
 pub mod ip;
 pub mod link;
+pub mod netstats;
 pub mod progress;
 pub mod tcp;
 pub mod tls;
@@ -55,7 +56,7 @@ pub use wire::{IpAddr, IpEndpoint, Ipv4Addr, Ipv4Cidr, Ipv6Addr};
 use crate::net::link::Link;
 use crate::sync::spinlock::Spinlock;
 use crate::task::scheduler;
-use crate::{info, warn};
+use crate::{debug, info, warn};
 
 /// Хэндл транспортного сокета (TCP или UDP — обе таблицы индексируются с 0).
 pub type SocketHandle = usize;
@@ -70,6 +71,18 @@ pub enum NetError {
     /// NIC найден, но инициализация упала, или сокетная операция не может
     /// завершиться.
     DeviceInit,
+}
+
+/// Отказ `bind(2)`/`listen(2)` на AF_INET-сокете.
+///
+/// Отдельный от [`NetError`] тип, потому что Linux различает «порт занят» и
+/// «сети нет»: `bind(2)` обязан вернуть `EADDRINUSE`, а не общий отказ стека.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindError {
+    /// Порт уже занят живым TCP- или UDP-сокетом.
+    AddrInUse,
+    /// Пригодного NIC нет: стек не инициализирован, порт зарезервировать негде.
+    NoDevice,
 }
 
 /// Статический fallback-адрес, когда DHCP не завершился (R13.3). Для e1000 это
@@ -603,11 +616,42 @@ pub fn tcp_rx_at_eof(handle: SocketHandle) -> bool {
     s.tcp.get(handle).map(|k| k.eof_visible()).unwrap_or(true)
 }
 
+/// Половинное закрытие TX для `shutdown(SHUT_WR)` (nr 48): FIN заказывается и
+/// стек получает несколько poll'ов, чтобы его отправить, но СЛОТ ОСТАЁТСЯ —
+/// соединение продолжает принимать данные и живёт до `close`.
+///
+/// Отличие от [`tcp_close`] только в `remove`: там слот снимается сразу после
+/// close-рукопожатия, здесь сокет доигрывает FIN-WAIT сам.
+pub fn tcp_shutdown_wr(handle: SocketHandle) {
+    let mut g = NET.lock();
+    let Some(s) = g.as_mut() else { return };
+    if let Some(k) = s.tcp.get_mut(handle) {
+        k.close();
+    }
+    for _ in 0..4 {
+        s.step();
+    }
+}
+
 /// Полузакрыть наш TX, дать close-рукопожатию несколько poll'ов и вернуть слот
 /// сокета.
 pub fn tcp_close(handle: SocketHandle) {
     let mut g = NET.lock();
     let Some(s) = g.as_mut() else { return };
+    // У слушателя нет FIN-рукопожатия: `close()` лишь поднимает флаг, который
+    // обычный шаг сокета обрабатывает для соединённых состояний, а `reap_closed`
+    // снимает только `Closed`. Без этой ветки закрытый listener оставался в
+    // таблице навсегда, и порт было не занять повторно (`EADDRINUSE`) даже после
+    // успешного `close(2)`.
+    let listening = s
+        .tcp
+        .get(handle)
+        .map(|k| k.state() == tcp::State::Listen)
+        .unwrap_or(false);
+    if listening {
+        s.tcp.remove(handle);
+        return;
+    }
     if let Some(k) = s.tcp.get_mut(handle) {
         k.close();
     }
@@ -617,6 +661,29 @@ pub fn tcp_close(handle: SocketHandle) {
     s.tcp.remove(handle);
 }
 
+/// Открыть слушающий TCP-сокет на `port` (`0` — эфемерный). Возвращает хэндл и
+/// фактически занятый порт.
+///
+/// `bind(2)` зовёт это, чтобы зарезервировать порт до `listen(2)`: таблица
+/// стека — единственное место, где порт можно атомарно проверить и занять.
+/// Порт, занятый любым живым сокетом (не только другим слушателем), — отказ
+/// `EADDRINUSE`, как в Linux.
+pub fn tcp_listen(port: u16) -> Result<(SocketHandle, u16), BindError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(BindError::NoDevice)?;
+    let port = if port == 0 {
+        ephemeral_port_locked(state)
+    } else {
+        port
+    };
+    if state.tcp.port_in_use(port) {
+        return Err(BindError::AddrInUse);
+    }
+    let handle = state.tcp.listen(port).map_err(|_| BindError::AddrInUse)?;
+    debug!("[TCP] listen port={} handle={}", port, handle);
+    Ok((handle, port))
+}
+
 // ─── Публичный UDP API ──────────────────────────────────────────────────────
 
 /// Открыть UDP-сокет, привязанный к эфемерному локальному порту на 0.0.0.0.
@@ -624,6 +691,26 @@ pub fn udp_open() -> Result<SocketHandle, NetError> {
     let mut guard = NET.lock();
     let state = guard.as_mut().ok_or(NetError::NoDevice)?;
     let port = ephemeral_port_locked(state);
+    Ok(state.udp.open(port))
+}
+
+/// Перепривязать существующий UDP-сокет на `port` (`0` или текущий порт — no-op).
+///
+/// UDP-сокет уже занимает эфемерный порт с момента `socket(2)`, поэтому
+/// `bind(2)` — это замена порта, а не первая привязка: под `NET` проверяем
+/// занятость, закрываем старый слот и открываем новый. Занятый порт — отказ
+/// `EADDRINUSE`; сеть без NIC — `NoDevice`.
+pub fn udp_bind(handle: SocketHandle, port: u16) -> Result<SocketHandle, BindError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(BindError::NoDevice)?;
+    let current = state.udp.port_of(handle).ok_or(BindError::NoDevice)?;
+    if port == 0 || port == current {
+        return Ok(handle);
+    }
+    if state.udp.port_in_use(port) {
+        return Err(BindError::AddrInUse);
+    }
+    state.udp.close(handle);
     Ok(state.udp.open(port))
 }
 
@@ -637,7 +724,7 @@ fn ephemeral_port_locked(s: &mut Stack) -> u16 {
         } else {
             s.next_eph + 1
         };
-        if !s.udp.port_in_use(p) {
+        if !s.udp.port_in_use(p) && !s.tcp.port_in_use(p) {
             return p;
         }
     }
@@ -710,6 +797,83 @@ pub fn ip_config() -> Option<IpConfig> {
         addr: cidr,
         gateway: state.gateway.unwrap_or(Ipv4Addr::UNSPECIFIED),
         mac: state.mac,
+    })
+}
+
+/// Имя единственного сетевого интерфейса.
+///
+/// Имя стабильное и Linux-совместимое (`eth0`): у стека один канал, а какой
+/// драйвер его обслуживает — деталь реализации, которую userspace видит в
+/// `/proc/net/dev` и `SIOCGIF*`. Драйверное имя (`e1000`/`usb-rndis`) остаётся
+/// в `link::Link::name` для логов.
+pub const IFACE_NAME: &str = "eth0";
+
+/// MTU, который объявляет канал (`SIOCGIFMTU`, `/proc/net/dev`).
+///
+/// e1000 и RNDIS принимают кадры до 1500 байт полезной нагрузки; больше стек и
+/// не отправляет (`wire::Ipv4` не фрагментирует под меньший MTU).
+pub const IFACE_MTU: u32 = 1500;
+
+/// Есть ли канал: `Some("eth0")`, если драйвер уже выбран, иначе `None`.
+///
+/// «Канал выбран» — то же условие, что у [`link::active`]: стек может
+/// существовать без канала (xHCI есть, RNDIS ещё не перечислен), и тогда
+/// интерфейса для userspace нет.
+pub fn iface_name() -> Option<&'static str> {
+    link::active().map(|_| IFACE_NAME)
+}
+
+/// Реальное состояние интерфейса для `/proc/net/dev` и `SIOCGIF*`.
+///
+/// Это снимок: каждый вызов заново берёт `NET` и атомарные счётчики, поэтому
+/// два чтения подряд отражают прогресс стека. `cidr`/`gateway` — `None` до
+/// DHCP/fallback; `running` — физический линк, а не «адрес назначен».
+#[derive(Clone, Copy, Debug)]
+pub struct IfaceStats {
+    pub name: &'static str,
+    pub mac: Mac,
+    pub cidr: Option<Ipv4Cidr>,
+    pub gateway: Option<Ipv4Addr>,
+    pub running: bool,
+    pub counters: netstats::LinkCounters,
+    /// Ошибки/потери приёма, которые считает драйвер. У e1000 их нет (нули):
+    /// драйвер не ведёт статистику, и выдумывать числа нельзя.
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
+    pub mtu: u32,
+}
+
+/// Снимок [`IfaceStats`] или `None`, если канала нет.
+///
+/// Лок `NET` берётся здесь и отпускается до возврата; `link::running`/
+/// `link::counters` не берут `NET`, поэтому порядок локов остаётся прежним
+/// (`NET` → `ACTIVE` → драйвер), как на путях передачи.
+pub fn iface_stats() -> Option<IfaceStats> {
+    let guard = NET.lock();
+    let state = guard.as_ref()?;
+    let kind = state.link?;
+    // Драйверские счётчики ошибок: RNDIS ведёт их сам, e1000 — нет.
+    let (rx_errors, rx_dropped, tx_errors, tx_dropped) = match kind {
+        Link::UsbRndis => {
+            let s = crate::drivers::usb_rndis::stats();
+            (s.rx_errors, s.rx_dropped, s.tx_errors, s.tx_dropped)
+        }
+        Link::E1000 => (0, 0, 0, 0),
+    };
+    Some(IfaceStats {
+        name: IFACE_NAME,
+        mac: state.mac,
+        cidr: state.cidr,
+        gateway: state.gateway,
+        running: link::running(),
+        counters: link::counters(),
+        rx_errors,
+        rx_dropped,
+        tx_errors,
+        tx_dropped,
+        mtu: IFACE_MTU,
     })
 }
 

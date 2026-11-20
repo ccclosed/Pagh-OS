@@ -12,9 +12,9 @@
 
 | # | Что | Команда | Индекс | Результат | Время |
 |---|---|---|---|---|---|
-| 1 | streaming 60k | `python3 tools/e2e.py bigindex --stanzas 60000 --timeout 900 --serial-log serial_bigindex_60k.log` | `Packages` 22 949 891 B (21.89 MiB), `.gz` 1 702 056 B (1.62 MiB), 60 000 станзов | `apt: read package lists - 21.8 MiB / 60000 pkgs` → `apt: index ready - 60000 packages` → `LXSELFTEST bigindex PASS (streaming; 60000 packages)`, **exit 0** | 36.2 s |
+| 1 | streaming 60k | `python3 tools/e2e.py bigindex --stanzas 60000 --timeout 900 --serial-log serial_bigindex_60k.log` | `Packages` 22 949 891 B (21.89 MiB), `.gz` 1 702 056 B (1.62 MiB), 60 000 станзов | `ppkg: read package lists - 21.8 MiB / 60000 pkgs` → `ppkg: index ready - 60000 packages` → `LXSELFTEST bigindex PASS (streaming; 60000 packages)`, **exit 0** | 36.2 s |
 | 2 | in-RAM | `python3 tools/e2e.py bigindex --stanzas 60000 --in-ram --timeout 900 --serial-log serial_bigindex_60k_inram.log` | **фиксированные 12 000 станзов in-kernel** (см. ограничение ниже) | `BIGINDEX variant=IN-RAM … 12000 stanzas IN-KERNEL` → `LXSELFTEST bigindex PASS (in-ram in-kernel; 12000 packages parsed)`, **exit 0** | 42.0 s |
-| 3 | streaming 120k (запас по масштабу) | `python3 tools/e2e.py bigindex --stanzas 120000 --timeout 900 --serial-log serial_bigindex_120k.log` | `Packages` 45 929 891 B (43.80 MiB), `.gz` 3 403 681 B (3.25 MiB) | `apt: read package lists - 43.8 MiB / 120000 pkgs` → `index ready - 120000 packages` → `PASS (streaming; 120000 packages)`, **exit 0** | 55.2 s |
+| 3 | streaming 120k (запас по масштабу) | `python3 tools/e2e.py bigindex --stanzas 120000 --timeout 900 --serial-log serial_bigindex_120k.log` | `Packages` 45 929 891 B (43.80 MiB), `.gz` 3 403 681 B (3.25 MiB) | `ppkg: read package lists - 43.8 MiB / 120000 pkgs` → `index ready - 120000 packages` → `PASS (streaming; 120000 packages)`, **exit 0** | 55.2 s |
 | 4 | host-репро | `cd host-tests && cargo test --locked --target x86_64-unknown-linux-gnu big_index -- --nocapture` | 60 000 станзов × 3 теста (`big_index_parse_packages_at_scale`, `big_index_through_gzip_decompress_stream`, `big_index_queries_and_resolver_at_scale`) | `test result: ok. 3 passed; 0 failed` | 8.9 s |
 | 5 | host-property-сюита | `python3 tools/host_tests.py` | — | `test result: ok. 212 passed; 0 failed; 0 ignored` | 100.4 s |
 | 6 | локальный apt по HTTP (mini_repo) | `python3 tools/e2e.py local-mirror --timeout 420 --serial-log serial_local_mirror.log` | mini_repo `hello-pagh` | `LXSELFTEST apt_e2e PASS (index 1 pkgs; installed 1; spawned hello-pagh pid=5)` + `hello from apt` + `LXSELFTEST https_get PASS`, **exit 0** | 38.6 s |
@@ -82,5 +82,5 @@ python3 tools/host_tests.py
 ```
 
 Ожидаемые строки-доказательства: `LXSELFTEST bigindex PASS (streaming; N packages)`,
-`apt: index ready - N packages`; negative control обязан отказаться с кодом 2, а не пройти
+`ppkg: index ready - N packages`; negative control обязан отказаться с кодом 2, а не пройти
 на одном станзе.

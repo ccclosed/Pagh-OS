@@ -1,0 +1,92 @@
+# PaghTerm
+
+Терминал для Pagh desktop B: VT100/ANSI-эмулятор, программный RGBA-рендерер,
+headless PNG-скриншоты и клиент PDP/1 (Pagh Desktop Protocol).  Без внешних зависимостей,
+собирается статически под `x86_64-unknown-linux-musl`.
+
+![PaghTerm](screenshots/01-welcome.png)
+
+E2E с реальным композитором: `pagh-desktop` из dev (PR #101) рисует окно
+терминала, полученное по PDP/1 (headless backend, 1280×800).
+
+![Live PDP/1](screenshots/05-live-pdp1.png)
+
+## Что уже работает
+
+* VT100/ANSI: CSI/OSC/ESC/DCS, курсор, scroll region, alt screen, tabs,
+  16/256/truecolor SGR, атрибуты, UTF-8, wide/zero-width, DEC graphics,
+  запросы DA/DSR/CPR/DECRQM.
+* Рендерер 8×18 (Fira Code) + wide 16×18 (Noto CJK), box drawing/block
+  elements, курсор, selection, scrollback/scrollbar, окно для скриншотов.
+* PNG-выгрузка (RGBA8) без зависимостей.
+* Клиент PDP/1: AF_UNIX, hello/welcome/create/commit/input/configure/focus/
+  ping/pong/close, XRGB8888/RGB565, кодирование клавиш и SGR-мыши.
+* `ShmSurface`: memfd/`SCM_RIGHTS` (`shm_offer`/`shm_ready`/`shm_release`),
+  рендер прямо в mmap, по сокету — только damage-прямоугольники; мигание
+  курсора и ввод дают damage порядка клетки, а не полный кадр. Legacy-сервер
+  без bit 2 обслуживается прежним полным кадром.
+* ABI v1 kernel console shared surface: валидатор, reader, конвертация в
+  экран (`/dev/vtconsole0`, `/dev/vtinput`), см. [TERMINAL.md](TERMINAL.md).
+* 120 host-тестов, включая эталонные escape-последовательности и скриншоты.
+
+## Сборка и проверки
+
+```sh
+cd rust-apps/pagh-terminal
+
+cargo fmt --all -- --check
+cargo test                    # host tests
+cargo run -- --screenshots screenshots
+
+# статический бинарник для pagh (нужен rustup target x86_64-unknown-linux-musl)
+tools/build-static.sh         # результат: rust-apps/out/pagh-terminal
+```
+
+`cargo test` использует локальный `.cargo/config.toml`, чтобы нейтрализовать
+`build-std` из корневого конфига ядра.  Статическая сборка выполняется через
+`tools/build-static.sh` из нейтрального каталога — так cargo не наследует
+bare-metal-конфиг ядра (см. комментарий в скрипте).
+
+## Использование
+
+```sh
+# скриншот демо
+cargo run -- --headless --demo 01-welcome --out /tmp/welcome.png --print
+
+# произвольный вывод терминала
+cargo run -- --headless --script session.bin --cols 100 --rows 30 \
+  --out /tmp/session.png --print
+
+# живое окно через compositor (task desktop-server)
+cargo run -- --socket /tmp/pagh-desktop.sock --size 900x600
+
+# окно с собственной shell-сессией (по умолчанию для --vt + --socket):
+# дочерний shell за pipe'ами, boot-VT не читается и ввод в lxrun не уходит
+cargo run -- --vt /dev/vtconsole0 --socket /tmp/pagh-desktop.sock
+
+# диагностика: по-прежнему зеркалить boot-VT в окне
+cargo run -- --vt /dev/vtconsole0 --vt-input /dev/vtinput \
+  --socket /tmp/pagh-desktop.sock --mirror-vt
+```
+
+Headless-демо: `01-welcome`, `02-colors`, `03-scrollback`, `04-unicode`.
+`--select R1,C1:R2,C2 --dump-selection` печатает выделенный текст;
+`--print-full` включает scrollback.
+
+## Ограничения
+
+Полноценного PTY нет (ABI v1 kernel console surface описан в
+[TERMINAL.md](TERMINAL.md)). Live-режим подключается к `pagh-desktop` по PDP/1:
+окно запускает собственный shell-потомок через pipe'ы (минимальный userspace
+shell `help/ls/cd/pwd/echo/cat/uname/clear/exit`), а не зеркалит boot-VT;
+`--mirror-vt` возвращает старое зеркало для диагностики. ShmSurface включается только если
+сервер объявил `welcome.flags` bit 2 (иначе — полный кадр). Нет reflow при
+resize,
+комбинирующие метки не компонуются, OSC 4/8/52 игнорируются.  Подробно —
+[TERMINAL.md](TERMINAL.md).
+
+## Лицензии
+
+Код — MIT (см. корневой `LICENSE`).  Bitmap-шрифты в `assets/` — производные
+Fira Code и Noto Sans CJK, распространяются по SIL OFL 1.1; тексты и
+атрибуция — в `fonts/LICENSES.md` и `fonts/OFL-1.1.txt`.

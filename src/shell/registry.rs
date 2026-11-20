@@ -257,6 +257,43 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_pwd,
     },
     CommandSpec {
+        name: "id",
+        description: "Show uid/gid/groups of the session or a user",
+        usage: "id [user]",
+        handler: super::commands::cmd_id,
+    },
+    CommandSpec {
+        name: "groups",
+        description: "List group names of the session or a user",
+        usage: "groups [user]",
+        handler: super::commands::cmd_groups,
+    },
+    CommandSpec {
+        name: "su",
+        description: "Switch the session identity, authenticating when the session is not root",
+        usage: "su [-p] [user]",
+        handler: super::commands::cmd_su,
+    },
+    CommandSpec {
+        name: "login",
+        description:
+            "Start a session identity for a /etc/passwd user (-p forces a password prompt)",
+        usage: "login [-p] <user>",
+        handler: super::commands::cmd_login,
+    },
+    CommandSpec {
+        name: "passwd",
+        description: "Set a password in /etc/shadow (no echo; root may target any user)",
+        usage: "passwd [user]",
+        handler: super::commands::cmd_passwd,
+    },
+    CommandSpec {
+        name: "whoami",
+        description: "Print the user name of the session's effective uid",
+        usage: "whoami",
+        handler: super::commands::cmd_whoami,
+    },
+    CommandSpec {
         name: "head",
         description: "Print the first lines of a file",
         usage: "head [-n LINES] FILE",
@@ -336,26 +373,21 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "cargo",
-        description: "Run cargo: real /mnt/usr/bin/cargo when installed, else the embedded mini-Rust (new/check/build/run)",
-        usage: "cargo <new|check|build|run> [path]",
+        description: "Run the installed Rust cargo toolchain through Linux compatibility",
+        usage: "cargo <args...>",
         handler: super::commands::cmd_cargo,
     },
     CommandSpec {
         name: "rustc",
-        description: "Compile Rust source: real /mnt/usr/bin/rustc when installed, else the embedded mini-Rust (.pbc)",
-        usage: "rustc <file.rs> [-o output.pbc]",
+        description: "Run the installed Rust compiler through Linux compatibility",
+        usage: "rustc <file.rs> [args...]",
         handler: super::commands::cmd_rustc,
     },
     CommandSpec {
-        name: "rustup",
-        description: "Show the built-in offline mini-Rust toolchain",
-        usage: "rustup [show|target list|default]",
-        handler: super::commands::cmd_rustup,
-    },
-    CommandSpec {
         name: "rust",
-        description: "Run a mini-Rust .rs/.pbc file, or a static ELF through Linux compatibility",
-        usage: "rust <path> [args...]",
+        description:
+            "Run a static Linux ELF (e.g. a native Rust musl binary) through Linux compatibility",
+        usage: "rust <static-elf> [args...]",
         handler: super::commands::cmd_rust,
     },
     CommandSpec {
@@ -366,14 +398,14 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "pkg",
-        description: "Download & install a .deb by URL (use `apt` for by-name)",
+        description: "Download & install a .deb by URL (use `ppkg` for by-name)",
         usage: "pkg <host> <path> [port]",
         handler: super::commands::cmd_pkg,
     },
     CommandSpec {
-        name: "apt",
-        description: "Name-based package manager (update/install/show/list/setmirror)",
-        usage: "apt <update|install|show|list|setmirror> [args]",
+        name: "ppkg",
+        description: "Pagh package manager (update/install/show/list/setmirror)",
+        usage: "ppkg <update|install|show|list|setmirror> [args]",
         handler: super::commands::cmd_apt,
     },
     CommandSpec {

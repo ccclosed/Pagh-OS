@@ -15,19 +15,28 @@ pub(crate) mod complete;
 pub(crate) mod disk;
 pub(crate) mod editor;
 pub(crate) mod history;
+// Сессионная идентичность фазы 1 (`id`/`groups`/`su`): чистый разбор
+// `/etc/passwd` + `/etc/group` (`identity_db`, host-тестируемый) и VFS-слой
+// хранения сессии (`identity`).
+pub(crate) mod identity;
+pub(crate) mod identity_db;
 pub(crate) mod jobs;
 pub(crate) mod keys;
 pub(crate) mod nano;
 pub(crate) mod nano_config;
 pub(crate) mod paint;
 pub(crate) mod path;
+pub(crate) mod shadow;
+// Pure `ppkg install` progress model/renderers (host-tested in
+// `host-tests/src/properties/ppkg_progress_ui.rs`) + its effectful console driver.
+pub(crate) mod ppkg_progress;
+mod progress;
 pub(crate) mod registry;
 pub(crate) mod render;
 pub(crate) mod selection;
 pub(crate) mod suggest;
 pub(crate) mod texttools;
 pub(crate) mod theme;
-pub(crate) mod toolchain;
 pub(crate) mod tree;
 
 use alloc::format;
@@ -407,6 +416,12 @@ pub fn shell_main() -> ! {
         loop {
             // Idle на halt, пока прерывание не доставит событие (R11.5).
             crate::arch::cpu::halt();
+
+            // Если клавиатурой владел userspace-терминал (`/dev/vtinput`), а его
+            // процесс уже завершился, вернуть прямой PS/2-путь: иначе физические
+            // клавиши остались бы «съеденными» закрытым окном. Проверка дешёвая
+            // (атомик) и троттлится внутри; пока владелец жив — no-op.
+            crate::drivers::vtinput::reap_dead_client();
 
             // Тик таймера будит shell каждую миллисекунду, но работа есть,
             // только если изменилось что-то, что может менять экран: пришёл

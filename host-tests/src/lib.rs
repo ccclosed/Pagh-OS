@@ -53,14 +53,46 @@ pub mod io;
 #[path = "../../src/arch/x86_64/linux/abi.rs"]
 pub mod abi;
 
+// Ancillary data (`cmsg`) AF_UNIX SCM_RIGHTS: разметка msghdr/cmsghdr,
+// разбор control-буфера отправки и план доставки fd на приёме. Модуль
+// `core`+`alloc`-only, поэтому host-свойства исполняют ровно тот исходник,
+// который компилирует ядро (`src/arch/x86_64/linux/cmsg.rs`).
+#[path = "../../src/arch/x86_64/linux/cmsg.rs"]
+pub mod cmsg;
+
 // Process credentials + POSIX permission/setuid decisions (security model).
 // `core`-only and self-contained, so the same source the kernel compiles is
 // exercised by property P56 and its inline unit tests.
 #[path = "../../src/arch/x86_64/linux/cred.rs"]
 pub mod cred;
 
+// `/etc/shadow` parser + `$6$` SHA-512-crypt (non-root A4): the same source the
+// kernel compiles, checked against independent `openssl passwd -6` vectors.
+#[path = "../../src/shell/shadow.rs"]
+pub mod shadow;
+
+// Shell identity database: pure `/etc/passwd` + `/etc/group` parsing used by
+// `id`/`groups`/`su` (phase 1 "groups separate from root"). `core`+`alloc`
+// only, so property P58 exercises the exact source the kernel compiles.
+#[path = "../../src/shell/identity_db.rs"]
+pub mod identity_db;
+
 #[path = "../../src/arch/x86_64/linux/rand_clock.rs"]
 pub mod rand_clock;
+
+// Блокирующее чтение сокета: чистое решение «продолжать ждать / EOF / EBADF»,
+// которое ядро принимает на каждой уступке CPU (`src/arch/x86_64/linux/
+// sock_wait.rs`). `core`-only, поэтому host-свойство `p59` исполняет ровно тот
+// исходник, который компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/sock_wait.rs"]
+pub mod sock_wait;
+
+// `shutdown(2)` (nr 48): чистая политика полузакрытия — порядок отказов
+// (`EBADF`/`ENOTSOCK`/`EINVAL`/`ENOTCONN`) и что значит каждый флаг
+// направления для read/write/poll. `core`-only, поэтому host-свойство `p59`
+// исполняет ровно тот исходник, который компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/sock_shutdown.rs"]
+pub mod sock_shutdown;
 
 // `stack` is `core` + `alloc` only (uses `alloc::vec::Vec`). The host crate links
 // `std`, which provides the `alloc` crate via the `extern crate alloc;` below, so
@@ -105,6 +137,13 @@ pub mod deb;
 // `#[path]` include resolves with no extra wiring (task 8.5; tests in P24/P25).
 #[path = "../../src/pkg/tar.rs"]
 pub mod tar;
+
+// `ppkg_progress` is the pure `ppkg install` progress model/renderer (bar
+// geometry, unknown-total `<=>` animation, percent/speed/size/ETA widgets, the
+// 10 FPS gate, ANSI/carriage-return/plain emitters). It is `core` + `alloc` only,
+// so the host tests pin the exact strings the console driver writes.
+#[path = "../../src/shell/ppkg_progress.rs"]
+pub mod ppkg_progress;
 
 // `install` is the pure install-path normalization + install model (component 10).
 // It references `TarEntry`/`TarType` via `super::tar`, which here resolves to the
@@ -157,6 +196,14 @@ pub mod mem;
 #[path = "../../src/memory/cow.rs"]
 pub mod cow;
 
+// `pat` is the pure PAT/write-combining policy behind `/dev/fb0` (desktop-render
+// §2 A1/A2): the `IA32_PAT` entry-4 encoding, CPUID PAT detection, the fb0 PTE
+// flag composition (PAT entry 4, no NO_CACHE/WRITE_THROUGH) and the exact
+// uncached fallback. `core`-only, so the same source the kernel compiles is
+// property-tested here (`pat_wc_flags`) and unit-tested inline.
+#[path = "../../src/memory/pat.rs"]
+pub mod pat;
+
 // `dirent` is the pure `getdents64` record packer (Feature: linux-binary-compat).
 // `core` + `alloc` only and self-contained, so the standalone `#[path]` include
 // resolves with no extra wiring (P32).
@@ -203,6 +250,13 @@ pub mod kill;
 #[path = "../../src/arch/x86_64/linux/tty.rs"]
 pub mod tty;
 
+// `net_if_abi` — чистый ABI `SIOCGIF*`: 40-байтный `ifreq` (name 16 @0,
+// union @16), `sockaddr_in`/`sockaddr` для адреса/маски/MAC и номера запросов
+// из Linux UAPI. `core`-only, без `super::`-зависимостей, поэтому host-свойство
+// `net_if_abi` кодирует/декодирует ровно тот источник, что компилирует ядро.
+#[path = "../../src/arch/x86_64/linux/net_if_abi.rs"]
+pub mod net_if_abi;
+
 // `regs` is the pure 15-GPR syscall frame contract (`repr(C)`, `rax` at offset
 // 112) — `core`-only and self-contained, included here so the tick-path frame
 // mirror below can be asserted against the REAL struct rather than a copy.
@@ -216,6 +270,16 @@ pub mod regs;
 // asserts byte-for-byte in-QEMU (property `irq_frame`).
 #[path = "../../src/arch/x86_64/linux/trap_frame.rs"]
 pub mod trap_frame;
+
+// `compat_guard` — владелец и глубина входа в `COMPAT_STATES` (fix/pf-guard-reentry):
+// тик, вытеснивший задачу между `enter` и `lock()`, раньше оставлял глобальную
+// глубину >0, обработчик #PF отказывал в законной ленивой странице постороннего
+// процесса, а kill-путь сбрасывал счётчик и приводил к underflow. Модуль
+// `core`-only (атомики), поэтому host-свойство `pf_guard_reentry` исполняет ровно
+// тот исходник, который компилирует ядро, и проверяет межзадачные чередования,
+// которые в QEMU ловятся только вероятностно.
+#[path = "../../src/arch/x86_64/linux/compat_guard.rs"]
+pub mod compat_guard;
 
 // `x509` is the pure minimal DER (ASN.1) reader + X.509 time decoding that the
 // TLS server-certificate verifier (issue #14) is built on. `core`-only and
@@ -265,6 +329,13 @@ pub mod ca_bundle;
 #[path = "../../src/net/tls_auth.rs"]
 pub mod tls_auth;
 
+// `netstats` — счётчики канала (`/proc/net/dev`, `SIOCGIF*`): байты и пакеты
+// RX/TX. `core`-only (атомики) и самодостаточный, поэтому host-свойство
+// `net_counters` исполняет ровно тот исходник, что компилирует ядро, и
+// проверяет и арифметику, и межпоточный инкремент (в QEMU это ловится только
+// вероятностно).
+#[path = "../../src/net/netstats.rs"]
+pub mod netstats;
 
 // `seed` is the pure `AT_RANDOM` fallback mixer (issue #16): a SHA-256
 // transcript over independent boot-time sources plus a counter-based derivation.
@@ -281,7 +352,6 @@ pub mod seed;
 #[path = "../../src/vfs/link_walk.rs"]
 pub mod link_walk;
 
-
 // `format_policy` decides whether boot may format a block device (issue #33).
 // Pure `core`, no I/O by design: `boot::init_fs` probes the device and feeds the
 // bytes in, so P50 asserts the decision itself against real GPT/MBR/ext2 boot
@@ -289,6 +359,16 @@ pub mod link_walk;
 // that no CI job could reach, because no CI job ever boots the kernel.
 #[path = "../../src/fs/format_policy.rs"]
 pub mod format_policy;
+
+// `mount_choice` is the recorded boot-time mount choice — the marker that makes
+// the disk menu a once-per-machine question instead of an every-boot 20 s
+// ritual (or, as the `has_pagh_volume` skip did, a question nobody ever saw).
+// Pure `core`, no I/O: `boot::init_fs` reads and writes one raw sector through
+// `BlockDevice`, so the property is that any damaged, foreign or random sector
+// reads as "no choice" — the failure mode being a silently skipped menu, which
+// decides a mount on the operator's behalf.
+#[path = "../../src/fs/mount_choice.rs"]
+pub mod mount_choice;
 
 // `nvme_prp` is the NVMe driver's pure transfer arithmetic: PRP1/PRP2 and the
 // PRP-list page contents (NVMe Base Spec §3.3.3), LBA-aligned command chunking,
@@ -341,6 +421,25 @@ pub mod usb_desc;
 #[path = "../../src/drivers/usb_hid_report.rs"]
 pub mod usb_hid_report;
 
+// Desktop-вариант B: ABI `fbdev` (`fb_var/fix_screeninfo`) и evdev
+// (`input_event` + set-1 → Linux keycodes). Оба модуля только `core`, поэтому
+// host-тесты проверяют разметку байтов и декодер ровно того исходника, который
+// компилирует ядро; смещения/размеры сверены с `linux/fb.h`/`linux/input.h`.
+#[path = "../../src/drivers/fb_abi.rs"]
+pub mod fb_abi;
+
+#[path = "../../src/drivers/input_event.rs"]
+pub mod input_event;
+
+// Shared VT surface ABI (`/dev/vtconsole0`) и перевод VT-байтов в PS/2
+// scancodes (`/dev/vtinput`). Оба модуля `core`-only: host-тесты проверяют
+// байтовую раскладку/валидатор/seqlock и таблицу ввода без QEMU.
+#[path = "../../src/drivers/vt_abi.rs"]
+pub mod vt_abi;
+
+#[path = "../../src/drivers/vt_keys.rs"]
+pub mod vt_keys;
+
 // Протокол RNDIS: сообщения управления и data-конверты. Модуль `core`+`alloc`
 // и самодостаточен, поэтому host-тесты разбирают точный исходник ядра и подают
 // ему усечённые/лживые ответы устройства.
@@ -354,7 +453,6 @@ pub mod usb_rndis_proto;
 // мгновенно и этого не воспроизводит.
 #[path = "../../src/drivers/xhci_hub.rs"]
 pub mod xhci_hub;
-
 
 // ── OpenPGP repository-metadata verification (issue #32) ─────────────────────
 // The pure verifier the `apt` trust chain will use: packet/armor parsing,
@@ -476,6 +574,18 @@ mod properties {
     mod p47;
     mod p48;
     mod p49;
+    // Канальные счётчики (`src/net/netstats.rs`): нулевой старт, точная
+    // арифметика байтов/пакетов, нулевая длина не считается, монотонность,
+    // отсутствие потерь при параллельном инкременте из нескольких потоков.
+    mod net_counters;
+    // `/proc/net/dev` (этап K1, контракт `docs/procfs.md` §15): две шапки
+    // дословно как в Linux, строка `%6s:` + 16 колонок в фиксированном порядке,
+    // нули в не ведущихся колонках, u64 без обрезки.
+    mod net_dev;
+    // `ifreq`/`sockaddr` ABI для `SIOCGIF*` (этап K2): точные константы Linux
+    // UAPI, раскладка/смещения, round-trip имени и `sockaddr_in`/`sockaddr`,
+    // байтовый порядок порта и адреса.
+    mod net_if_abi;
     // procfs (issue #11, contract `docs/procfs.md` §7): meminfo columns + the
     // libuv `strstr`/`sscanf` substrings; cpuinfo block/`\t: ` separators and the
     // truthfulness of the `flags` line against the CPUID bits; uptime arithmetic
@@ -507,7 +617,7 @@ mod properties {
     // merge that resolves it the wrong way drops properties silently. The test
     // FUNCTIONS keep their `p51_*` names — numbers inside a file are harmless.
     mod at_random;
-// ext2 symbolic links + hard links (issue #18, contract `EXT2-LINKS.md`
+    // ext2 symbolic links + hard links (issue #18, contract `EXT2-LINKS.md`
     // §2/§3/§8): the fast/slow layout boundary and inline image round-trip, the
     // `i_block` word reshape, and the link-count accounting that `unlink` and
     // `link` must obey (a name is only freed at the last link).
@@ -544,10 +654,33 @@ mod properties {
     // §7.4): Linux-verified cases plus a randomized comparison against an
     // independent restart-based oracle.
     mod link_walk_paths;
+
+    // PF-guard re-entry (fix/pf-guard-reentry): законный ленивый отказ ring 3
+    // обслуживается независимо от глубины compat-лока, а повторный вход
+    // kernel-контекста владельца по-прежнему отвергается. Свойства гоняют
+    // межзадачные чередования `CompatEntry` и чистую политику
+    // `trap_frame::pf_registry_must_refuse`.
+    mod pf_guard_reentry;
     // Tar members that carry links and the pure install plan built from them
     // (issue #18, contract `EXT2-LINKS.md` §5): `'1'` vs `'2'`, GNU `'L'`/`'K'`,
     // ustar `prefix`, pax records, and the hard-link ordering rules.
     mod tar_links;
+    // apt-fast W1: the incremental `TarWalker`/`scan_tar_meta` path must agree
+    // with `read_tar` at every chunk boundary and on every fixture, and the
+    // metadata plan must equal the eager plan (operations, order,
+    // deferred/unresolved, atomic-refusal counters). Also covers truncation,
+    // oversized extensions and byte-level panic-freedom.
+    mod tar_stream;
+    // apt-fast W3: the compact/versioned `PackageIndex` encoding behind the
+    // persistent index cache — lossless round-trip through the production
+    // streaming builder, strict structural validation (magic/version/lengths/
+    // StrRef ranges/no trailing bytes) and byte-level panic-freedom.
+    mod apt_index_cache;
+    // `ppkg install` progress UI: deterministic snapshots of the known bar,
+    // the unknown-total `<=>` animation at t=0/250/500/750/1000 ms, the
+    // percent/speed/size/ETA widgets, the 10 FPS redraw gate, the ANSI repaint
+    // sequence and the carriage-return/plain fallbacks.
+    mod ppkg_progress_ui;
     // OpenPGP repository-metadata verification (issue #32), contract
     // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
     //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.
@@ -560,6 +693,7 @@ mod properties {
     mod p51;
     mod p52;
     mod p53;
+    mod p58;
 
     // Controlling-terminal job control: the pure foreground-group/TOSTOP model
     // behind TIOCGPGRP/TIOCSPGRP and the SIGTTIN/SIGTTOU signal choice.
@@ -579,14 +713,21 @@ mod properties {
     // SIGCONT). Descriptive module name, same reason as `kill_target`.
     mod signal_stop;
 
-// The apt trust chain (issue #32, contract OPENPGP-VERIFY-CONTRACT.md
+    // `SIG_DFL` dispositions without handler work (issue #12): `Ignore` and
+    // `Cont`. The tick delivery path must consume those instead of building an
+    // `rt_sigframe` at handler 0 — the bug that killed the desktop compositor
+    // right after `bg` (pending SIGCONT) and made every later PDP/1 handshake
+    // time out. Direct regression guard for `default_action_is_silent`.
+    mod signal_dfl;
+
+    // The apt trust chain (issue #32, contract OPENPGP-VERIFY-CONTRACT.md
     // §5/§6): P54 covers the `Release` parser that binds `Packages` to the
     // signed metadata, P55 covers the per-record `.deb` digest on BOTH parser
     // paths (a missing or malformed digest must be `None`, never a zero digest
     // that would "verify" any payload).
     mod p54;
     mod p55;
-// The timer-tick frame adapter (issue #12, task t9): iret-frame mirror, the
+    // The timer-tick frame adapter (issue #12, task t9): iret-frame mirror, the
     // ring-3 classification, the exact handler-entry mutation set, the
     // "delivered signal == consumed signal" guard and the rt_sigframe round trip
     // for a tick-delivered signal. Descriptive module name, same reason as
@@ -618,10 +759,53 @@ mod properties {
     // number.
     mod p56;
 
+    // Setuid/setgid-on-exec + login identities (non-root A1/A2): the pure
+    // `bprm_fill_uid()` decision (`exec_setid`), the exact "no bits => identical
+    // credentials" law, the secureexec flag and `Creds::for_login`.
+    // `p59` is the blocking-read wakeup property and `p60` the shutdown policy,
+    // so this is `p61`.
+    mod p61;
+
+    // `/etc/shadow` + `$6$` SHA-512-crypt (non-root A4): known `openssl passwd -6`
+    // vectors, fail-closed locked/unknown methods, and line-preserving rewrite.
+    // `p60` is the shutdown policy, so this is `p62`.
+    mod p62;
+
+    // Non-root phase 2 (agent B): the sticky-directory deletion rule
+    // (`S_ISVTX`, /tmp 1777). Isolated from P56's ordinary permission matrix so
+    // that a regression in either rule names itself.
+    mod p63;
+
+    // Non-root phase 2 (agent B): the network admission policy — privileged
+    // `bind(2)` ports (`< 1024`, root only) and the `SOCK_RAW` gate. Pure
+    // decisions the AF_INET syscall path applies before touching the stack.
+    // `p60` is the shutdown policy, so this is `p64`.
+    mod p64;
+
     // Socket payload cap (`sendto`/`recvfrom`): the kernel validated with a
     // capped length and then allocated/copied the raw u64 count (2026-11-13
     // audit follow-up, F-x86v-1 allocation class). P57 pins the single policy.
     mod p57;
+
+    // Blocking AF_UNIX read wakeup: a read fd closed from a sibling thread must
+    // end the wait (`EBADF`), a peer close must produce `EOF`, and a live queue
+    // must keep waiting. Pins the watchdog `nr=45 arg0=0x3 closed` regression.
+    // `p58` is taken by the phase-1 groups identity property, so this is `p59`.
+    mod p59;
+
+    // `shutdown(2)` half-close policy (task-81): errno order and the
+    // per-direction read/write/poll answers. Pinned against a live-kernel probe.
+    // `p59` is the blocking-read wakeup property, so this is `p60`.
+    mod p60;
+
+    // Blocking AF_UNIX delivery: the wait step must be a SLEEP (not the
+    // `yield_current` busy-spin that starved the CPU under the compat lock), and
+    // `SO_RCVTIMEO` must turn a still-live queue into `EAGAIN` instead of an
+    // eternal `recv`. Pins the live PDP-client `poll()` hang (`nr=45` watchdog)
+    // and the `timeval`→milliseconds conversion the kernel lost.
+    // `p60` is the shutdown half-close policy above, so this is `p65` (the
+    // next free number after the non-root phase-2 properties P61–P64).
+    mod p65;
 
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is
@@ -635,6 +819,33 @@ mod properties {
     // descriptive name, same policy as `page_fault`/`irq_frame`.
     mod cow_ownership;
 
+    // `/dev/fb0` write-combining policy (desktop-render §2 A1/A2): random
+    // `IA32_PAT` values prove entries 4/5 are set to WC while every other entry
+    // survives, and random PTE bit patterns prove the fb0 leaf selects PAT entry
+    // 4 (never NO_CACHE/WRITE_THROUGH) or keeps the exact uncached fallback.
+    mod pat_wc_flags;
+
+    // AF_UNIX SCM_RIGHTS fd passing (desktop B): `sendmsg` control-buffer
+    // decoding (`__scm_send`), Linux-observed `recvmsg` delivery/truncation
+    // plan, and the encode/decode round trip. Pure `cmsg` layout only — the
+    // effectful fd-table half is covered by the in-QEMU `desktop-b::SCM_RIGHTS`
+    // routines.
+    mod scm_cmsg;
+
+    // Recorded boot-time mount choice (`src/fs/mount_choice.rs`): the marker
+    // that makes the disk menu a once-per-machine question. Round trip of the
+    // written sector, and — the failure mode that decides a mount on the
+    // operator's behalf — every damaged or foreign sector reads as "no choice",
+    // so the menu is asked again instead of silently skipped.
+    mod mount_choice;
+
+    // Demand-paged user buffers on the general `read(2)`/`write(2)` path: the
+    // per-page acceptance table (`validate::page_acceptance`) shared by the
+    // syscall copy paths and `handle_user_page_fault`. Pins that absence alone
+    // is never accepted, that a large lazy anon span is fully populatable, and
+    // that `PROT_NONE`/out-of-region stay refused. The end-to-end half is the
+    // in-QEMU `userbuf::lazy_anon_read_write` routine.
+    mod user_buffer_paging;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

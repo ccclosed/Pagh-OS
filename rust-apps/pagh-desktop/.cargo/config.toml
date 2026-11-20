@@ -1,0 +1,10 @@
+# Крейт собирается для хоста и для musl как обычное std-приложение.
+# Родительский `.cargo/config.toml` репозитория настроен на bare-metal ядро
+# (target x86_64-unknown-none + build-std core/alloc). Здесь target переопределён
+# на хост, а build-std включает std: иначе sysroot-std и собранный из исходников
+# core оказываются двумя копиями, и методы примитивов становятся неоднозначными.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[unstable]
+build-std = ["std"]

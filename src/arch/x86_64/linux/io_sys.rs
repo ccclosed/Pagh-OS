@@ -33,19 +33,21 @@ use alloc::vec::Vec;
 
 use crate::task::compat;
 use crate::task::fd::{OpenObject, PipeEndpoint, PipeReadResult, PipeWriteResult};
-use crate::vfs::ramfs::RamFile;
+use crate::vfs::memfd::MemFd;
 use crate::vfs::{self, VfsNode};
 
 use super::cred::{Access, Creds};
 use super::dirent::{d_type_for, dirent_reclen, encode_dirent64};
 use super::errno::Errno;
 use super::io::{plan_lseek, plan_read};
-use super::{check_user_ptr, check_user_ptr_writable};
+use super::net_if_sys;
+use super::{check_user_ptr, check_user_ptr_bounds, check_user_ptr_writable};
 // Два ioctl foreground-группы (`tcgetpgrp`/`tcsetpgrp`), как и бит `TOSTOP`,
 // берутся из чистой модели (`super::tty`), чтобы ядро и host-свойства не
 // разошлись в номерах ABI.
 use super::stat::{encode_stat, LinuxStat, S_IFDIR, S_IFLNK, S_IFREG};
 use super::tty::{TIOCGPGRP, TIOCSPGRP, TOSTOP};
+use super::unix_sock;
 
 /// Биты типа `st_mode` для символьного устройства (консоль/stdin), чтобы
 /// `fstat` стандартного потока сообщал правдоподобный (не regular) тип.
@@ -125,7 +127,18 @@ fn write_statx_sock(buf: u64) -> Result<u64, Errno> {
 }
 
 pub(crate) fn copy_in_pub(buf: u64, count: u64) -> alloc::vec::Vec<u8> {
-    copy_in(buf, count)
+    // Мелкие фиксированные записи соседних модулей (sigset 8, timespec 32,
+    // sockaddr, cmsg): `count` здесь не пользовательского масштаба, поэтому
+    // прямой `vec!` уместен и отказ выделения невозможен.
+    let mut out = vec![0u8; count as usize];
+    if count > 0 {
+        // SAFETY: диапазон проверен вызывающим (`check_user_ptr`), а активный
+        // CR3 — user PML4 вызывающего процесса, поэтому источник читаем.
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf as *const u8, out.as_mut_ptr(), count as usize);
+        }
+    }
+    out
 }
 pub(crate) fn copy_out_pub(buf: u64, data: &[u8]) -> Result<(), Errno> {
     copy_out(buf, data)
@@ -143,6 +156,24 @@ pub(crate) fn copy_out_checked(ptr: u64, src: &[u8]) -> Result<(), Errno> {
     copy_out(ptr, src)
 }
 
+/// Опубликовать `src` в пользовательский приёмник `read(2)`/`readv(2)`/
+/// `pread(2)`: подпереть ленивые страницы demand paging'ом, затем скопировать
+/// с повторной проверкой.
+///
+/// ПОЧЕМУ не `copy_out_checked` напрямую: приёмник `read(2)` у реальных
+/// приложений — свежий `Vec`/`Box` на ленивой куче `brk` или анонимный `mmap`
+/// (`vec![0u8; total]`), чьи страницы ещё не подперты. `check_user_ptr_writable`
+/// требует PRESENT и отвергал такой законный буфер `EFAULT`'ом на любой длине
+/// больше одной страницы. Порядок здесь тот же, что в vt-bridge фиксе:
+/// `populate_user_out` (политика `handle_user_page_fault`) → проверка прав →
+/// копия. Проверка идёт ПОСЛЕ подпирания и по фактической длине `src`, поэтому
+/// TOCTOU-контракт сохраняется: страница, ставшая read-only или исчезнувшая,
+/// пока вызов уступал CPU, по-прежнему даёт `EFAULT` до записи.
+fn publish_read(ptr: u64, src: &[u8]) -> Result<(), Errno> {
+    super::mem_sys::populate_user_out(ptr, src.len() as u64)?;
+    copy_out_checked(ptr, src)
+}
+
 /// Свести ошибку записи в VFS к errno.
 ///
 /// Узел без `write` — файл только для чтения; таковы файлы `/proc`, и Linux
@@ -150,6 +181,9 @@ pub(crate) fn copy_out_checked(ptr: u64, src: &[u8]) -> Result<(), Errno> {
 fn write_errno(e: crate::vfs::VfsError) -> Errno {
     match e {
         crate::vfs::VfsError::NotSupported => Errno::EACCES,
+        // `/dev/full`: Linux отвечает ENOSPC, и POSIX-программы полагаются на
+        // эту ошибку в тестах записи.
+        crate::vfs::VfsError::NoSpace => Errno::ENOSPC,
         _ => Errno::EINVAL,
     }
 }
@@ -229,6 +263,12 @@ pub fn file_backing_for_fd(fd: u32) -> Option<(Arc<dyn VfsNode>, String)> {
     .flatten()
 }
 
+/// `f_flags` открытого дескриптора (или `None`, если fd закрыт): нужен
+/// `mmap(MAP_SHARED)` для проверки «открыт на запись» и `fcntl` для `F_GETFL`.
+pub fn fd_open_flags(fd: u32) -> Option<u64> {
+    compat::with_current_compat(|cs| cs.fds.open_flags(fd)).flatten()
+}
+
 /// Зафиксировать новое смещение открытого дескриптора (no-op, если это сейчас
 /// не открытый `File`). Вызывается после `read`/`write`/`lseek`, сдвинувших
 /// смещение.
@@ -279,11 +319,29 @@ fn console_write(slice: &[u8]) {
     }
 }
 
+/// `len` нулевых байт под копию пользовательских данных, либо `ENOMEM`.
+///
+/// ПОЧЕМУ не `vec![0u8; len]`: `len` выводится из пользовательского `count`
+/// (до `COUNT_MAX` = 2 ГиБ), а куча ядра фиксирована (512 МиБ). Неудачная
+/// аллокация в `no_std` паникует, `panic = "abort"` останавливает машину —
+/// то есть `write(2)`/`read(2)` с большим `count` стали бы machine-kill'ом
+/// ровно на тех буферах, которые этот фикс разрешает (ленивый anon-буфер
+/// больше не требует резидентности всех страниц заранее). Отказ обязан быть
+/// `ENOMEM`, как у нехватки памяти в Linux.
+fn try_user_buf(len: u64) -> Result<Vec<u8>, Errno> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len as usize)
+        .map_err(|_| Errno::ENOMEM)?;
+    buf.resize(len as usize, 0);
+    Ok(buf)
+}
+
 /// Скопировать `len` проверенных пользовательских байт по `ptr` в свой буфер.
 ///
-/// ПРЕДУСЛОВИЕ: `[ptr, ptr+len)` уже прошёл [`check_user_ptr`].
-fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
-    let mut buf = vec![0u8; len as usize];
+/// ПРЕДУСЛОВИЕ: `[ptr, ptr+len)` уже прошёл [`check_user_ptr`]. Нехватка
+/// памяти — `ENOMEM` (см. [`try_user_buf`]), а не паника.
+fn copy_in(ptr: u64, len: u64) -> Result<Vec<u8>, Errno> {
+    let mut buf = try_user_buf(len)?;
     if len > 0 {
         // SAFETY: диапазон проверен (в границах, все страницы отображены), а
         // активный CR3 — user PML4 вызывающего процесса, поэтому источник читаем.
@@ -291,7 +349,7 @@ fn copy_in(ptr: u64, len: u64) -> Vec<u8> {
             core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len as usize);
         }
     }
-    buf
+    Ok(buf)
 }
 
 /// Скопировать `src` наружу в пользовательский буфер по `ptr`.
@@ -335,25 +393,144 @@ fn read_user_cstr(ptr: u64) -> Result<String, Errno> {
     Err(Errno::EINVAL)
 }
 
+/// Блокирующее/неблокирующее чтение конца очереди (pipe или AF_UNIX-сокета).
+///
+/// Ожидание — уступка CPU с перечитыванием очереди. На каждой уступке
+/// перепроверяется владение очередью: закрытый из соседнего потока дескриптор
+/// EOF не выставляет (счётчики очереди считают концы, а не fd), поэтому без
+/// [`unix_sock::endpoint_wait_verdict`] заблокированный `read` спал бы вечно —
+/// тот же класс зависания, что watchdog печатает для `recvfrom` (nr 45).
 fn read_pipe(e: &PipeEndpoint, dst: &mut [u8]) -> Result<usize, Errno> {
+    // `SO_RCVTIMEO` читается ОДИН раз на входе: пока спим, соседний поток может
+    // его поменять, но Linux применяет значение, действовавшее на начало
+    // вызова, и пересчёт на каждом витке давал бы «вечный» таймаут.
+    let deadline = super::sock_wait::Deadline::from_ticks(
+        crate::arch::x86_64::apic::ms_to_ticks(e.rcv_timeout_ms()),
+        crate::task::scheduler::ticks(),
+    );
     loop {
         match e.read(dst) {
             PipeReadResult::Data(n) => return Ok(n),
             PipeReadResult::Eof => return Ok(0),
             PipeReadResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
-            PipeReadResult::WouldBlock => crate::task::scheduler::yield_current(),
+            PipeReadResult::WouldBlock => {
+                let referenced = unix_sock::endpoint_reads_queue(e);
+                let timed_out = deadline
+                    .as_ref()
+                    .is_some_and(|d| d.expired(crate::task::scheduler::ticks()));
+                match super::sock_wait::read_step(referenced, e.writers(), timed_out) {
+                    // Сон, а не `yield_current()`: уступка оставляет задачу
+                    // готовой, поэтому блокирующий `read` выедал CPU и на каждом
+                    // витке брал глобальный compat-лок. `hlt` до тика — 1 мс.
+                    super::sock_wait::ReadStep::Sleep => crate::task::scheduler::sleep_ticks(1),
+                    super::sock_wait::ReadStep::TimedOut => return Err(Errno::EAGAIN),
+                    super::sock_wait::ReadStep::Eof => return Ok(0),
+                    super::sock_wait::ReadStep::Ebadf => return Err(Errno::EBADF),
+                }
+            }
         }
     }
 }
 fn write_pipe(e: &PipeEndpoint, src: &[u8]) -> Result<usize, Errno> {
+    // Симметрично `read_pipe`: `SO_SNDTIMEO` фиксируется на входе.
+    let deadline = super::sock_wait::Deadline::from_ticks(
+        crate::arch::x86_64::apic::ms_to_ticks(e.snd_timeout_ms()),
+        crate::task::scheduler::ticks(),
+    );
     loop {
         match e.write(src) {
             PipeWriteResult::Data(n) => return Ok(n),
             PipeWriteResult::Broken => return Err(Errno::EPIPE),
             PipeWriteResult::WouldBlock if e.nonblocking() => return Err(Errno::EAGAIN),
-            PipeWriteResult::WouldBlock => crate::task::scheduler::yield_current(),
+            PipeWriteResult::WouldBlock => {
+                // Зеркало `read_pipe`: закрытие ПИШУЩЕГО fd из соседнего
+                // потока счётчики очереди не меняет, и без перепроверки
+                // владения этот `write` спал бы вечно.
+                let referenced = unix_sock::endpoint_writes_queue(e);
+                let timed_out = deadline
+                    .as_ref()
+                    .is_some_and(|d| d.expired(crate::task::scheduler::ticks()));
+                match super::sock_wait::write_step(referenced, timed_out) {
+                    super::sock_wait::WriteStep::Sleep => crate::task::scheduler::sleep_ticks(1),
+                    super::sock_wait::WriteStep::TimedOut => return Err(Errno::EAGAIN),
+                    super::sock_wait::WriteStep::Ebadf => return Err(Errno::EBADF),
+                }
+            }
         }
     }
+}
+
+/// `read(2)` на `/dev/input/event0`: одно 24-байтное `struct input_event` за
+/// вызов.
+///
+/// Linux evdev требует `count >= sizeof(struct input_event)` (иначе `EINVAL`) и
+/// возвращает ровно одно событие. Пустая очередь блокирует вызов до события;
+/// `O_NONBLOCK` даёт `EAGAIN`, доставимый сигнал — `EINTR`. Nonblock-флаг
+/// читается ДО цикла ожидания: compat-лок нельзя держать, пока уступаем CPU.
+fn read_evdev_event(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
+    const EV_SIZE: u64 = crate::drivers::evdev::EVENT_SIZE as u64;
+    if count < EV_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr_writable(buf, EV_SIZE)?;
+    let nonblock = fd_open_flags(fd)
+        .map(|f| f & crate::task::fd::O_NONBLOCK != 0)
+        .unwrap_or(false);
+    let mut event = [0u8; crate::drivers::evdev::EVENT_SIZE];
+    loop {
+        if crate::drivers::evdev::read_event(&mut event) {
+            // Повторная проверка приёмника: буфер мог исчезнуть, пока вызов
+            // уступал CPU (тот же TOCTOU-контракт, что у pipe/read).
+            copy_out_checked(buf, &event)?;
+            return Ok(EV_SIZE);
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if super::signal::has_deliverable_current() {
+            return Err(Errno::EINTR);
+        }
+        crate::task::scheduler::yield_current();
+    }
+}
+
+/// `read(2)` с `/dev/vtconsole0`: один целостный снимок shared-поверхности.
+///
+/// Отличается от общего файлового пути только подготовкой приёмника. Клиент
+/// (`pagh-terminal --vt`) читает снимок в свежий анонимный `mmap`, страницы
+/// которого ещё не подперты: общая проверка присутствия по всему `buf` давала
+/// ему `EFAULT` на 100-килобайтном снимке, хотя диапазон — законное
+/// записываемое отображение. Здесь запрос урезается до реально копируемого
+/// остатка снимка (как `read(2)` в Linux), а страницы приёмника подпираются
+/// [`super::mem_sys::populate_user_out`] — той же политикой demand paging, что
+/// применил бы обработчик page fault. Настоящий отказ (адрес вне
+/// зарегистрированных регионов, `PROT_NONE`, read-only лист) остаётся `EFAULT`
+/// и по-прежнему приходит из [`copy_out_checked`].
+fn read_vtconsole(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
+    let (node, offset) = match resolve_fd(fd) {
+        Some(Resolved::File { node, offset }) => (node, offset),
+        _ => return Err(Errno::EBADF),
+    };
+    let (copied, _) = plan_read(node.size(), offset, count);
+    if copied == 0 {
+        return Ok(0);
+    }
+    super::mem_sys::populate_user_out(buf, copied)?;
+    let mut kbuf = vec![0u8; copied as usize];
+    let n = node.read(offset, &mut kbuf).map_err(|e| {
+        crate::error!(
+            "[linux] vtconsole read failed: {:?} off={} len={}",
+            e,
+            offset,
+            copied
+        );
+        Errno::EIO
+    })?;
+    // Повторная проверка на единственном choke point'е копирования наружу:
+    // приёмник мог исчезнуть/стать read-only, пока вызов уступал CPU.
+    copy_out_checked(buf, &kbuf[..n])?;
+    set_fd_offset(fd, offset + n as u64);
+    Ok(n as u64)
 }
 
 /// `read` (0): скопировать до `count` байт файла с текущего смещения в буфер
@@ -363,7 +540,34 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr(buf, count)?;
+    // evdev читает одно событие (24 байта), поэтому полный `count` ему не
+    // обязан быть отображён: Linux проверяет только `sizeof(input_event)`.
+    // `/dev/vtconsole0` отдаёт снимок целиком, поэтому проверять присутствие
+    // страниц по всему `count` нельзя: клиент читает его в свежий анонимный
+    // `mmap`, чьи страницы ещё не подперты demand paging'ом, и общая проверка
+    // ниже отвергла бы законный буфер с `EFAULT` (Linux проверяет только
+    // реально копируемый диапазон). Специальный путь урезает запрос до остатка
+    // снимка и подпирает приёмник той же политикой, что и page fault.
+    if let Some(Resolved::File { node, .. }) = resolve_fd(fd as u32) {
+        if node.is_vtinput() {
+            return Err(Errno::EBADF);
+        }
+        if node.is_evdev() {
+            return read_evdev_event(fd as u32, buf, count);
+        }
+        if node.is_vtconsole() {
+            return read_vtconsole(fd as u32, buf, count);
+        }
+    }
+    // PRESENT больше не требуется от всего `count`: `read(2)` копирует
+    // `min(count, доступное)`, и требование резидентности всех `count` байт
+    // отвергало законные буферы — свежий `Vec`/`Box` на ленивой куче `brk` или
+    // анонимный `mmap`, заполняемый как раз этим вызовом. Остаётся диапазонная
+    // проверка (не пользовательский адрес/переполнение → `EFAULT`), а
+    // присутствие и права проверяются по фактической длине копии; страницы
+    // приёмника подпирает `publish_read`/`populate_user_out` той же политикой,
+    // что и обработчик page fault.
+    check_user_ptr_bounds(buf, count)?;
 
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
@@ -392,7 +596,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             if count < 8 {
                 return Err(Errno::EINVAL);
             }
-            check_user_ptr(buf, 8)?;
+            super::mem_sys::populate_user_out(buf, 8)?;
             loop {
                 let due = state.lock().take(crate::task::scheduler::ticks());
                 if due > 0 {
@@ -415,7 +619,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             if count < 8 {
                 return Err(Errno::EINVAL);
             }
-            check_user_ptr(buf, 8)?;
+            super::mem_sys::populate_user_out(buf, 8)?;
             loop {
                 let mut v = val.lock();
                 if *v > 0 {
@@ -439,26 +643,27 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::InetTcp(t)) => {
-            let mut data = vec![0u8; count as usize];
+            // `count` — пользовательский: буфер ядра ограничен кучей, OOM → ENOMEM.
+            let mut data = try_user_buf(count)?;
             let n = crate::arch::x86_64::linux::inet_sock::tcp_read(fd, &mut data)?;
-            copy_out_checked(buf, &data[..n])?;
+            publish_read(buf, &data[..n])?;
             return Ok(n as u64);
         }
         Some(Resolved::InetUdp(_)) => Err(Errno::ENOTCONN), // только recvfrom
         Some(Resolved::PipeRead(e)) => {
-            let mut data = vec![0u8; count as usize];
+            let mut data = try_user_buf(count)?;
             let n = read_pipe(&e, &mut data)?;
             if n > 0 {}
-            copy_out_checked(buf, &data[..n])?;
+            publish_read(buf, &data[..n])?;
             Ok(n as u64)
         }
         Some(Resolved::Socket { rx, .. }) => {
-            let mut data = vec![0u8; count as usize];
+            let mut data = try_user_buf(count)?;
             let n = read_pipe(&rx, &mut data)?;
             if n > 0 {
                 diag_count(&DIAG_SOCK_R, "sock read", n as u64, 16384);
             }
-            copy_out_checked(buf, &data[..n])?;
+            publish_read(buf, &data[..n])?;
             Ok(n as u64)
         }
         Some(Resolved::File { node, offset }) => {
@@ -467,7 +672,11 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             if copied == 0 {
                 return Ok(0);
             }
-            let mut kbuf = vec![0u8; copied as usize];
+            // Подпереть приёмник ДО чтения: копируется ровно `copied` =
+            // min(count, size - offset), поэтому EFAULT приходит на реально
+            // недоступном диапазоне, а не на всём `count`.
+            super::mem_sys::populate_user_out(buf, copied)?;
+            let mut kbuf = try_user_buf(copied)?;
             let n = node.read(offset, &mut kbuf).map_err(|e| {
                 // Настоящая ошибка чтения VFS/ext2 — не «неверный аргумент»:
                 // сообщаем EIO и логируем, что именно сломалось.
@@ -649,6 +858,15 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
     }
+    // `write(2)` читает ВЕСЬ `count` (copy_in на каждой ветке), поэтому здесь
+    // подпирание источника не «min(count, available)», а весь диапазон. Раньше
+    // PRESENT требовался от всех страниц `count`, и свежий пользовательский
+    // буфер — `Vec`/`Box` на ленивой куче `brk` или анонимный `mmap`, ещё не
+    // подпёртый, — отвергался `EFAULT`'ом, хотя ядро скопировало бы его без
+    // отказа. Подпирание идёт ТОЙ ЖЕ политикой, что и обработчик page fault
+    // (`populate_user_in` → `handle_user_page_fault`), а проверка присутствия
+    // остаётся и после него: она же отвергает страницу без `USER_ACCESSIBLE`.
+    super::mem_sys::populate_user_in(buf, count)?;
     check_user_ptr(buf, count)?;
 
     match resolve_fd(fd as u32) {
@@ -670,22 +888,22 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         Some(Resolved::Epoll) => Err(Errno::EINVAL),
         Some(Resolved::PipeRead(_)) => Err(Errno::EBADF),
         Some(Resolved::InetTcp(_)) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
             Ok(n as u64)
         }
         Some(Resolved::InetUdp(_)) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = crate::arch::x86_64::linux::inet_sock::udp_write_fd(fd, &data)?;
             Ok(n as u64)
         }
         Some(Resolved::PipeWrite(e)) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
 
             Ok(write_pipe(&e, &data)? as u64)
         }
         Some(Resolved::Socket { tx, .. }) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = write_pipe(&tx, &data)?;
             if n > 0 {
                 diag_count(&DIAG_SOCK_W, "sock write", n as u64, 16384);
@@ -697,12 +915,16 @@ pub fn sys_write(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
             // останавливается при TOSTOP (SIGTTOU + -EINTR), как в Linux; если
             // TOSTOP снят, запись проходит.
             crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             console_write(&data);
             Ok(count)
         }
+        Some(Resolved::File { node, .. }) if node.is_vtconsole() => {
+            // Shared surface — read-only: экран публикует только ядро.
+            Err(Errno::EBADF)
+        }
         Some(Resolved::File { node, offset }) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = node.write(offset, &data).map_err(write_errno)?;
             set_fd_offset(fd as u32, offset + n as u64);
             Ok(n as u64)
@@ -725,6 +947,10 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     // Проверить сам массив iovec, прежде чем читать из него записи.
+    // Массив iovec ядро читает целиком: подпереть ленивые страницы и затем
+    // проверить присутствие (та же политика demand paging, что у page fault).
+    // Без этого writev/readv из свежего `Vec<iovec>` на куче давал EFAULT.
+    super::mem_sys::populate_user_in(iov, iovcnt * IOV_SIZE)?;
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
 
     let target = resolve_fd(fd as u32).ok_or(Errno::EBADF)?;
@@ -745,8 +971,9 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
             if len == 0 {
                 continue;
             }
+            super::mem_sys::populate_user_in(base, len)?;
             check_user_ptr(base, len)?;
-            let data = copy_in(base, len);
+            let data = copy_in(base, len)?;
             let n = crate::arch::x86_64::linux::inet_sock::tcp_write(fd, &data)?;
             total += n as u64;
             if (n as u64) < len {
@@ -788,8 +1015,9 @@ pub fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
         if len > COUNT_MAX {
             return Err(Errno::EINVAL);
         }
+        super::mem_sys::populate_user_in(base, len)?;
         check_user_ptr(base, len)?;
-        let data = copy_in(base, len);
+        let data = copy_in(base, len)?;
         match &target {
             Resolved::Console => {
                 // Тот же контроль доступа к терминалу, что у `write(2)`:
@@ -841,6 +1069,10 @@ pub fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
     if iovcnt > IOV_MAX {
         return Err(Errno::EINVAL);
     }
+    // Массив iovec ядро читает целиком: подпереть ленивые страницы и затем
+    // проверить присутствие (та же политика demand paging, что у page fault).
+    // Без этого writev/readv из свежего `Vec<iovec>` на куче давал EFAULT.
+    super::mem_sys::populate_user_in(iov, iovcnt * IOV_SIZE)?;
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     let mut total: u64 = 0;
     for i in 0..iovcnt {
@@ -876,6 +1108,10 @@ pub fn sys_preadv(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, Er
     if iovcnt > IOV_MAX {
         return Err(Errno::EINVAL);
     }
+    // Массив iovec ядро читает целиком: подпереть ленивые страницы и затем
+    // проверить присутствие (та же политика demand paging, что у page fault).
+    // Без этого writev/readv из свежего `Vec<iovec>` на куче давал EFAULT.
+    super::mem_sys::populate_user_in(iov, iovcnt * IOV_SIZE)?;
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     let mut total: u64 = 0;
     for i in 0..iovcnt {
@@ -911,6 +1147,10 @@ pub fn sys_pwritev(fd: u64, iov: u64, iovcnt: u64, offset: u64) -> Result<u64, E
     if iovcnt > IOV_MAX {
         return Err(Errno::EINVAL);
     }
+    // Массив iovec ядро читает целиком: подпереть ленивые страницы и затем
+    // проверить присутствие (та же политика demand paging, что у page fault).
+    // Без этого writev/readv из свежего `Vec<iovec>` на куче давал EFAULT.
+    super::mem_sys::populate_user_in(iov, iovcnt * IOV_SIZE)?;
     check_user_ptr(iov, iovcnt * IOV_SIZE)?;
     let mut total: u64 = 0;
     for i in 0..iovcnt {
@@ -1071,6 +1311,11 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
     };
     let fd = compat::with_current_compat(|cs| cs.fds.alloc_with_flags(obj, flags))
         .ok_or(Errno::EBADF)??;
+    if node.is_vtconsole() {
+        // Публикация включается после успешной аллокации fd: клиент сразу
+        // получает снимок уже нарисованного shell-текста.
+        crate::drivers::vtsurface::activate();
+    }
     Ok(fd as u64)
 }
 
@@ -1118,6 +1363,27 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
             // Root обходит read/write, но для обхода каталогов через VFS ему всё
             // равно нужен execute-бит, и этот обход уже произошёл выше.
             check_open_mode(&node, flags)?;
+            // `/dev/fb0`: экран забирает первый открывший (композитор), а на
+            // serial-only boot устройства нет — ENODEV, не «пустой файл».
+            if node.is_fbdev() {
+                if node.fb_info().is_none() {
+                    return Err(Errno::ENODEV);
+                }
+                crate::drivers::framebuffer::takeover_acquire();
+            }
+            // `/dev/vtconsole0` — read-only снимок консоли; запись/чтение
+            // vtinput — строго по назначению (ABI: 0600, read-only/write-only).
+            if node.is_vtconsole() {
+                if node.vtconsole_info().is_none() {
+                    return Err(Errno::ENODEV);
+                }
+                if flags & 0o3 != 0 {
+                    return Err(Errno::EACCES);
+                }
+            }
+            if node.is_vtinput() && flags & 0o3 == 0 {
+                return Err(Errno::EACCES);
+            }
             if flags & O_TRUNC_FL != 0 && !node.is_directory() {
                 // Best effort: узлы без поддержки truncate (обычные файлы ext2
                 // в этом минимальном слое) сохраняют содержимое.
@@ -1208,9 +1474,20 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
     // NET.lock из обработчика syscall, рискует дедлоком: спинлоки выключают IF,
     // и сетевой поток не может выполниться, чтобы отпустить свою сторону. Слот
     // SocketSet освободится только при перезагрузке.
+    // `/dev/vtconsole0`: закрытие последнего fd выключает публикацию shared
+    // surface (уже взятые mmap-снимки остаются валидны до munmap).
+    let closing_vtconsole = matches!(
+        resolve_fd(fd as u32),
+        Some(Resolved::File { ref node, .. }) if node.is_vtconsole()
+    );
     let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
     match res {
-        Some(Ok(())) => Ok(0),
+        Some(Ok(())) => {
+            if closing_vtconsole {
+                crate::drivers::vtsurface::deactivate();
+            }
+            Ok(0)
+        }
         Some(Err(e)) => Err(e),
         None => Err(Errno::EBADF),
     }
@@ -1248,12 +1525,58 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
             });
             Ok(offset)
         }
+        Some(Resolved::File { node, .. }) if node.is_vtconsole() || node.is_vtinput() => {
+            Err(Errno::ESPIPE)
+        }
         Some(Resolved::File { node, offset: cur }) => {
             let size = node.size();
             let new_off = plan_lseek(whence as u32, cur, size, offset as i64)?;
             set_fd_offset(fd as u32, new_off);
             Ok(new_off)
         }
+    }
+}
+
+/// `ftruncate` (77): изменить размер открытого regular-файла.
+///
+/// Нужен композитору для memfd: `memfd_create` даёт пустой файл, `ftruncate`
+/// задаёт размер SHM-буфера, дальше `mmap(MAP_SHARED)` отображает страницы.
+/// Дескриптор обязан быть открыт на запись; символьные устройства (`fb0`,
+/// `event0`) не усекаются. Смещение fd Linux не меняет — так же и здесь.
+pub fn sys_ftruncate(fd: u64, length: u64) -> Result<u64, Errno> {
+    let acc = fd_open_flags(fd as u32).ok_or(Errno::EBADF)? & 0o3;
+    if acc == 0 {
+        return Err(Errno::EINVAL);
+    }
+    match resolve_fd(fd as u32) {
+        Some(Resolved::File { node, .. }) => {
+            if node.is_fbdev() || node.is_evdev() || node.is_vtconsole() || node.is_vtinput() {
+                return Err(Errno::EINVAL);
+            }
+            node.truncate(length).map_err(truncate_errno)?;
+            Ok(0)
+        }
+        Some(_) => Err(Errno::EINVAL),
+        None => Err(Errno::EBADF),
+    }
+}
+
+/// `truncate` (76): то же по пути (путь разыменовывается, как в `open`).
+pub fn sys_truncate(path: u64, length: u64) -> Result<u64, Errno> {
+    let p = read_user_cstr(path)?;
+    let abs = resolve_path(&p);
+    let node = walk(&abs, true)?;
+    if node.is_directory() {
+        return Err(Errno::EISDIR);
+    }
+    node.truncate(length).map_err(truncate_errno)?;
+    Ok(0)
+}
+
+fn truncate_errno(e: crate::vfs::VfsError) -> Errno {
+    match e {
+        crate::vfs::VfsError::NotSupported | crate::vfs::VfsError::InvalidArgument => Errno::EINVAL,
+        _ => Errno::EIO,
     }
 }
 
@@ -1318,13 +1641,31 @@ fn check_node_access(node: &Arc<dyn VfsNode>, access: Access) -> Result<(), Errn
 /// `may`, ему всё равно нужен execute-бит: каталог с правами `0644` не
 /// просматривается даже root.
 fn check_dir_mutation(dir: &Arc<dyn VfsNode>) -> Result<(), Errno> {
+    check_dir_mutation_of(dir, None)
+}
+
+/// [`check_dir_mutation`] плюс sticky-правило для существующей записи.
+///
+/// `child_owner` — владелец удаляемой/переименовываемой записи (`None` для
+/// создания: sticky-бит ограничивает только удаление и переименование чужих
+/// записей). В каталоге с `S_ISVTX` (`/tmp` 1777) Linux разрешает это только
+/// root'у, владельцу каталога и владельцу самой записи — иначе один
+/// непривилегированный пользователь мог бы уничтожать файлы другого. Отказ —
+/// `EPERM`, как в `may_delete()` Linux (не `EACCES`: биты каталога при этом
+/// позволяют операцию, запрещает дополнительное правило).
+fn check_dir_mutation_of(
+    dir: &Arc<dyn VfsNode>,
+    child_owner: Option<(u32, u32)>,
+) -> Result<(), Errno> {
     let creds = current_creds();
     let mode = dir.mode();
     let owner = dir.owner();
-    if creds.may(mode, owner, Access::Write) && creds.may(mode, owner, Access::Execute) {
-        Ok(())
-    } else {
-        Err(Errno::EACCES)
+    if !(creds.may(mode, owner, Access::Write) && creds.may(mode, owner, Access::Execute)) {
+        return Err(Errno::EACCES);
+    }
+    match child_owner {
+        Some(child) if !creds.may_delete_child(mode, owner, child) => Err(Errno::EPERM),
+        _ => Ok(()),
     }
 }
 
@@ -1485,6 +1826,11 @@ fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
         S_IFDIR | perms
     } else if node.is_symlink() {
         S_IFLNK | perms
+    } else if node.is_fbdev() || node.is_evdev() || node.is_vtconsole() || node.is_vtinput() {
+        // Символьные устройства варианта B: композитор видит S_IFCHR, как
+        // `/dev/fb0`/`/dev/input/event0` в Linux, и может отличить их от
+        // regular-файла до open.
+        S_IFCHR | perms
     } else {
         S_IFREG | perms
     }
@@ -1539,6 +1885,37 @@ fn write_stat_struct(stat: &LinuxStat, statbuf: u64) -> Result<(), Errno> {
         )
     };
     copy_out(statbuf, bytes)
+}
+
+/// `stat` (4): статус файла по пути в пользовательский `struct stat`.
+///
+/// Старый (до `newfstatat`) номер x86_64, который всё ещё зовут статические
+/// musl-бинари: Rust-std `Command::spawn`/`Path::exists` внутри
+/// `pagh-desktop` упирались в него и получали `ENOSYS`, из-за чего запуск
+/// дочернего процесса (`--spawn-demo`, панель Files/Terminal) падал с
+/// `Function not implemented (os error 38)`.
+///
+/// Семантика — как у Linux `stat`: конечная символическая ссылка
+/// разыменовывается (в отличие от `lstat`, то есть `newfstatat` с
+/// `AT_SYMLINK_NOFOLLOW`), относительный путь разрешается от cwd, а разметка
+/// результата — тот же 144-байтный [`LinuxStat`], что у `fstat`/`newfstatat`
+/// (x86_64 `struct stat`). Поэтому обработчик — тонкая обёртка над проверенной
+/// обвязкой `newfstatat`: одна реализация поиска в VFS, одна проверка буфера
+/// (`EFAULT` до записи) и один набор `ENOENT`/`ENOTDIR`/`ELOOP`.
+pub fn sys_stat(path: u64, statbuf: u64) -> Result<u64, Errno> {
+    sys_newfstatat(AT_FDCWD, path, statbuf, 0)
+}
+
+/// `lstat` (6): статус самого пути, конечный символический компонент НЕ
+/// разыменовывается.
+///
+/// Ровно та же тонкая обёртка над `newfstatat`, что и [`sys_stat`], но с
+/// `AT_SYMLINK_NOFOLLOW`: одна реализация поиска в VFS, одна проверка буфера и
+/// один набор `ENOENT`/`ENOTDIR`/`ELOOP`. Отдельный номер нужен потому, что
+/// `std::fs::symlink_metadata`, `ls -l` и `find` зовут `lstat` напрямую, а
+/// `ENOSYS` здесь ломал их на любом симлинке (`/proc/self/exe`, `/lib64`).
+pub fn sys_lstat(path: u64, statbuf: u64) -> Result<u64, Errno> {
+    sys_newfstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
 }
 
 /// `fstat` (5): заполнить пользовательский `struct stat` для открытого
@@ -1656,7 +2033,18 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     }
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
+        Some(Resolved::File { node, .. }) if node.is_fbdev() => fb_ioctl(&node, request, arg),
+        Some(Resolved::File { node, .. }) if node.is_vtconsole() => {
+            vtconsole_ioctl(&node, request, arg)
+        }
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
+        // Сетевые `SIOCGIF*` — на любом `AF_INET`-сокете, как в Linux. До этой
+        // ветки они падали в общий ENOTTY, и `ifconfig` не видел ни адреса, ни
+        // флагов, хотя `/proc/net/dev` уже отдавал счётчики. Неизвестный
+        // запрос по-прежнему ENOTTY (внутри `if_ioctl`).
+        Some(Resolved::InetTcp(_)) | Some(Resolved::InetUdp(_)) => {
+            net_if_sys::if_ioctl(request, arg)
+        }
         // tty-запрос на не-tty дескриптор — «неподходящий ioctl для
         // устройства», а не «неверный аргумент». isatty() из glibc ждёт ENOTTY;
         // EINVAL ещё и зажигал diag на каждой пробе isatty у CPython (TCGETS на
@@ -1672,6 +2060,95 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
 }
 
 // ─── поверхность tty ────────────────────────────────────────────────────────
+
+/// `ioctl(/dev/fb0)`: `FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO`.
+///
+/// Это единственная часть fbdev UAPI, которая нужна композитору: геометрия,
+/// stride, биты на пиксель и физическая база scanout. `FBIOPUT_*`/`FBIOBLANK`
+/// не реализованы и честно отвечают `ENOTTY` — притворяться, что режим
+/// переключён, значило бы отдать композитору неверный stride.
+fn fb_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u64, Errno> {
+    use crate::drivers::fb_abi::{
+        encode_fix, encode_var, FbBitfield, FixScreenInfo, VarScreenInfo, FBIOGET_FSCREENINFO,
+        FBIOGET_VSCREENINFO, FB_FIX_SIZE, FB_VAR_SIZE, FB_VISUAL_TRUECOLOR,
+    };
+    let info = node.fb_info().ok_or(Errno::ENODEV)?;
+    match request {
+        FBIOGET_VSCREENINFO => {
+            let var = VarScreenInfo {
+                xres: info.width,
+                yres: info.height,
+                xres_virtual: info.width,
+                yres_virtual: info.height,
+                xoffset: 0,
+                yoffset: 0,
+                bits_per_pixel: info.bpp,
+                grayscale: 0,
+                red: FbBitfield {
+                    offset: info.red_offset,
+                    length: info.red_length,
+                },
+                green: FbBitfield {
+                    offset: info.green_offset,
+                    length: info.green_length,
+                },
+                blue: FbBitfield {
+                    offset: info.blue_offset,
+                    length: info.blue_length,
+                },
+                transp: FbBitfield {
+                    offset: info.transp_offset,
+                    length: info.transp_length,
+                },
+                ..Default::default()
+            };
+            check_user_ptr_writable(arg, FB_VAR_SIZE as u64)?;
+            copy_out(arg, &encode_var(&var))?;
+            Ok(0)
+        }
+        FBIOGET_FSCREENINFO => {
+            let fix = FixScreenInfo {
+                id: crate::drivers::fb_abi::padded_id(b"paghfb"),
+                smem_start: info.phys,
+                smem_len: core::cmp::min(info.smem_len, u32::MAX as u64) as u32,
+                // FB_TYPE_PACKED_PIXELS
+                type_: 0,
+                type_aux: 0,
+                visual: FB_VISUAL_TRUECOLOR,
+                line_length: info.pitch,
+            };
+            check_user_ptr_writable(arg, FB_FIX_SIZE as u64)?;
+            copy_out(arg, &encode_fix(&fix))?;
+            Ok(0)
+        }
+        _ => Err(Errno::ENOTTY),
+    }
+}
+
+/// `ioctl(/dev/vtconsole0)`: `PGVT_IOC_INFO` (ABI v1).
+///
+/// Отдаёт геометрию и `total_bytes`, чтобы клиент мог отобразить/промапить
+/// поверхность, не угадывая размер. Прочие запросы — `ENOTTY`; режим/размер
+/// меняет только ядро.
+fn vtconsole_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u64, Errno> {
+    use crate::drivers::vt_abi::{encode_info, PgvtInfo, PGVT_IOC_INFO};
+    let info = node.vtconsole_info().ok_or(Errno::ENODEV)?;
+    if request != PGVT_IOC_INFO {
+        return Err(Errno::ENOTTY);
+    }
+    let out = PgvtInfo {
+        abi_version: 1,
+        total_bytes: info.total_bytes,
+        cols: info.cols as u32,
+        rows: info.rows as u32,
+        cell_size: 16,
+        header_len: 128,
+        reserved: [0, 0],
+    };
+    check_user_ptr_writable(arg, 32)?;
+    copy_out(arg, &encode_info(&out))?;
+    Ok(0)
+}
 
 /// `TCGETS`: прочитать атрибуты терминала (`struct termios`).
 const TCGETS: u64 = 0x5401;
@@ -1816,6 +2293,18 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
 static STDIN_PENDING: crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>> =
     crate::sync::spinlock::Spinlock::new(alloc::vec::Vec::new());
 
+/// Положить байты в stdin текущего foreground-процесса (`/dev/vtinput` →
+/// Linux-программа). Ограничение 4 КиБ: медленный читатель не должен дать
+/// userspace бесконечно растить kernel-heap.
+pub fn push_stdin_bytes(bytes: &[u8]) {
+    const MAX_PENDING: usize = 4096;
+    let mut q = STDIN_PENDING.lock();
+    let room = MAX_PENDING.saturating_sub(q.len());
+    if room != 0 {
+        q.extend_from_slice(&bytes[..core::cmp::min(bytes.len(), room)]);
+    }
+}
+
 // Libuv переводит сырой tty в O_NONBLOCK и мультиплексирует его через epoll;
 // блокирующее чтение в ядре останавливает весь TUI event loop nvim.
 static STDIN_NONBLOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1872,14 +2361,22 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         }
     }
     // Сначала вычерпать накопившиеся байты (raw-режим тоже может их оставлять).
-    {
+    // `publish_read` подпирает страницы приёмника demand paging'ом и берёт
+    // `COMPAT_STATES`, поэтому спинлок очереди отпускается до копии: держать
+    // его через подпирание/аллокацию кадров нельзя (инвариант 3 AGENTS.md).
+    let head = {
         let mut pending = STDIN_PENDING.lock();
-        if !pending.is_empty() {
+        if pending.is_empty() {
+            None
+        } else {
             let n = core::cmp::min(count as usize, pending.len());
-            let head: alloc::vec::Vec<u8> = pending.drain(..n).collect();
-            copy_out_checked(buf, &head)?;
-            return Ok(n as u64);
+            Some(pending.drain(..n).collect::<alloc::vec::Vec<u8>>())
         }
+    };
+    if let Some(head) = head {
+        let n = head.len() as u64;
+        publish_read(buf, &head)?;
+        return Ok(n);
     }
     let mut decoder = Decoder::new();
     // После первого потреблённого сканкода подождать ограниченное число
@@ -1957,7 +2454,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
             }
         }
         let n = core::cmp::min(count as usize, bytes.len());
-        copy_out_checked(buf, &bytes[..n])?;
+        publish_read(buf, &bytes[..n])?;
         if n < bytes.len() {
             STDIN_PENDING.lock().extend_from_slice(&bytes[n..]);
         }
@@ -1970,14 +2467,22 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
     if count == 0 {
         return Ok(0);
     }
-    {
+    // `publish_read` подпирает страницы приёмника demand paging'ом и берёт
+    // `COMPAT_STATES`, поэтому спинлок очереди отпускается до копии: держать
+    // его через подпирание/аллокацию кадров нельзя (инвариант 3 AGENTS.md).
+    let head = {
         let mut pending = STDIN_PENDING.lock();
-        if !pending.is_empty() {
+        if pending.is_empty() {
+            None
+        } else {
             let n = core::cmp::min(count as usize, pending.len());
-            let head: alloc::vec::Vec<u8> = pending.drain(..n).collect();
-            copy_out_checked(buf, &head)?;
-            return Ok(n as u64);
+            Some(pending.drain(..n).collect::<alloc::vec::Vec<u8>>())
         }
+    };
+    if let Some(head) = head {
+        let n = head.len() as u64;
+        publish_read(buf, &head)?;
+        return Ok(n);
     }
     let mut decoder = Decoder::new();
     let mut line: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -2059,9 +2564,10 @@ pub fn sys_access(path: u64, mode: u64) -> Result<u64, Errno> {
     // право поиска в каталоге при обходе, поэтому walk получает real id, а не
     // только финальную проверку прав.
     let creds = current_creds();
-    let real = Creds::new(
-        creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
-    );
+    // REAL-проекция, но с сохранением дополнительных групп: `setgroups(2)`
+    // меняет общий набор, поэтому `access(2)` обязан видеть group-класс так же,
+    // как обычный путь прав.
+    let real = creds.with_real_ids();
     // `access(2)` разыменовывает симлинки (висячая ссылка — ENOENT).
     let node = walk_as(&abs, true, real)?;
     let owner = node.owner();
@@ -2093,7 +2599,7 @@ pub fn sys_memfd_create(name: u64, flags: u64) -> Result<u64, Errno> {
         return Err(Errno::EINVAL);
     }
     let requested = read_user_cstr(name)?;
-    let node = Arc::new(RamFile::new(&alloc::format!("memfd:{requested}"))) as Arc<dyn VfsNode>;
+    let node = Arc::new(MemFd::new(&alloc::format!("memfd:{requested}"))) as Arc<dyn VfsNode>;
     let obj = OpenObject::File {
         node,
         path: alloc::format!("/memfd:{requested}"),
@@ -2171,9 +2677,14 @@ fn rename_paths(old: &str, new: &str, flags: u64) -> Result<u64, Errno> {
     // должен попасть в его цель); *источник* намеренно остаётся
     // неразыменованным — см. замечание выше.
     let ndir = walk(nparent, true)?;
-    check_dir_mutation(&ndir)?;
+    // Sticky: заменяемая запись приёмника тоже защищена — чужой файл нельзя
+    // перезаписать rename'ом в /tmp (Linux проверяет may_delete и для target).
+    let target_owner = walk(newabs, false).ok().map(|n| n.owner());
+    check_dir_mutation_of(&ndir, target_owner)?;
     let odir = walk(oparent, true)?;
-    check_dir_mutation(&odir)?;
+    // Источник: `node` уже разрешён выше (конечный компонент не разыменован),
+    // его владелец — тот, кого защищает sticky-бит исходного каталога.
+    check_dir_mutation_of(&odir, Some(node.owner()))?;
     // Прочитать весь исходный файл.
     //
     // `i_size` контролируется образом и может быть разреженным обещанием на
@@ -2335,7 +2846,7 @@ pub fn sys_unlink(path: u64) -> Result<u64, Errno> {
         None => return Err(Errno::ENOENT),
     };
     let dir = walk(parent, true)?;
-    check_dir_mutation(&dir)?;
+    check_dir_mutation_of(&dir, Some(node.owner()))?;
     dir.remove(name).map_err(|e| {
         crate::warn!("[linux] unlink failed: {:?} path={}", e, trimmed);
         Errno::EIO
@@ -2362,7 +2873,7 @@ pub fn sys_rmdir(path: u64) -> Result<u64, Errno> {
         None => return Err(Errno::ENOENT),
     };
     let dir = walk(parent, true)?;
-    check_dir_mutation(&dir)?;
+    check_dir_mutation_of(&dir, Some(node.owner()))?;
     dir.remove(name).map_err(|e| {
         crate::warn!("[linux] rmdir failed: {:?} path={}", e, trimmed);
         Errno::EIO
@@ -2438,9 +2949,8 @@ pub fn sys_faccessat(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64
     let check = if flags & AT_EACCESS != 0 {
         creds
     } else {
-        Creds::new(
-            creds.uid, creds.gid, creds.uid, creds.gid, creds.uid, creds.gid,
-        )
+        // REAL-проекция с сохранением дополнительных групп (см. `sys_access`).
+        creds.with_real_ids()
     };
     let node = walk_as(&abs, follow, check)?;
     let owner = node.owner();
@@ -2893,7 +3403,10 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
     }
-    check_user_ptr_writable(buf, count)?;
+    // Как у `read(2)`: копируется `min(count, size - offset)`, поэтому требовать
+    // PRESENT/права на всём `count` нельзя — диапазон проверяется здесь, а
+    // приёмник подпирается и проверяется на фактическую длину копии ниже.
+    check_user_ptr_bounds(buf, count)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
         Some(Resolved::Console)
@@ -2914,7 +3427,11 @@ pub fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, Er
             if copied == 0 {
                 return Ok(0);
             }
-            let mut kbuf = vec![0u8; copied as usize];
+            // Подпереть приёмник ДО чтения: копируется ровно `copied` =
+            // min(count, size - offset), поэтому EFAULT приходит на реально
+            // недоступном диапазоне, а не на всём `count`.
+            super::mem_sys::populate_user_out(buf, copied)?;
+            let mut kbuf = try_user_buf(copied)?;
             let n = node.read(offset, &mut kbuf).map_err(|e| {
                 // Настоящая ошибка чтения VFS/ext2 — не «неверный аргумент»:
                 // сообщаем EIO и логируем, что именно сломалось.
@@ -2942,6 +3459,9 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
     if count > COUNT_MAX {
         return Err(Errno::EINVAL);
     }
+    // Та же входная сторона, что у `write(2)`: подпереть ленивый источник и
+    // лишь затем проверять присутствие/права.
+    super::mem_sys::populate_user_in(buf, count)?;
     check_user_ptr(buf, count)?;
     match resolve_fd(fd as u32) {
         None => Err(Errno::EBADF),
@@ -2957,12 +3477,12 @@ pub fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> Result<u64, E
         Some(Resolved::Console) => {
             // Контроль доступа к терминалу, как у `write(2)`/`writev(2)`.
             crate::drivers::tty::check_access(super::tty::TtyAccess::Write)?;
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             console_write(&data);
             Ok(count)
         }
         Some(Resolved::File { node, .. }) => {
-            let data = copy_in(buf, count);
+            let data = copy_in(buf, count)?;
             let n = node.write(offset, &data).map_err(write_errno)?;
             // ЗАМЕЧАНИЕ: смещение дескриптора намеренно НЕ обновляется.
             Ok(n as u64)
@@ -3170,7 +3690,22 @@ fn poll_revents(fd: i32, events: i16) -> i16 {
             }
         }
         Some(Resolved::Epoll) => 0,
-        Some(Resolved::File { .. }) | Some(Resolved::Dir) => events & (POLLIN | POLLOUT),
+        Some(Resolved::File { node, .. }) => {
+            if node.is_evdev() {
+                // evdev: POLLIN ровно когда в очереди есть событие.
+                if crate::drivers::evdev::has_events() {
+                    events & POLLIN
+                } else {
+                    0
+                }
+            } else if node.is_fbdev() {
+                // Фреймбуфер всегда готов к записи (mmap — отдельный путь).
+                events & POLLOUT
+            } else {
+                events & (POLLIN | POLLOUT)
+            }
+        }
+        Some(Resolved::Dir) => events & (POLLIN | POLLOUT),
     }
 }
 /// Опубликовать ядерную копию массива pollfd в пользовательский указатель,
@@ -3200,7 +3735,7 @@ pub fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> Result<u64, Errno> {
     // её только через `publish_pollfds`, который заново проверяет приёмник.
     // Буфер, размонтированный во время ожидания, теперь даёт `-EFAULT`, а не
     // падение в ring 0 с остановкой машины.
-    let mut kfds = copy_in(fds, bytes);
+    let mut kfds = copy_in(fds, bytes)?;
     let ms = timeout as i64;
     let deadline = if ms < 0 {
         None
@@ -3283,7 +3818,14 @@ fn select_ready(fd: u64, want_write: bool) -> bool {
             }
         }
         Some(Resolved::Epoll) => false,
-        Some(Resolved::File { .. }) | Some(Resolved::Dir) => true,
+        Some(Resolved::File { node, .. }) => {
+            if node.is_evdev() {
+                !want_write && crate::drivers::evdev::has_events()
+            } else {
+                true
+            }
+        }
+        Some(Resolved::Dir) => true,
     }
 }
 

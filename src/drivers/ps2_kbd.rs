@@ -111,9 +111,45 @@ pub fn take_scancode() -> Option<u8> {
 /// Ctrl press that arrived on both paths (firmware PS/2 translation plus a real
 /// USB device) and latch `^C` without a keypress.
 pub fn inject_scancode(byte: u8) {
+    // Та же маршрутизация, что у IRQ1: evdev получает байт всегда, shell-кольцо —
+    // только пока клавиатурой не владеет VT-клиент. USB HID-путь зовёт именно
+    // эту функцию, поэтому одна точка покрывает оба источника.
+    deliver_physical(byte);
+}
+
+/// Доставить физический скан-код (IRQ1 или USB HID) обоим потребителям.
+///
+/// `/dev/input/event0` получает байт **всегда**: композитор — независимый
+/// читатель, и чтение event0 не отнимает скан-коды у shell. А вот в shell-кольцо
+/// байт кладётся только пока клавиатурой не владеет внешний VT-клиент
+/// ([`crate::drivers::vtinput::client_active`]): этот же байт вернётся в shell
+/// через `/dev/vtinput`, и вторая копия в том же кольце дала бы двойной ввод
+/// (двойное эхо, два элемента истории, повтор команды). Владельца, который уже
+/// завершился, снимает shell-цикл (`vtinput::reap_dead_client`), поэтому
+/// shell-only загрузка и закрытый терминал ввод не теряют.
+fn deliver_physical(byte: u8) {
+    crate::drivers::evdev::feed_scancode(byte);
+    if !crate::drivers::vtinput::client_active() {
+        push_to_ring(byte);
+    }
+}
+
+/// Положить байт в PS/2-кольцо, из которого читает shell.
+fn push_to_ring(byte: u8) {
     if let Some(kbd) = KEYBOARD.lock().as_ref() {
         kbd.push_scancode(byte);
     }
+}
+
+/// Положить скан-код в shell-кольцо, НЕ дублируя его в evdev.
+///
+/// Используется `/dev/vtinput`: терминал уже получает ввод из evdev-очереди
+/// desktop'а, и эхо его же синтетических клавиш обратно в event0 дало бы цикл.
+/// Шеллу нужен именно scancode-ring, поэтому evdev-путь здесь пропускается.
+/// Пока владелец клавиатуры — VT-клиент, это единственная доставка ввода в shell
+/// (прямой путь IRQ1/USB байт в кольцо не кладёт).
+pub fn inject_scancode_from_vt(byte: u8) {
+    push_to_ring(byte);
 }
 
 /// Whether at least one scancode is currently queued (non-destructive).
@@ -201,9 +237,10 @@ pub fn irq_handler() {
         }
     }
 
-    if let Some(ref kbd) = *KEYBOARD.lock() {
-        kbd.push_scancode(scancode);
-    }
+    // Маршрутизация: evdev получает байт всегда (композитор), shell-кольцо —
+    // только если клавиатурой не владеет VT-клиент; иначе этот же байт придёт
+    // в shell один раз через `/dev/vtinput`.
+    deliver_physical(scancode);
 }
 
 /// True when the ring buffer holds an unread scancode. Lets

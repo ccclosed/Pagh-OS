@@ -27,6 +27,9 @@ pub const PROT_EXEC: u32 = 4;
 
 /// Флаг `mmap`: отображение приватное (copy-on-write, не разделяемое).
 pub const MAP_PRIVATE: u32 = 0x2;
+/// Флаг `mmap`: отображение разделяемое (для memfd — общие физические кадры
+/// между отображениями и процессами после `fork`).
+pub const MAP_SHARED: u32 = 0x1;
 /// Флаг `mmap`: отображение не опирается на файл (заполняется нулями).
 pub const MAP_ANONYMOUS: u32 = 0x20;
 

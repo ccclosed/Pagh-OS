@@ -1361,3 +1361,303 @@ mod arena_tests {
         assert_eq!(r.len as usize, s.len());
     }
 }
+
+// ───────────────────────── compact on-disk encoding (apt-fast W3) ─────────────────────────
+
+/// Magic at the start of the compact [`PackageIndex`] encoding.
+///
+/// The encoding is the payload of the persistent apt index cache: it serializes
+/// the five arena buffers ([`PackageIndex`]'s compact representation) so a second
+/// `apt update` against an unchanged signed `Release` can rebuild the index
+/// without downloading, decompressing or parsing `Packages`. It is versioned and
+/// strictly length-delimited; a byte that does not decode exactly is rejected and
+/// the caller falls back to the verified network path.
+pub const COMPACT_MAGIC: [u8; 8] = *b"PAGHIDX1";
+/// Version of the compact encoding. Bump on any layout change; older caches are
+/// rejected as "not this version" and simply re-downloaded.
+pub const COMPACT_VERSION: u32 = 1;
+
+/// The exact on-disk size of one encoded raw record:
+/// four [`StrRef`]s (4 × 8), `size` (8), the `SHA256:` presence byte (1), the
+/// optional digest (32) and four counters (4 × 4).
+const COMPACT_RECORD_LEN: usize = 4 * 8 + 8 + 1 + 32 + 4 * 4;
+/// The exact on-disk size of one encoded dependency group (`alt_start`+`alt_len`).
+const COMPACT_GROUP_LEN: usize = 8;
+/// The exact on-disk size of one encoded [`StrRef`].
+const COMPACT_STRREF_LEN: usize = 8;
+
+/// Sanity ceilings for the decoder. The cache file is bounded by the 64 MiB disk
+/// anyway, but these keep a corrupt length field from requesting an absurd
+/// allocation before the byte stream has been proven long enough.
+const COMPACT_MAX_ARENA: u32 = 256 * 1024 * 1024;
+const COMPACT_MAX_RECORDS: u32 = 4_000_000;
+const COMPACT_MAX_GROUPS: u32 = 16_000_000;
+const COMPACT_MAX_ALT_REFS: u32 = 16_000_000;
+
+fn compact_push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn compact_push_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn compact_push_strref(out: &mut Vec<u8>, r: StrRef) {
+    compact_push_u32(out, r.off);
+    compact_push_u32(out, r.len);
+}
+
+/// A bounds-checked little-endian cursor over the encoded index.
+struct CompactReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CompactReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        CompactReader { bytes, pos: 0 }
+    }
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(self.take(4)?);
+        Some(u32::from_le_bytes(b))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(self.take(8)?);
+        Some(u64::from_le_bytes(b))
+    }
+    fn strref(&mut self) -> Option<StrRef> {
+        Some(StrRef {
+            off: self.u32()?,
+            len: self.u32()?,
+        })
+    }
+}
+
+/// A [`StrRef`] is valid when its byte range lies within the arena.
+fn compact_strref_in_arena(r: StrRef, arena_len: u32) -> bool {
+    (r.off as u64 + r.len as u64) <= arena_len as u64
+}
+
+impl PackageIndex {
+    /// Serialize this index into the versioned compact encoding (see
+    /// [`COMPACT_MAGIC`]).
+    ///
+    /// The result is the exact inverse of [`PackageIndex::from_compact_bytes`]:
+    /// the five arena buffers are written verbatim with explicit lengths, so the
+    /// decoder does no parsing of package text — only bounds-checked copying and
+    /// the same one-time lookup-table sort [`PackageIndexBuilder::finish`] does.
+    pub fn to_compact_bytes(&self) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(
+            self.arena.len()
+                + self.records.len() * COMPACT_RECORD_LEN
+                + self.dep_groups.len() * COMPACT_GROUP_LEN
+                + (self.dep_alts.len() + self.prov_refs.len()) * COMPACT_STRREF_LEN
+                + 64,
+        );
+        out.extend_from_slice(&COMPACT_MAGIC);
+        compact_push_u32(&mut out, COMPACT_VERSION);
+        compact_push_u32(&mut out, self.arena.len() as u32);
+        out.extend_from_slice(&self.arena);
+        compact_push_u32(&mut out, self.records.len() as u32);
+        for rec in self.records.iter() {
+            compact_push_strref(&mut out, rec.package);
+            compact_push_strref(&mut out, rec.version);
+            compact_push_strref(&mut out, rec.arch);
+            compact_push_strref(&mut out, rec.filename);
+            compact_push_u64(&mut out, rec.size);
+            match rec.sha256 {
+                Some(digest) => {
+                    out.push(1);
+                    out.extend_from_slice(&digest);
+                }
+                None => {
+                    out.push(0);
+                    out.extend_from_slice(&[0u8; 32]);
+                }
+            }
+            compact_push_u32(&mut out, rec.dep_group_start);
+            compact_push_u32(&mut out, rec.dep_group_len);
+            compact_push_u32(&mut out, rec.prov_start);
+            compact_push_u32(&mut out, rec.prov_len);
+        }
+        compact_push_u32(&mut out, self.dep_groups.len() as u32);
+        for group in self.dep_groups.iter() {
+            compact_push_u32(&mut out, group.alt_start);
+            compact_push_u32(&mut out, group.alt_len);
+        }
+        compact_push_u32(&mut out, self.dep_alts.len() as u32);
+        for r in self.dep_alts.iter() {
+            compact_push_strref(&mut out, *r);
+        }
+        compact_push_u32(&mut out, self.prov_refs.len() as u32);
+        for r in self.prov_refs.iter() {
+            compact_push_strref(&mut out, *r);
+        }
+        out
+    }
+
+    /// Decode the compact encoding produced by [`PackageIndex::to_compact_bytes`].
+    ///
+    /// Strict: magic, version, every length, every [`StrRef`] range and every
+    /// record's dependency/provides range must be consistent, and the stream must
+    /// end exactly at the end of the last table. Any deviation returns `None` —
+    /// the caller treats a cache as absent and uses the verified network path — so
+    /// corrupt or hostile bytes can never produce a partially-trusted index. Never
+    /// panics and never allocates more than a length that the remaining bytes can
+    /// actually back.
+    pub fn from_compact_bytes(bytes: &[u8]) -> Option<PackageIndex> {
+        let mut r = CompactReader::new(bytes);
+        if r.take(COMPACT_MAGIC.len())? != COMPACT_MAGIC {
+            return None;
+        }
+        if r.u32()? != COMPACT_VERSION {
+            return None;
+        }
+
+        let arena_len = r.u32()?;
+        if arena_len > COMPACT_MAX_ARENA || arena_len as usize > r.remaining() {
+            return None;
+        }
+        let arena = Vec::from(r.take(arena_len as usize)?);
+
+        let records_len = r.u32()?;
+        if records_len > COMPACT_MAX_RECORDS {
+            return None;
+        }
+        // Every record is fixed-size: refuse a count the remaining bytes cannot
+        // possibly hold BEFORE reserving anything.
+        if records_len as usize * COMPACT_RECORD_LEN > r.remaining() {
+            return None;
+        }
+        let mut records: Vec<PkgRecordC> = Vec::with_capacity(records_len as usize);
+        for _ in 0..records_len {
+            let package = r.strref()?;
+            let version = r.strref()?;
+            let arch = r.strref()?;
+            let filename = r.strref()?;
+            let size = r.u64()?;
+            let has_sha = r.u8()?;
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(r.take(32)?);
+            let sha256 = match has_sha {
+                0 => None,
+                1 => Some(digest),
+                // Any other presence byte is a corrupt encoding.
+                _ => return None,
+            };
+            let dep_group_start = r.u32()?;
+            let dep_group_len = r.u32()?;
+            let prov_start = r.u32()?;
+            let prov_len = r.u32()?;
+            records.push(PkgRecordC {
+                package,
+                version,
+                arch,
+                filename,
+                size,
+                sha256,
+                dep_group_start,
+                dep_group_len,
+                prov_start,
+                prov_len,
+            });
+        }
+
+        let groups_len = r.u32()?;
+        if groups_len > COMPACT_MAX_GROUPS
+            || groups_len as usize * COMPACT_GROUP_LEN > r.remaining()
+        {
+            return None;
+        }
+        let mut dep_groups: Vec<DepGroupC> = Vec::with_capacity(groups_len as usize);
+        for _ in 0..groups_len {
+            dep_groups.push(DepGroupC {
+                alt_start: r.u32()?,
+                alt_len: r.u32()?,
+            });
+        }
+
+        let alts_len = r.u32()?;
+        if alts_len > COMPACT_MAX_ALT_REFS || alts_len as usize * COMPACT_STRREF_LEN > r.remaining()
+        {
+            return None;
+        }
+        let mut dep_alts: Vec<StrRef> = Vec::with_capacity(alts_len as usize);
+        for _ in 0..alts_len {
+            dep_alts.push(r.strref()?);
+        }
+
+        let prov_len_total = r.u32()?;
+        if prov_len_total > COMPACT_MAX_ALT_REFS
+            || prov_len_total as usize * COMPACT_STRREF_LEN > r.remaining()
+        {
+            return None;
+        }
+        let mut prov_refs: Vec<StrRef> = Vec::with_capacity(prov_len_total as usize);
+        for _ in 0..prov_len_total {
+            prov_refs.push(r.strref()?);
+        }
+
+        // The encoding is length-delimited: trailing bytes mean this is not the
+        // encoding we think it is.
+        if r.remaining() != 0 {
+            return None;
+        }
+
+        // Structural validation: every string range and every record range must
+        // lie inside the table it indexes. Without this a corrupt cache could make
+        // lookup slice out of bounds (the accessors are defensive, but an index
+        // that silently resolves to "" would be worse than a clean cache miss).
+        for rec in records.iter() {
+            for sref in [rec.package, rec.version, rec.arch, rec.filename] {
+                if !compact_strref_in_arena(sref, arena_len) {
+                    return None;
+                }
+            }
+            let group_end = (rec.dep_group_start as u64) + (rec.dep_group_len as u64);
+            if group_end > dep_groups.len() as u64 {
+                return None;
+            }
+            let prov_end = (rec.prov_start as u64) + (rec.prov_len as u64);
+            if prov_end > prov_refs.len() as u64 {
+                return None;
+            }
+        }
+        for group in dep_groups.iter() {
+            let alt_end = (group.alt_start as u64) + (group.alt_len as u64);
+            if alt_end > dep_alts.len() as u64 {
+                return None;
+            }
+        }
+        for sref in dep_alts.iter().chain(prov_refs.iter()) {
+            if !compact_strref_in_arena(*sref, arena_len) {
+                return None;
+            }
+        }
+
+        // Rebuild through the same finish() the streaming/owned paths use, so the
+        // lookup tables are constructed by exactly one piece of code.
+        Some(
+            PackageIndexBuilder {
+                arena,
+                records,
+                dep_groups,
+                dep_alts,
+                prov_refs,
+            }
+            .finish(),
+        )
+    }
+}

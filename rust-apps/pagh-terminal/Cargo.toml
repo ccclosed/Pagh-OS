@@ -1,0 +1,41 @@
+[package]
+name = "pagh-terminal"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Pagh desktop terminal: VT100/ANSI parser, RGBA renderer, PDP/1 protocol client"
+
+# Standalone crate: rust-apps/** are built separately from the bare-metal kernel
+# workspace (see rust-apps/README.md). Without this table cargo would try to make
+# this package a member of the kernel workspace at the repository root.
+[workspace]
+
+[lib]
+name = "pagh_terminal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pagh-terminal"
+path = "src/bin/pagh-terminal.rs"
+
+[dependencies]
+# Клиентская половина ShmSurface (memfd/SCM_RIGHTS) и DamageTracker живут в
+# pagh-ui; терминал использует их, чтобы тоже слать damage вместо полного кадра.
+pagh-ui = { path = "../pagh-ui" }
+
+[dev-dependencies]
+# E2E с настоящим композитором (host build) по AF_UNIX/PDP/1.
+pagh-desktop = { path = "../pagh-desktop" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true
+
+# pagh-ui — render-крейт (виджеты, блиты, damage): P1 плана frame time.
+# Своя profile.release у pagh-ui не действует, когда он собран зависимостью,
+# поэтому целевой opt-level задаётся здесь.
+[profile.release.package.pagh-ui]
+opt-level = 3

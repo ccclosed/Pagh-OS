@@ -51,8 +51,19 @@ pub mod nr {
     pub const OPEN: u64 = 2;
     /// `close` — закрыть дескриптор файла.
     pub const CLOSE: u64 = 3;
+    /// `stat` — статус файла по пути (конечная символическая ссылка
+    /// разыменовывается, как в Linux). Отдельный номер от `newfstatat` (262):
+    /// статические musl-бинари (`pagh-desktop`/`pagh-desktop-demo`) до сих пор
+    /// зовут именно старый `stat`, и без него запуск дочернего процесса падал с
+    /// `ENOSYS` (os error 38).
+    pub const STAT: u64 = 4;
     /// `fstat` — статус файла по дескриптору.
     pub const FSTAT: u64 = 5;
+    /// `lstat` — статус символической ссылки по пути (конечный компонент НЕ
+    /// разыменовывается, в отличие от `stat`). Отдельный номер от `newfstatat`
+    /// (262) по той же причине, что и `stat` (4): старые статические бинари и
+    /// `std::fs::symlink_metadata` зовут именно его.
+    pub const LSTAT: u64 = 6;
     pub const POLL: u64 = 7;
     /// `select` — синхронное мультиплексирование fd (таймаут timeval).
     pub const SELECT: u64 = 23;
@@ -95,6 +106,10 @@ pub mod nr {
     pub const PWRITEV: u64 = 296;
     pub const FSYNC: u64 = 74;
     pub const FDATASYNC: u64 = 75;
+    /// `truncate`/`ftruncate` — размер обычного файла (в частности memfd,
+    /// которым композитор задаёт размер SHM-буфера до `mmap`).
+    pub const TRUNCATE: u64 = 76;
+    pub const FTRUNCATE: u64 = 77;
     /// Семейство rename. nvim пишет ShaDa во временный файл и переименовывает
     /// его на место; отсутствие rename давало «E136: Can't rename ShaDa» и
     /// вечный экран Press-ENTER при каждом выходе.
@@ -241,6 +256,15 @@ pub mod nr {
     pub const SENDTO: u64 = 44;
     /// `recvfrom` (45) — DNS-ответы.
     pub const RECVFROM: u64 = 45;
+    /// `sendmsg` (46) — данные + `SCM_RIGHTS` для AF_UNIX (fd passing memfd).
+    pub const SENDMSG: u64 = 46;
+    /// `recvmsg` (47) — приём данных и `SCM_RIGHTS` из AF_UNIX.
+    pub const RECVMSG: u64 = 47;
+    /// `shutdown` (48) — закрыть направление подключённого сокета: половина
+    /// `SHUT_WR` даёт пиру EOF, `SHUT_RD` — `Ok(0)` на своём приёме. Без него
+    /// клиент не мог сообщить серверу «я больше не пишу», а сервер не видел
+    /// EOF до полного `close`.
+    pub const SHUTDOWN: u64 = 48;
     /// `unlink` (87) — git удаляет свои `*.lock`-файлы.
     pub const UNLINK: u64 = 87;
     /// `mkdirat` (258) — mkdir относительно AT_FDCWD/dirfd.
@@ -284,6 +308,16 @@ pub mod nr {
     pub const SETREUID: u64 = 113;
     /// `setregid` — задать real/effective group id.
     pub const SETREGID: u64 = 114;
+    /// `getgroups` — прочитать дополнительные группы процесса.
+    ///
+    /// `getgroups(2)` x86_64: `size == 0` — вернуть число групп, не трогая
+    /// `list`; `size < ngroups` — `EINVAL`; больше — записать `ngroups` gid'ов.
+    pub const GETGROUPS: u64 = 115;
+    /// `setgroups` — заменить дополнительные группы (только `euid == 0`).
+    ///
+    /// `setgroups(2)` x86_64: `size > NGROUPS_MAX` — `EINVAL` (pagh:
+    /// `cred::GROUPS_CAP` = 32), непривилегированный — `EPERM`.
+    pub const SETGROUPS: u64 = 116;
     /// `setresuid` — задать любое подмножество real/effective/saved user id.
     pub const SETRESUID: u64 = 117;
     /// `getresuid` — прочитать real/effective/saved user id.
@@ -382,15 +416,19 @@ pub fn marshal_args(
 /// нагрузку, обязано согласоваться с пределом; см. [`socket_payload_len`].
 pub const MAX_SOCKET_IO: u64 = 1 << 20;
 
-/// Эффективная длина пользовательской полезной нагрузки для сокетного syscall из
-/// сырого счётчика.
+/// Эффективная длина пользовательской полезной нагрузки *датаграммного*
+/// сокетного syscall из сырого счётчика.
 ///
-/// `send = true` (`sendto`): счётчик выше [`MAX_SOCKET_IO`] отвергается с
+/// `send = true` (`sendto` на UDP): счётчик выше [`MAX_SOCKET_IO`] отвергается с
 /// `EMSGSIZE` ДО любой аллокации — молча отправить усечённую датаграмму было бы
-/// отдельным багом корректности.
+/// отдельным багом корректности (датаграмма неделима, а Linux отвергает
+/// слишком большую именно `EMSGSIZE`).
 /// `send = false` (`recvfrom`): счётчик — *ёмкость* буфера вызывающего; Linux
 /// принимает ёмкость больше датаграммы, поэтому ядро урезает её до предела и
 /// затем валидирует, выделяет и копирует ровно этот диапазон.
+///
+/// Stream-сокеты (`SOCK_STREAM`: AF_UNIX-пары композитора и TCP) сюда не
+/// относятся — у них нет границ записи, см. [`stream_send_len`].
 pub fn socket_payload_len(count: u64, send: bool) -> Result<u64, super::errno::Errno> {
     if send && count > MAX_SOCKET_IO {
         return Err(super::errno::Errno::EMSGSIZE);
@@ -400,6 +438,32 @@ pub fn socket_payload_len(count: u64, send: bool) -> Result<u64, super::errno::E
     } else {
         count
     })
+}
+
+/// Сколько байт `send()`/`sendto`/`sendmsg` на `SOCK_STREAM` копирует и пишет за
+/// один вызов.
+///
+/// Поток байтов не имеет границ записи: Linux на `SOCK_STREAM` не отвергает
+/// длинную запись, а копирует столько, сколько помещается, и возвращает
+/// **короткую запись** — `write_all`/`send_all` вызывающего доносит остаток
+/// следующим вызовом. Отвечать здесь `EMSGSIZE` (как для датаграммы) — значит
+/// убивать законную запись: Rust-std реализует `UnixStream::write` через
+/// `send(2)` (`Write for &UnixStream` → `send_with_flags`), поэтому
+/// `write_all(&frame)` для кадра 1060x640 (`2 713 600` байт) уходил одним
+/// `sendto` и получал `EMSGSIZE` — `pagh-files` умирал на первом же кадре
+/// («Message too large (os error 90)»).
+///
+/// [`MAX_SOCKET_IO`] остаётся, но как **размер чанка**: он по-прежнему не даёт
+/// вызывающему заказать аллокацию сырым `u64`-счётчиком (защита P57), а
+/// короткая запись превращает длинный кадр в последовательность ограниченных
+/// копий. Вызывающий, который передал `len > MAX_SOCKET_IO`, обязан сравнить
+/// возвращённый счётчик со своей длиной — так и делает `write_all`.
+pub fn stream_send_len(count: u64) -> u64 {
+    if count > MAX_SOCKET_IO {
+        MAX_SOCKET_IO
+    } else {
+        count
+    }
 }
 
 /// Полный `Supported_Syscall_Set` (R2.1) — единственный источник правды и для
@@ -432,12 +496,14 @@ pub fn socket_payload_len(count: u64, send: bool) -> Result<u64, super::errno::E
 /// Ветки match не интроспектируются из теста, поэтому список — ручное
 /// перечисление покрытия диспетчера; тест закрепляет числа, а запасная растяжка —
 /// ветки.
-pub const SUPPORTED_SYSCALLS: [u64; 159] = [
+pub const SUPPORTED_SYSCALLS: [u64; 168] = [
     nr::READ,
     nr::WRITE,
     nr::OPEN,
     nr::CLOSE,
+    nr::STAT,
     nr::FSTAT,
+    nr::LSTAT,
     nr::POLL,
     nr::LSEEK,
     nr::MMAP,
@@ -468,6 +534,9 @@ pub const SUPPORTED_SYSCALLS: [u64; 159] = [
     nr::ACCEPT,
     nr::SENDTO,
     nr::RECVFROM,
+    nr::SENDMSG,
+    nr::RECVMSG,
+    nr::SHUTDOWN,
     nr::BIND,
     nr::LISTEN,
     nr::GETSOCKNAME,
@@ -484,6 +553,8 @@ pub const SUPPORTED_SYSCALLS: [u64; 159] = [
     nr::FLOCK,
     nr::FSYNC,
     nr::FDATASYNC,
+    nr::TRUNCATE,
+    nr::FTRUNCATE,
     nr::GETCWD,
     nr::CHDIR,
     nr::FCHDIR,
@@ -514,6 +585,8 @@ pub const SUPPORTED_SYSCALLS: [u64; 159] = [
     nr::SETSID,
     nr::SETREUID,
     nr::SETREGID,
+    nr::GETGROUPS,
+    nr::SETGROUPS,
     nr::SETRESUID,
     nr::GETRESUID,
     nr::SETRESGID,
@@ -638,16 +711,16 @@ mod tests {
     fn supported_set_is_exact() {
         // Независимое перечисление: номера syscall'ов Linux x86_64 с реальной
         // веткой диспетчера, по возрастанию (держать отсортированным!).
-        const EXPECTED: [u64; 159] = [
-            0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            28, 32, 33, 35, 39, 40, 41, 42, 43, 44, 45, 49, 50, 51, 53, 54, 55, 56, 59, 60, 61, 62,
-            63, 72, 73, 74, 75, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91, 92, 93, 95, 96, 97, 98, 99,
-            100, 102, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 117, 118, 119, 120,
-            121, 127, 131, 135, 137, 138, 140, 141, 143, 144, 145, 146, 147, 148, 158, 160, 162,
-            186, 187, 201, 202, 203, 204, 213, 217, 218, 221, 227, 228, 229, 230, 231, 232, 233,
-            234, 257, 258, 260, 262, 263, 264, 267, 268, 269, 270, 271, 273, 274, 277, 281, 282,
-            283, 284, 285, 286, 287, 288, 289, 290, 291, 292, 293, 295, 296, 302, 306, 309, 316,
-            318, 319, 326, 332, 334, 439,
+        const EXPECTED: [u64; 168] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 28, 32, 33, 35, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 53, 54, 55,
+            56, 59, 60, 61, 62, 63, 72, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 84, 87, 89, 90, 91,
+            92, 93, 95, 96, 97, 98, 99, 100, 102, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113,
+            114, 115, 116, 117, 118, 119, 120, 121, 127, 131, 135, 137, 138, 140, 141, 143, 144,
+            145, 146, 147, 148, 158, 160, 162, 186, 187, 201, 202, 203, 204, 213, 217, 218, 221,
+            227, 228, 229, 230, 231, 232, 233, 234, 257, 258, 260, 262, 263, 264, 267, 268, 269,
+            270, 271, 273, 274, 277, 281, 282, 283, 284, 285, 286, 287, 288, 289, 290, 291, 292,
+            293, 295, 296, 302, 306, 309, 316, 318, 319, 326, 332, 334, 439,
         ];
 
         // 1. Два независимых перечисления совпадают поэлементно, и оба строго
@@ -682,16 +755,13 @@ mod tests {
 
         // 3. Точечные проверки номеров, трактовку которых документация путала:
         //    clone(56) и futex(202) ПОДДЕРЖИВАЮТСЯ (прежний doc-комментарий
-        //    утверждал обратное), kill(62) — новейший член, а fork/vfork/stat —
-        //    никогда.
-        for n in [nr::CLONE, nr::FUTEX, nr::KILL] {
+        //    утверждал обратное), kill(62) — новейший член; stat(4) поддерживается
+        //    с тех пор, как launch Rust-std (`Command::spawn`) упёрся в этот
+        //    старый номер; fork/vfork — по-прежнему никогда.
+        for n in [nr::CLONE, nr::FUTEX, nr::KILL, nr::STAT] {
             assert!(is_supported(n), "nr={n} must be supported");
         }
-        for n in [
-            4u64, /* stat */
-            57,   /* fork */
-            58,   /* vfork */
-        ] {
+        for n in [57u64 /* fork */, 58 /* vfork */] {
             assert!(!is_supported(n), "nr={n} must stay unsupported");
         }
     }

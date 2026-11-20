@@ -1943,6 +1943,7 @@ mod procfs_tests {
                 String::from("filesystems"),
                 String::from("loadavg"),
                 String::from("mounts"),
+                String::from("net"),
             ],
             "procfs: /proc readdir order"
         );
@@ -1961,6 +1962,7 @@ mod procfs_tests {
             "filesystems",
             "loadavg",
             "mounts",
+            "net",
         ] {
             let node = match proc_dir.lookup(name) {
                 Ok(n) => n,
@@ -1983,6 +1985,89 @@ mod procfs_tests {
                 .unwrap_or(0),
             "procfs: /proc/meminfo reports its table inode"
         );
+
+        // ── /proc/net/dev: шапки дословно + живая строка eth0 ───────────────
+        //
+        // Контракт docs/procfs.md §15: две Linux-шапки и по строке на
+        // интерфейс с 16 числовыми полями. Канала может не быть (QEMU без
+        // NIC и без xHCI) — тогда честны только шапки, и это SKIP, не FAIL.
+        let net_node = match vfs::lookup_path("/proc/net") {
+            Ok(n) => n,
+            Err(_) => {
+                assert_kernel!(false, "procfs: lookup_path(/proc/net) failed");
+                return;
+            }
+        };
+        assert_kernel!(net_node.is_directory(), "procfs: /proc/net is a directory");
+        assert_eq_kernel!(
+            names(&net_node),
+            alloc::vec![String::from("dev")],
+            "procfs: /proc/net children"
+        );
+        assert_kernel!(
+            net_node.lookup("nope").is_err(),
+            "procfs: unknown /proc/net child is ENOENT"
+        );
+        let net_dev = read_path("/proc/net/dev");
+        let net_dev_text = core::str::from_utf8(&net_dev).unwrap_or("");
+        assert_kernel!(
+            net_dev_text.starts_with(
+                "Inter-|   Receive                                                |  Transmit\n"
+            ),
+            "procfs: /proc/net/dev first header is the Linux text"
+        );
+        let mut net_lines = net_dev_text.lines();
+        let _header1 = net_lines.next();
+        assert_eq_kernel!(
+            net_lines.next(),
+            Some(
+                " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
+            ),
+            "procfs: /proc/net/dev second header is the Linux text"
+        );
+        match crate::net::iface_stats() {
+            Some(stats) => {
+                let row = net_lines.next().unwrap_or("");
+                // Имя печатается шириной 6, как `%6s` в Linux; префикс строим
+                // из имени канала, а не из литерала eth0.
+                let prefix = alloc::format!("{:>6}:", stats.name);
+                let rest = row.strip_prefix(prefix.as_str()).unwrap_or("");
+                assert_kernel!(
+                    !rest.is_empty(),
+                    "procfs: /proc/net/dev has an eth0 row when the channel exists"
+                );
+                let fields: Vec<u64> = rest
+                    .split_whitespace()
+                    .filter_map(|f| f.parse::<u64>().ok())
+                    .collect();
+                assert_eq_kernel!(
+                    fields.len(),
+                    16,
+                    "procfs: /proc/net/dev row has 16 numeric fields"
+                );
+                assert_kernel!(
+                    net_lines.next().is_none(),
+                    "procfs: exactly one interface row (single channel)"
+                );
+                // Имя интерфейса — то же, что отдаёт net, а не литерал procfs.
+                assert_eq_kernel!(
+                    stats.name,
+                    crate::net::iface_name().unwrap_or(""),
+                    "procfs: /proc/net/dev and iface_name agree"
+                );
+                crate::kprintln!("NETDATA iface={} row={}", stats.name, row);
+            }
+            None => {
+                assert_kernel!(
+                    net_lines.next().is_none(),
+                    "procfs: /proc/net/dev has no rows without a channel"
+                );
+                crate::skip_kernel!(
+                    "netdata",
+                    "/proc/net/dev: no network channel in this boot (headers only)"
+                );
+            }
+        }
 
         // ── /proc/cpuinfo ────────────────────────────────────────────────────
         let cpuinfo = read_path("/proc/cpuinfo");
@@ -6215,6 +6300,396 @@ mod linux_tty_tests {
     }
 }
 
+// ─── Сетевые данные для userspace (этап K), в госте ─────────────────────────
+//
+// `/proc/net/dev` и `SIOCGIF*` — два независимых входа к одному состоянию.
+// Host-свойства (`net_counters`, `net_dev`, `net_if_abi`) проверяют чистые
+// кодировщики; здесь проверяется ядерная связка на настоящем стеке: ioctl
+// вызывается напрямую с mapped-страницей (как в `linux_tty_tests::*`), потому
+// что `sys_ioctl` требует compat-fd, а суть — в `net_if_sys::if_ioctl`.
+//
+// Инварианты: неизвестный запрос — `ENOTTY` (не расширяем ioctl-поверхность
+// молча); непригодный указатель — `EFAULT` до записи; отсутствие канала —
+// `ENODEV`; ответы `SIOCGIFADDR/NETMASK` совпадают с `net::ip_config()`,
+// `SIOCGIFFLAGS` несёт IFF_UP и IFF_RUNNING ровно тогда, когда линк поднят,
+// `SIOCGIFHWADDR` — MAC канала, а строки `/proc/net/dev` не убывают между
+// чтениями (счётчики монотонны).
+mod netdata_tests {
+    use crate::arch::x86_64::linux::errno::Errno;
+    use crate::arch::x86_64::linux::net_if_abi::{
+        ARPHRD_ETHER, IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, IFREQ_SIZE, SIOCGIFADDR,
+        SIOCGIFCONF, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME,
+        SIOCGIFNETMASK,
+    };
+    use crate::arch::x86_64::linux::net_if_sys::if_ioctl;
+    use crate::memory::{pmm, vmm};
+    use crate::vfs::VfsNode;
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// USER_ACCESSIBLE scratch-страница под 40-байтный `ifreq` (свой адрес, не
+    /// общий с `linux_tty_tests`, чтобы модули не мешали друг другу).
+    const SCRATCH_VA: u64 = 0x0000_4002_0000_0000;
+
+    fn map_scratch() -> Option<u64> {
+        if vmm::virt_to_phys(SCRATCH_VA).is_some() {
+            return None;
+        }
+        let frame = pmm::alloc_frame()?;
+        // SAFETY: кадр только что выделен и доступен через HHDM.
+        unsafe {
+            core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        vmm::map(frame, SCRATCH_VA, flags).ok()?;
+        Some(frame)
+    }
+
+    fn unmap_scratch(frame: Option<u64>) {
+        if let Some(frame) = frame {
+            let _ = vmm::unmap(SCRATCH_VA);
+            pmm::free_frame(frame);
+        }
+    }
+
+    /// Нулевой `ifreq` с записанным `ifr_name`.
+    fn put_name(name: &str) {
+        // SAFETY: SCRATCH_VA отображена writable на время теста.
+        unsafe {
+            core::ptr::write_bytes(SCRATCH_VA as *mut u8, 0, IFREQ_SIZE);
+            let bytes = name.as_bytes();
+            let n = bytes.len().min(15);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), SCRATCH_VA as *mut u8, n);
+        }
+    }
+
+    /// `struct ifconf` в начало scratch-страницы: длина по смещению 0,
+    /// указатель буфера — по смещению 8.
+    fn put_ifconf(len: i32, buf: u64) {
+        // SAFETY: 16 байт начала отображённой страницы; запись полей ifconf.
+        unsafe {
+            core::ptr::write_bytes(SCRATCH_VA as *mut u8, 0, 16);
+            core::ptr::write_unaligned(SCRATCH_VA as *mut i32, len);
+            core::ptr::write_unaligned((SCRATCH_VA + 8) as *mut u64, buf);
+        }
+    }
+
+    /// Записать `int` в union (`ifr_ifindex`/`ifr_mtu` — вход `SIOCGIFNAME`).
+    fn put_i32(value: i32) {
+        // SAFETY: union лежит в отображённой странице.
+        unsafe {
+            core::ptr::write_unaligned((SCRATCH_VA + 16) as *mut i32, value);
+        }
+    }
+
+    fn get_i16(off: u64) -> i16 {
+        // SAFETY: читаем в пределах отображённой scratch-страницы.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + off) as *const i16) }
+    }
+
+    fn get_i32(off: u64) -> i32 {
+        // SAFETY: то же — чтение внутри 40-байтного буфера.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + off) as *const i32) }
+    }
+
+    fn get_bytes<const N: usize>(off: u64) -> [u8; N] {
+        let mut out = [0u8; N];
+        // SAFETY: `off + N <= 40`, оба конца внутри отображённой страницы.
+        unsafe {
+            core::ptr::copy_nonoverlapping((SCRATCH_VA + off) as *const u8, out.as_mut_ptr(), N);
+        }
+        out
+    }
+
+    /// Имя из `ifr_name` после ответа `SIOCGIFNAME`.
+    fn read_out_name() -> alloc::string::String {
+        let bytes = get_bytes::<16>(0);
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(16);
+        alloc::string::String::from_utf8_lossy(&bytes[..len]).into_owned()
+    }
+
+    pub fn if_ioctl_reports_live_interface() {
+        // `None` — страница уже отображена прошлым проходом (selftest 2) либо
+        // аллокация не удалась; в обоих случаях освобождать нечего, как в
+        // `linux_tty_tests::map_scratch`.
+        let frame = map_scratch();
+
+        // Чужие запросы не обслуживаются этим слоем: прежний ENOTTY.
+        assert_eq_kernel!(
+            if_ioctl(0x5413, SCRATCH_VA),
+            Err(Errno::ENOTTY),
+            "netdata: a non-SIOCGIF request stays ENOTTY"
+        );
+        // Непригодный указатель отвергается ДО записи.
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFADDR, 1),
+            Err(Errno::EFAULT),
+            "netdata: an unmapped ifreq pointer is EFAULT"
+        );
+
+        let stats = match crate::net::iface_stats() {
+            Some(s) => s,
+            None => {
+                unmap_scratch(frame);
+                crate::skip_kernel!(
+                    "netdata",
+                    "netdata: no network channel in this boot (iface_stats = None)"
+                );
+                return;
+            }
+        };
+
+        // ── имя интерфейса: индекс 1 → eth0, чужой индекс → ENODEV ─────────
+        put_i32(1);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFNAME, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFNAME(1) succeeds"
+        );
+        assert_eq_kernel!(
+            read_out_name().as_str(),
+            stats.name,
+            "netdata: SIOCGIFNAME reports the interface name"
+        );
+        put_i32(9);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFNAME, SCRATCH_VA),
+            Err(Errno::ENODEV),
+            "netdata: SIOCGIFNAME of an unknown index is ENODEV"
+        );
+
+        // ── SIOCGIFADDR: реальный адрес из net::ip_config() ────────────────
+        put_name(stats.name);
+        match if_ioctl(SIOCGIFADDR, SCRATCH_VA) {
+            Ok(0) => {
+                let family = get_i16(16);
+                let addr = get_bytes::<4>(20);
+                assert_eq_kernel!(
+                    family,
+                    2,
+                    "netdata: SIOCGIFADDR sockaddr_in family is AF_INET"
+                );
+                assert_eq_kernel!(
+                    get_i16(18),
+                    0,
+                    "netdata: SIOCGIFADDR sin_port is 0 for an interface"
+                );
+                match crate::net::ip_config() {
+                    Some(cfg) => assert_eq_kernel!(
+                        addr,
+                        cfg.addr.addr.0,
+                        "netdata: SIOCGIFADDR equals net::ip_config()"
+                    ),
+                    None => {
+                        assert_kernel!(false, "netdata: SIOCGIFADDR succeeded without ip_config")
+                    }
+                }
+                crate::kprintln!(
+                    "NETDATA ioctl iface={} addr={}.{}.{}.{}",
+                    stats.name,
+                    addr[0],
+                    addr[1],
+                    addr[2],
+                    addr[3]
+                );
+            }
+            other => assert_eq_kernel!(
+                other,
+                Err(Errno::EADDRNOTAVAIL),
+                "netdata: SIOCGIFADDR without a lease is EADDRNOTAVAIL"
+            ),
+        }
+
+        // ── SIOCGIFNETMASK: маска префикса, family тоже AF_INET ────────────
+        if let Some(cidr) = stats.cidr {
+            put_name(stats.name);
+            assert_eq_kernel!(
+                if_ioctl(SIOCGIFNETMASK, SCRATCH_VA),
+                Ok(0),
+                "netdata: SIOCGIFNETMASK succeeds when an address exists"
+            );
+            assert_eq_kernel!(get_i16(16), 2, "netdata: SIOCGIFNETMASK family is AF_INET");
+            assert_eq_kernel!(
+                get_bytes::<4>(20),
+                cidr.mask_octets(),
+                "netdata: SIOCGIFNETMASK equals the prefix mask"
+            );
+        }
+
+        // ── SIOCGIFFLAGS: UP всегда, RUNNING — по линку ────────────────────
+        put_name(stats.name);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFFLAGS, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFFLAGS succeeds"
+        );
+        let flags = get_i16(16);
+        assert_kernel!(flags & IFF_UP != 0, "netdata: flags carry IFF_UP");
+        assert_kernel!(
+            flags & IFF_BROADCAST != 0 && flags & IFF_MULTICAST != 0,
+            "netdata: flags carry IFF_BROADCAST|IFF_MULTICAST"
+        );
+        assert_eq_kernel!(
+            (flags & IFF_RUNNING != 0),
+            stats.running,
+            "netdata: IFF_RUNNING mirrors link::running()"
+        );
+        crate::kprintln!("NETDATA flags={:#06x} running={}", flags, stats.running);
+
+        // ── SIOCGIFHWADDR: ARPHRD_ETHER + MAC канала ──────────────────────
+        put_name(stats.name);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFHWADDR, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFHWADDR succeeds"
+        );
+        assert_eq_kernel!(
+            get_i16(16),
+            ARPHRD_ETHER as i16,
+            "netdata: SIOCGIFHWADDR family is ARPHRD_ETHER"
+        );
+        assert_eq_kernel!(
+            get_bytes::<6>(18),
+            stats.mac.0,
+            "netdata: SIOCGIFHWADDR reports the channel MAC"
+        );
+
+        // ── MTU и INDEX ────────────────────────────────────────────────────
+        put_name(stats.name);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFMTU, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFMTU succeeds"
+        );
+        assert_eq_kernel!(
+            get_i32(16),
+            stats.mtu as i32,
+            "netdata: SIOCGIFMTU reports the interface MTU"
+        );
+        put_name(stats.name);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFINDEX, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFINDEX succeeds"
+        );
+        assert_eq_kernel!(get_i32(16), 1, "netdata: SIOCGIFINDEX is 1 (eth0)");
+
+        // ── неизвестное имя — ENODEV, а не ответ про eth0 ─────────────────
+        put_name("lo");
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFFLAGS, SCRATCH_VA),
+            Err(Errno::ENODEV),
+            "netdata: SIOCGIFFLAGS with an unknown name is ENODEV"
+        );
+
+        // ── SIOCGIFCONF: перечисление интерфейса в массив `ifreq` ──────────
+        //
+        // Буфер лежит в той же scratch-странице по смещению 64; `ifc_len = 40`
+        // вмещает ровно одну запись. Linux кладёт в массив только интерфейсы с
+        // IPv4-адресом, поэтому без lease ожидается 0 и `ifc_len = 0`.
+        put_ifconf(40, SCRATCH_VA + 64);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFCONF, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFCONF succeeds"
+        );
+        match stats.cidr {
+            Some(cidr) => {
+                assert_eq_kernel!(
+                    get_i32(0),
+                    40,
+                    "netdata: SIOCGIFCONF reports one 40-byte ifreq"
+                );
+                let mut name = [0u8; 16];
+                // SAFETY: запись сделана ядром в scratch+64..+80.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (SCRATCH_VA + 64) as *const u8,
+                        name.as_mut_ptr(),
+                        16,
+                    );
+                }
+                let len = name.iter().position(|&b| b == 0).unwrap_or(16);
+                assert_eq_kernel!(
+                    &name[..len],
+                    stats.name.as_bytes(),
+                    "netdata: SIOCGIFCONF entry names the interface"
+                );
+                assert_eq_kernel!(
+                    get_bytes::<4>(64 + 20),
+                    cidr.addr.0,
+                    "netdata: SIOCGIFCONF entry carries the interface address"
+                );
+            }
+            None => assert_eq_kernel!(
+                get_i32(0),
+                0,
+                "netdata: SIOCGIFCONF lists nothing before a lease"
+            ),
+        }
+        // Маленький буфер — 0 записей и `ifc_len = 0`, без ошибки.
+        put_ifconf(0, 0);
+        assert_eq_kernel!(
+            if_ioctl(SIOCGIFCONF, SCRATCH_VA),
+            Ok(0),
+            "netdata: SIOCGIFCONF with a 0-length buffer still succeeds"
+        );
+        assert_eq_kernel!(
+            get_i32(0),
+            0,
+            "netdata: SIOCGIFCONF with a short buffer writes no entry"
+        );
+        // NULL-буфер при достаточной длине — EFAULT, а не молчаливая запись.
+        if stats.cidr.is_some() {
+            put_ifconf(40, 0);
+            assert_eq_kernel!(
+                if_ioctl(SIOCGIFCONF, SCRATCH_VA),
+                Err(Errno::EFAULT),
+                "netdata: SIOCGIFCONF with a NULL buffer is EFAULT"
+            );
+        }
+
+        // ── /proc/net/dev: счётчики не убывают между чтениями ─────────────
+        let first = read_net_dev_row(stats.name);
+        let second = read_net_dev_row(stats.name);
+        if let (Some(a), Some(b)) = (first, second) {
+            for i in 0..16 {
+                assert_kernel!(
+                    b[i] >= a[i],
+                    "netdata: /proc/net/dev counters are monotonic"
+                );
+            }
+            crate::kprintln!("NETDATA procdev rx_bytes={} tx_bytes={}", b[0], b[8]);
+        } else {
+            assert_kernel!(false, "netdata: /proc/net/dev row is missing");
+        }
+
+        unmap_scratch(frame);
+    }
+
+    /// Разобрать строку `eth0` из `/proc/net/dev` в 16 чисел.
+    fn read_net_dev_row(name: &str) -> Option<[u64; 16]> {
+        let node = crate::vfs::lookup_path("/proc/net/dev").ok()?;
+        let mut buf = alloc::vec![0u8; 512];
+        let n = node.read(0, &mut buf).ok()?;
+        buf.truncate(n);
+        let text = core::str::from_utf8(&buf).ok()?;
+        let prefix = alloc::format!("{:>6}:", name);
+        let row = text.lines().find(|l| l.starts_with(prefix.as_str()))?;
+        let rest = row.strip_prefix(prefix.as_str())?;
+        let mut out = [0u64; 16];
+        for (i, field) in rest.split_whitespace().enumerate() {
+            if i >= 16 {
+                return None;
+            }
+            out[i] = field.parse().ok()?;
+        }
+        Some(out)
+    }
+}
+
 // ─── Состояние планировщика SIGSTOP/SIGCONT, в госте (issue #12) ────────────
 //
 // Proves on the real machine what the host properties (`signal_stop`,
@@ -7029,7 +7504,7 @@ mod linux_tick_tests {
 // ============================================================================
 mod security_tests {
     use super::mock_block::MockBlockDevice;
-    use crate::arch::x86_64::linux::cred::{Access, Creds};
+    use crate::arch::x86_64::linux::cred::{gid, Access, Creds, GROUPS_CAP};
     use crate::arch::x86_64::linux::errno::Errno;
     use crate::arch::x86_64::linux::kill::kill_permits;
     use crate::arch::x86_64::linux::misc;
@@ -7263,11 +7738,255 @@ mod security_tests {
             "setresuid(0) EPERM"
         );
 
+        // ── фаза 1: дополнительные группы ──────────────────────────────────
+        //
+        // Массив `gid_t` из сисколла — пользовательский указатель, а selftest
+        // исполняется в ring 0 на кернел-страницах; поэтому здесь проверяется
+        // контракт размера/указателя, а сам массив проходит через `Creds`
+        // (тот же переход, что зовёт обработчик) и через реальный gid-массив —
+        // в `tools/e2e.py groups` настоящей гостевой программой.
+        assert_eq_kernel!(compat::set_current_creds(Creds::ROOT), true, "back to root");
+        assert_eq_kernel!(misc::sys_getgroups(0, 0), Ok(0), "root has no groups");
+        let grouped = Creds::ROOT
+            .with_groups(&[gid::TTY, gid::VIDEO, gid::INPUT])
+            .expect("three groups fit");
+        assert_eq_kernel!(
+            compat::set_current_creds(grouped),
+            true,
+            "install supplementary groups"
+        );
+        assert_eq_kernel!(
+            misc::sys_getgroups(0, 0),
+            Ok(3),
+            "getgroups(0) reports the count"
+        );
+        assert_eq_kernel!(
+            misc::sys_getgroups(2, 0x1000),
+            Err(Errno::EINVAL),
+            "getgroups(size < ngroups) is EINVAL"
+        );
+        assert_eq_kernel!(
+            misc::sys_getgroups(4, 1),
+            Err(Errno::EFAULT),
+            "getgroups(bad list) is EFAULT"
+        );
+        assert_eq_kernel!(
+            misc::sys_setgroups(GROUPS_CAP as u64 + 1, 0),
+            Err(Errno::EINVAL),
+            "setgroups(count > cap) is EINVAL"
+        );
+        assert_eq_kernel!(
+            misc::sys_setgroups(0, 0),
+            Ok(0),
+            "setgroups(0) clears as root"
+        );
+        assert_eq_kernel!(
+            misc::sys_getgroups(0, 0),
+            Ok(0),
+            "cleared group set is empty"
+        );
+        assert_eq_kernel!(misc::sys_setuid(1000), Ok(0), "drop to uid 1000");
+        assert_eq_kernel!(
+            misc::sys_setgroups(0, 0),
+            Err(Errno::EPERM),
+            "unprivileged setgroups is EPERM"
+        );
+
         compat::remove_compat(me);
         assert_kernel!(
             !compat::current_has_compat(),
             "synthetic credential state removed"
         );
+    }
+
+    /// Проверить один узел `/dev`: режим и владелец ровно те, что обещает
+    /// `docs/security/groups.md`. `false` — узел недоступен (selftest без VFS).
+    fn check_device_node(path: &str, want_mode: u32, want_owner: (u32, u32), label: &str) -> bool {
+        match crate::vfs::lookup_path(path) {
+            Ok(node) => {
+                assert_eq_kernel!(node.mode() & 0o7777, want_mode, label);
+                assert_eq_kernel!(node.owner(), want_owner, label);
+                true
+            }
+            Err(_) => {
+                skip_kernel!("vfs", label);
+                false
+            }
+        }
+    }
+
+    /// Узлы `/dev` несут групповые права фазы 1, а `Creds::may` их учитывает:
+    /// член `video` открывает fb0, не-член — нет; `/dev/null` доступен всем;
+    /// `/dev/zero` читается нулями, `/dev/full` отвергает запись `ENOSPC`.
+    pub fn device_group_permissions() {
+        if !check_device_node("/dev/fb0", 0o660, (0, gid::VIDEO), "fb0 root:video 0660") {
+            return;
+        }
+        check_device_node(
+            "/dev/input/event0",
+            0o660,
+            (0, gid::INPUT),
+            "event0 root:input 0660",
+        );
+        check_device_node(
+            "/dev/vtconsole0",
+            0o660,
+            (0, gid::TTY),
+            "vtconsole0 root:tty 0660",
+        );
+        check_device_node(
+            "/dev/vtinput",
+            0o660,
+            (0, gid::INPUT),
+            "vtinput root:input 0660",
+        );
+        check_device_node("/dev/null", 0o666, (0, 0), "null 0666");
+        check_device_node("/dev/zero", 0o666, (0, 0), "zero 0666");
+        check_device_node("/dev/full", 0o666, (0, 0), "full 0666");
+
+        let desktop_user = Creds::new(1000, gid::OLEG, 1000, gid::OLEG, 1000, gid::OLEG)
+            .with_groups(&[gid::TTY, gid::VIDEO, gid::INPUT])
+            .expect("three groups fit");
+        let fb_owner = (0, gid::VIDEO);
+        assert_kernel!(
+            desktop_user.may(0o660, fb_owner, Access::Read),
+            "video member reads fb0"
+        );
+        assert_kernel!(
+            desktop_user.may(0o660, fb_owner, Access::Write),
+            "video member writes fb0"
+        );
+        let plain = Creds::new(1000, gid::OLEG, 1000, gid::OLEG, 1000, gid::OLEG);
+        assert_kernel!(
+            !plain.may(0o660, fb_owner, Access::Read),
+            "non-video user cannot read fb0"
+        );
+        assert_kernel!(
+            plain.may(0o666, (0, 0), Access::Write),
+            "null/zero/full remain world-writable"
+        );
+        assert_kernel!(
+            Creds::ROOT.may(0o660, fb_owner, Access::Read),
+            "root bypass unchanged"
+        );
+
+        if let Ok(zero) = crate::vfs::lookup_path("/dev/zero") {
+            let mut buf = [0xAAu8; 4];
+            assert_eq_kernel!(zero.read(0, &mut buf), Ok(4), "zero reads 4 bytes");
+            assert_eq_kernel!(buf, [0u8; 4], "zero fills with zeroes");
+        }
+        if let Ok(full) = crate::vfs::lookup_path("/dev/full") {
+            assert_eq_kernel!(
+                full.write(0, b"x"),
+                Err(VfsError::NoSpace),
+                "full rejects writes with ENOSPC"
+            );
+        }
+    }
+
+    /// `/etc/passwd` и `/etc/group` фазы 1 установлены провижинингом и
+    /// разбираются ровно теми функциями, что зовут `id`/`groups`/`su`.
+    pub fn identity_database_files() {
+        let read = |path: &str| -> Option<alloc::string::String> {
+            let node = crate::vfs::lookup_path(path).ok()?;
+            let size = node.size() as usize;
+            if size == 0 || size > 64 * 1024 {
+                return None;
+            }
+            let mut buf = alloc::vec![0u8; size];
+            let mut off = 0usize;
+            while off < size {
+                match node.read(off as u64, &mut buf[off..]) {
+                    Ok(0) => break,
+                    Ok(n) => off += n,
+                    Err(_) => return None,
+                }
+            }
+            buf.truncate(off);
+            alloc::string::String::from_utf8(buf).ok()
+        };
+        let Some(passwd_text) = read("/mnt/etc/passwd") else {
+            skip_kernel!("no /mnt", "/etc/passwd installed");
+            return;
+        };
+        let Some(group_text) = read("/mnt/etc/group") else {
+            skip_kernel!("no /mnt", "/etc/group installed");
+            return;
+        };
+        let users = crate::shell::identity_db::parse_passwd(&passwd_text);
+        let groups = crate::shell::identity_db::parse_group(&group_text);
+        let Some(oleg) = crate::shell::identity_db::user_by_name(&users, "oleg") else {
+            assert_kernel!(false, "/etc/passwd has oleg");
+            return;
+        };
+        assert_eq_kernel!((oleg.uid, oleg.gid), (1000, 1000), "oleg uid/gid 1000");
+        let root = crate::shell::identity_db::user_by_name(&users, "root").expect("root in passwd");
+        assert_eq_kernel!((root.uid, root.gid), (0, 0), "root uid/gid 0");
+        assert_eq_kernel!(
+            crate::shell::identity_db::supplementary_groups_for_user(&users, &groups, "oleg"),
+            Some(alloc::vec![gid::TTY, gid::VIDEO, gid::INPUT]),
+            "oleg supplementary groups = tty,video,input"
+        );
+        assert_eq_kernel!(
+            crate::shell::identity_db::groups_for_user(&users, &groups, "oleg"),
+            Some(alloc::vec![gid::OLEG, gid::TTY, gid::VIDEO, gid::INPUT]),
+            "oleg display groups"
+        );
+        assert_eq_kernel!(
+            crate::shell::identity_db::group_name(&groups, gid::VIDEO),
+            Some("video"),
+            "video gid is named"
+        );
+    }
+
+    /// fork/clone наследуют дополнительные группы; это чистая копия
+    /// `CompatState`, поэтому проверяется синтетическим состоянием без запуска
+    /// второго адресного пространства.
+    pub fn group_inheritance() {
+        const CHILD: u64 = 0x7E00_00C1;
+        const THREAD: u64 = 0x7E00_00C2;
+        let me = scheduler::current_pid();
+        let saved = compat::remove_compat(me);
+        let mut state = CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(crate::sync::spinlock::Spinlock::new(
+                crate::arch::x86_64::linux::mem::VmRegionSet::new(0, 0),
+            )),
+            me,
+        );
+        state.creds = Creds::new(1000, 1000, 1000, 1000, 1000, 1000)
+            .with_groups(&[gid::TTY, gid::VIDEO, gid::INPUT])
+            .expect("three groups fit");
+        compat::install_compat(me, state);
+
+        let want = Some(alloc::vec![gid::TTY, gid::VIDEO, gid::INPUT]);
+        assert_kernel!(compat::fork_current_compat(CHILD, 0), "fork compat clone");
+        assert_eq_kernel!(
+            compat::creds_of(CHILD).map(|c| c.groups().to_vec()),
+            want,
+            "fork inherits supplementary groups"
+        );
+        assert_eq_kernel!(
+            compat::creds_of(CHILD).map(|c| c.uid),
+            Some(1000),
+            "fork inherits ids"
+        );
+        assert_kernel!(
+            compat::clone_current_compat(THREAD, None, 0),
+            "thread compat clone"
+        );
+        assert_eq_kernel!(
+            compat::creds_of(THREAD).map(|c| c.groups().to_vec()),
+            want,
+            "clone inherits supplementary groups"
+        );
+
+        compat::remove_compat(CHILD);
+        compat::remove_compat(THREAD);
+        compat::remove_compat(me);
+        if let Some(previous) = saved {
+            compat::install_compat(me, previous);
+        }
     }
 }
 
@@ -7466,6 +8185,2564 @@ mod usb_hid_tests {
     }
 }
 
+// ─── Desktop-вариант B: kernel-примитивы (2.24.0) ───────────────────────────
+//
+// In-QEMU проверки того, что host-тесты доказать не могут: реальные syscall'ы
+// `memfd_create`/`ftruncate`/`mmap(MAP_SHARED)`, ioctl+mmap физического
+// framebuffer'а Limine и evdev-очередь `/dev/input/event0`, питаемая тем же
+// PS/2/USB-путём, что и shell.
+//
+// NON-DESTRUCTIVE: каждый syscall-тест выполняется в СВЕЖЕМ пользовательском
+// PML4 (`vmm::new_user_pml4` + `drop_user_space`): страницы, таблицы и scratch
+// возвращаются в PMM, kernel-PML4 не получает нижнеполовинных отображений, а
+// `/dev/fb0` отпускает экран через `release_takeover`. События/скан-коды,
+// которые тест инжектит в USB HID, вычитываются из PS/2-кольца, чтобы не
+// напечататься в shell после `selftest`; `evdev::reset` чистит очередь.
+mod desktop_b_tests {
+    use crate::arch::x86_64::linux::errno::Errno;
+    use crate::arch::x86_64::linux::mem::{
+        VmRegionSet, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE,
+    };
+    use crate::arch::x86_64::linux::{io_sys, mem_sys, unix_sock};
+    use crate::drivers::fb_abi::{
+        FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FB_FIX_SIZE, FB_VAR_SIZE,
+    };
+    use crate::drivers::input_event::{
+        BTN_LEFT, EV_KEY, EV_REL, EV_SYN, INPUT_EVENT_SIZE, REL_X, REL_Y,
+    };
+    use crate::drivers::{evdev, ps2_kbd, usb_hid, vt_abi, vtsurface};
+    use crate::memory::layout::USER_MMAP_BASE;
+    use crate::memory::{pat, pmm, vmm};
+    use crate::sync::spinlock::Spinlock;
+    use crate::task::compat::{self, CompatState};
+    use crate::task::fd::FdTable;
+    use crate::task::scheduler;
+    use alloc::sync::Arc;
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// Scratch-страница пользовательских аргументов (путь, ioctl-структуры,
+    /// pollfd, буфер события). Адрес ниже `USER_ADDR_MAX` и вдали от
+    /// `USER_MMAP_BASE`, куда `mmap` кладёт свои регионы.
+    const SCRATCH_VA: u64 = 0x0000_4002_0000_0000;
+    /// Отдельный VA для shared-страницы в fork-тесте.
+    const FORK_VA: u64 = 0x0000_5000_0000_0000;
+
+    const O_RDONLY: u64 = 0;
+    const O_WRONLY: u64 = 1;
+    const O_RDWR: u64 = 2;
+    const F_SETFL: u64 = 4;
+    const O_NONBLOCK: u64 = 0o4000;
+    const POLLIN: i16 = 0x001;
+
+    /// Синтетический `Compat_Process` для вызывающей задачи: syscall-слой
+    /// ищет состояние по `scheduler::current_pid()`.
+    fn synth(pid: u64) -> CompatState {
+        CompatState::new(
+            FdTable::with_standard_streams(),
+            Arc::new(Spinlock::new(VmRegionSet::new(
+                USER_MMAP_BASE,
+                USER_MMAP_BASE,
+            ))),
+            pid,
+        )
+    }
+
+    fn install_synth() -> (u64, Option<CompatState>) {
+        let me = scheduler::current_pid();
+        let saved = compat::remove_compat(me);
+        compat::install_compat(me, synth(me));
+        (me, saved)
+    }
+
+    fn restore_synth(me: u64, saved: Option<CompatState>) {
+        compat::remove_compat(me);
+        if let Some(st) = saved {
+            compat::install_compat(me, st);
+        }
+    }
+
+    /// Отобразить scratch-страницу в АКТИВНОМ адресном пространстве.
+    fn map_scratch() -> Option<u64> {
+        let frame = pmm::alloc_frame()?;
+        // SAFETY: кадр только что выделен и доступен через HHDM.
+        unsafe {
+            core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, 4096);
+        }
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        vmm::map(frame, SCRATCH_VA, flags).ok()?;
+        Some(frame)
+    }
+
+    /// Выполнить `f` в свежем пользовательском PML4, где отображена только
+    /// scratch-страница. После возврата адресное пространство сносится целиком
+    /// (`drop_user_space`), поэтому все кадры и таблицы возвращаются в PMM.
+    ///
+    /// `f` НЕ должен переключать CR3 сам и не должен ожидать, что в нижней
+    /// половине есть что-то, кроме scratch/своих отображений.
+    fn with_user_space<R>(f: impl FnOnce() -> R) -> Option<R> {
+        let pml4 = vmm::new_user_pml4().ok()?;
+        let saved = vmm::current_pml4_phys();
+        // SAFETY: новый PML4 построен `new_user_pml4` из текущего и содержит все
+        // ядерные отображения верхней половины, поэтому код ядра, стек и heap
+        // остаются доступны; возврат на `saved` — обязанность этой функции.
+        unsafe {
+            vmm::load_cr3(pml4);
+        }
+        if map_scratch().is_none() {
+            // SAFETY: возвращаем исходный PML4 до освобождения нового.
+            unsafe {
+                vmm::load_cr3(saved);
+            }
+            vmm::drop_user_space(pml4);
+            return None;
+        }
+        let out = Some(f());
+        // SAFETY: сносим адресное пространство только после возврата на
+        // исходный CR3.
+        unsafe {
+            vmm::load_cr3(saved);
+        }
+        vmm::drop_user_space(pml4);
+        out
+    }
+
+    fn put(offset: u64, bytes: &[u8]) {
+        assert!(offset as usize + bytes.len() <= 4096);
+        // SAFETY: scratch-страница отображена writable в `with_user_space`;
+        // диапазон проверен выше.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (SCRATCH_VA + offset) as *mut u8,
+                bytes.len(),
+            );
+        }
+    }
+
+    fn get_u32(offset: u64) -> u32 {
+        // SAFETY: scratch-страница отображена; смещение внутри 4 КиБ.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const u32) }
+    }
+
+    fn get_i16(offset: u64) -> i16 {
+        // SAFETY: как выше.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const i16) }
+    }
+
+    fn put_cstr(offset: u64, s: &[u8]) {
+        put(offset, s);
+        put(offset + s.len() as u64, &[0]);
+    }
+
+    fn put_u8(offset: u64, v: u8) {
+        // SAFETY: scratch-страница отображена writable в `with_user_space`.
+        unsafe { core::ptr::write_unaligned((SCRATCH_VA + offset) as *mut u8, v) }
+    }
+
+    fn put_u32(offset: u64, v: u32) {
+        // SAFETY: как выше.
+        unsafe { core::ptr::write_unaligned((SCRATCH_VA + offset) as *mut u32, v) }
+    }
+
+    fn put_i32(offset: u64, v: i32) {
+        // SAFETY: как выше.
+        unsafe { core::ptr::write_unaligned((SCRATCH_VA + offset) as *mut i32, v) }
+    }
+
+    fn put_u64(offset: u64, v: u64) {
+        // SAFETY: как выше.
+        unsafe { core::ptr::write_unaligned((SCRATCH_VA + offset) as *mut u64, v) }
+    }
+
+    fn get_u8(offset: u64) -> u8 {
+        // SAFETY: scratch-страница отображена; смещение внутри 4 КиБ.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const u8) }
+    }
+
+    fn get_u64(offset: u64) -> u64 {
+        // SAFETY: как выше.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const u64) }
+    }
+
+    fn get_i32(offset: u64) -> i32 {
+        // SAFETY: как выше.
+        unsafe { core::ptr::read_unaligned((SCRATCH_VA + offset) as *const i32) }
+    }
+
+    /// Разложить `struct iovec` (16 байт: base + len) в scratch.
+    fn put_iovec(offset: u64, base: u64, len: u64) {
+        put_u64(offset, base);
+        put_u64(offset + 8, len);
+    }
+
+    /// Разложить `struct msghdr` (56 байт) в scratch. `msg_name`/`namelen` и
+    /// входной `msg_flags` нулевые: подключённому AF_UNIX stream адрес не нужен.
+    fn put_msghdr(offset: u64, iov: u64, iovlen: u64, control: u64, controllen: u64) {
+        put(offset, &[0u8; 56]);
+        put_u64(offset, 0); // msg_name
+        put_u64(offset + 16, iov);
+        put_u64(offset + 24, iovlen);
+        put_u64(offset + 32, control);
+        put_u64(offset + 40, controllen);
+    }
+
+    /// Записать в scratch один `SCM_RIGHTS` cmsg с массивом `fds`.
+    /// Возвращает `CMSG_SPACE(4*len)` — длину control-буфера.
+    fn put_cmsg_rights(offset: u64, fds: &[i32]) -> u64 {
+        let payload = 4 * fds.len() as u64;
+        let len = 16 + payload;
+        let space = (len + 7) & !7;
+        put_u64(offset, len); // cmsg_len (CMSG_LEN)
+        put_u32(offset + 8, 1); // cmsg_level = SOL_SOCKET
+        put_u32(offset + 12, 1); // cmsg_type = SCM_RIGHTS
+        for (i, fd) in fds.iter().enumerate() {
+            put_i32(offset + 16 + 4 * i as u64, *fd);
+        }
+        space
+    }
+
+    /// Записать `memfd` с именем `name` и одним 8-байтным словом `magic` по
+    /// смещению 0; возвращает (fd, его VFS-узел для проверок владения).
+    fn make_shm(name: &[u8], magic: u64) -> (u64, Arc<dyn crate::vfs::VfsNode>) {
+        put_cstr(0x220, name);
+        let fd = io_sys::sys_memfd_create(SCRATCH_VA + 0x220, 0).expect("scm: memfd_create");
+        io_sys::sys_ftruncate(fd, 4096).expect("scm: ftruncate");
+        put_u64(0x300, magic);
+        assert_eq_kernel!(
+            io_sys::sys_pwrite64(fd, SCRATCH_VA + 0x300, 8, 0),
+            Ok(8),
+            "scm: seed memfd page"
+        );
+        let node = io_sys::file_node_for_fd(fd as u32).expect("scm: memfd node");
+        (fd, node)
+    }
+
+    /// Прочитать 8-байтное слово из `fd` (0 смещение) в scratch+0x300.
+    fn read_shm_word(fd: u64) -> u64 {
+        assert_eq_kernel!(
+            io_sys::sys_pread64(fd, SCRATCH_VA + 0x300, 8, 0),
+            Ok(8),
+            "scm: pread memfd word"
+        );
+        get_u64(0x300)
+    }
+
+    /// `/dev/fb0`: open → ioctl var/fix → mmap физического scanout → пиксель
+    /// через пользовательское отображение → `munmap`; takeover включён, пока
+    /// экран у desktop, и снят в конце.
+    pub fn fbdev_ioctl_mmap_pixel() {
+        let info = match crate::drivers::framebuffer::fb_info() {
+            Some(i) => i,
+            None => {
+                crate::skip_kernel!("no framebuffer", "fb0: serial-only boot");
+                return;
+            }
+        };
+        let frames_before = pmm::free_frames();
+        // Тест забирает экран; предыдущий (если был) обязан был его вернуть.
+        crate::drivers::framebuffer::release_takeover();
+
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"/dev/fb0");
+            let fd = match io_sys::sys_open(SCRATCH_VA, O_RDWR, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "fb0: open must succeed");
+                    return;
+                }
+            };
+            assert_kernel!(
+                crate::drivers::framebuffer::takeover_active(),
+                "fb0: open must take the screen over from the kernel console"
+            );
+
+            // FBIOGET_VSCREENINFO: 160-байтная структура в scratch+0x100.
+            assert_eq_kernel!(
+                io_sys::sys_ioctl(fd, FBIOGET_VSCREENINFO, SCRATCH_VA + 0x100),
+                Ok(0),
+                "fb0: FBIOGET_VSCREENINFO succeeds"
+            );
+            assert_eq_kernel!(get_u32(0x100), info.width, "fb0: var.xres");
+            assert_eq_kernel!(get_u32(0x104), info.height, "fb0: var.yres");
+            assert_eq_kernel!(get_u32(0x100 + 24), info.bpp, "fb0: var.bits_per_pixel");
+            // red.offset/length по смещениям 32/36.
+            assert_eq_kernel!(get_u32(0x100 + 32), info.red_offset, "fb0: var.red.offset");
+            assert_eq_kernel!(get_u32(0x100 + 36), info.red_length, "fb0: var.red.length");
+
+            // FBIOGET_FSCREENINFO: id/smem_start/smem_len/type/visual/stride.
+            assert_eq_kernel!(
+                io_sys::sys_ioctl(fd, FBIOGET_FSCREENINFO, SCRATCH_VA + 0x200),
+                Ok(0),
+                "fb0: FBIOGET_FSCREENINFO succeeds"
+            );
+            // SAFETY: scratch writable, id — 16 байт.
+            let id = unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x200) as *const u8, 16) };
+            assert_eq_kernel!(&id[..6], b"paghfb", "fb0: fix.id");
+            assert_eq_kernel!(
+                u64::from_le_bytes(unsafe {
+                    core::ptr::read_unaligned((SCRATCH_VA + 0x210) as *const [u8; 8])
+                }),
+                info.phys,
+                "fb0: fix.smem_start is the physical scanout base"
+            );
+            assert_eq_kernel!(
+                get_u32(0x200 + 24),
+                info.smem_len as u32,
+                "fb0: fix.smem_len"
+            );
+            assert_eq_kernel!(get_u32(0x200 + 28), 0, "fb0: FB_TYPE_PACKED_PIXELS");
+            assert_eq_kernel!(get_u32(0x200 + 36), 2, "fb0: FB_VISUAL_TRUECOLOR");
+            assert_eq_kernel!(get_u32(0x200 + 48), info.pitch, "fb0: fix.line_length");
+
+            // Приватный fbdev-маппинг — отказ, а не копия экрана.
+            assert_eq_kernel!(
+                mem_sys::sys_mmap(
+                    0,
+                    4096,
+                    (PROT_READ | PROT_WRITE) as u64,
+                    2u64, /*MAP_PRIVATE*/
+                    fd,
+                    0
+                ),
+                Err(Errno::EINVAL),
+                "fb0: MAP_PRIVATE must be EINVAL"
+            );
+
+            let map_len = (info.smem_len + 4095) & !4095;
+            let base = match mem_sys::sys_mmap(
+                0,
+                map_len,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            ) {
+                Ok(b) => b,
+                Err(_) => {
+                    crate::skip_kernel!("mmap failed", "fb0: scanout mmap failed");
+                    return;
+                }
+            };
+            assert_kernel!(base != 0, "fb0: mmap returned an address");
+
+            // A2: лист fb0 обязан быть write-combined (PAT entry 4), если
+            // boot запрограммировал IA32_PAT; без PAT — точная прежняя
+            // некешируемая пара. Проверяем сам листовой PTE, а не только
+            // наблюдаемый пиксель: QEMU не моделирует кэш, поэтому потеря
+            // атрибута иначе осталась бы незамеченной.
+            let wc = pat::wc_supported();
+            let cache_mask = pat::PTE_PAT | pat::PTE_NO_CACHE | pat::PTE_WRITE_THROUGH;
+            let leaf_bits = vmm::walk_pte(base)
+                .expect("fb0: leaf PTE")
+                .flags()
+                .bits();
+            assert_kernel!(
+                leaf_bits & pat::PTE_MMIO != 0,
+                "fb0: leaf keeps the MMIO ownership marker"
+            );
+            assert_eq_kernel!(
+                leaf_bits & (pat::PTE_PRESENT | pat::PTE_WRITABLE | pat::PTE_USER),
+                pat::PTE_PRESENT | pat::PTE_WRITABLE | pat::PTE_USER,
+                "fb0: leaf is PRESENT|WRITABLE|USER"
+            );
+            assert_kernel!(
+                leaf_bits & pat::PTE_NX != 0,
+                "fb0: leaf is NX (scanout is not code)"
+            );
+            if wc {
+                assert_kernel!(
+                    leaf_bits & pat::PTE_PAT != 0,
+                    "fb0: leaf selects PAT entry 4 (write-combining)"
+                );
+                assert_eq_kernel!(
+                    leaf_bits & (pat::PTE_NO_CACHE | pat::PTE_WRITE_THROUGH),
+                    0,
+                    "fb0: WC leaf has no NO_CACHE/WRITE_THROUGH"
+                );
+            } else {
+                assert_kernel!(
+                    leaf_bits & pat::PTE_PAT == 0,
+                    "fb0: fallback leaf does not depend on PAT"
+                );
+                assert_eq_kernel!(
+                    leaf_bits & (pat::PTE_NO_CACHE | pat::PTE_WRITE_THROUGH),
+                    pat::PTE_NO_CACHE | pat::PTE_WRITE_THROUGH,
+                    "fb0: fallback keeps NO_CACHE|WRITE_THROUGH"
+                );
+            }
+            crate::kprintln!(
+                "[selftest] fb0: leaf flags 0x{:016x} cache={}",
+                leaf_bits,
+                if wc { "wc" } else { "uncached" }
+            );
+
+            // mprotect меняет права, но не тип памяти: WC/MMIO обязаны
+            // пережить RW → RO → RW. Регрессия: безусловный
+            // NO_CACHE|WRITE_THROUGH в mprotect молча отменял WC.
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, map_len, (PROT_READ | PROT_WRITE) as u64),
+                Ok(0),
+                "fb0: mprotect(RW) succeeds"
+            );
+            let rw = vmm::walk_pte(base)
+                .expect("fb0: leaf after mprotect(RW)")
+                .flags();
+            assert_eq_kernel!(
+                rw.bits() & cache_mask,
+                leaf_bits & cache_mask,
+                "fb0: mprotect(RW) preserves the cache policy"
+            );
+            assert_kernel!(
+                rw.contains(vmm::MMIO_BIT),
+                "fb0: mprotect(RW) preserves MMIO_BIT"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, map_len, PROT_READ as u64),
+                Ok(0),
+                "fb0: mprotect(RO) succeeds"
+            );
+            let ro = vmm::walk_pte(base)
+                .expect("fb0: leaf after mprotect(RO)")
+                .flags();
+            assert_kernel!(
+                !ro.contains(PageTableFlags::WRITABLE),
+                "fb0: mprotect(RO) removes WRITABLE"
+            );
+            assert_eq_kernel!(
+                ro.bits() & cache_mask,
+                leaf_bits & cache_mask,
+                "fb0: mprotect(RO) preserves the cache policy"
+            );
+            assert_kernel!(
+                ro.contains(vmm::MMIO_BIT),
+                "fb0: mprotect(RO) preserves MMIO_BIT"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, map_len, (PROT_READ | PROT_WRITE) as u64),
+                Ok(0),
+                "fb0: mprotect(RW) restores write access"
+            );
+
+            // fork копирует PTE как есть: ребёнок получает ту же WC/MMIO
+            // трансляцию на тот же физический scanout, без COW и без второго
+            // «владельца» кадра устройства (PMM его не знает).
+            let parent = vmm::current_pml4_phys();
+            let child = vmm::new_user_pml4().expect("fb0: child PML4");
+            vmm::fork_user_space_cow(parent, child).expect("fb0: fork_user_space_cow");
+            // SAFETY: child полностью построен; переключаем CR3 на него и
+            // возвращаемся на parent до сноса.
+            unsafe {
+                vmm::load_cr3(child);
+            }
+            let child_bits = vmm::walk_pte(base)
+                .expect("fb0: child leaf")
+                .flags()
+                .bits();
+            let child_phys = vmm::virt_to_phys_in(child, base);
+            // SAFETY: возврат на parent AS.
+            unsafe {
+                vmm::load_cr3(parent);
+            }
+            assert_eq_kernel!(
+                child_bits & cache_mask,
+                leaf_bits & cache_mask,
+                "fb0: fork preserves the cache policy"
+            );
+            assert_kernel!(
+                child_bits & pat::PTE_MMIO != 0,
+                "fb0: fork preserves MMIO_BIT"
+            );
+            assert_eq_kernel!(
+                child_bits & vmm::COW_BIT.bits(),
+                0,
+                "fb0: fork does not make the scanout COW"
+            );
+            assert_eq_kernel!(
+                child_phys,
+                Some(info.phys),
+                "fb0: child maps the same physical scanout"
+            );
+            // SAFETY: ребёнок не активен (CR3=parent), снос идёт через HHDM.
+            vmm::drop_user_space(child);
+            assert_kernel!(
+                vmm::virt_to_phys(base).is_some(),
+                "fb0: child teardown leaves the parent mapping alive"
+            );
+
+            // Пиксель в правом нижнем углу: он не занят текстовой сеткой, но
+            // сохраняется/восстанавливается независимо от этого.
+            let off = ((info.height as u64 - 2) * info.pitch as u64 + (info.width as u64 - 2) * 4)
+                as usize;
+            assert_kernel!(
+                (off + 4) as u64 <= info.smem_len,
+                "fb0: pixel inside scanout"
+            );
+            // SAFETY: страница scanout отображена пользователю writable этим
+            // вызовом; `off+4` внутри `smem_len`.
+            let orig = unsafe { core::ptr::read_unaligned((base + off as u64) as *const u32) };
+            const MAGIC: u32 = 0x00FF_00FF;
+            // SAFETY: как выше.
+            unsafe {
+                core::ptr::write_unaligned((base + off as u64) as *mut u32, MAGIC);
+            }
+            // SAFETY: пользовательское отображение читается обратно.
+            let seen = unsafe { core::ptr::read_unaligned((base + off as u64) as *const u32) };
+            assert_eq_kernel!(
+                seen,
+                MAGIC,
+                "fb0: pixel written through the mapping reads back"
+            );
+            // SAFETY: HHDM-алиас физического кадра framebuffer валиден; проверяем,
+            // что запись реально дошла до scanout, а не осталась в кэше CPU.
+            let phys_seen = unsafe {
+                core::ptr::read_volatile(vmm::phys_to_virt(info.phys + off as u64) as *const u32)
+            };
+            assert_eq_kernel!(phys_seen, MAGIC, "fb0: pixel reached the physical scanout");
+
+            // Второе отображение того же fd видит тот же пиксель.
+            let base2 = mem_sys::sys_mmap(
+                0,
+                map_len,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            )
+            .expect("fb0 second mmap");
+            // SAFETY: как выше.
+            let seen2 = unsafe { core::ptr::read_unaligned((base2 + off as u64) as *const u32) };
+            assert_eq_kernel!(seen2, MAGIC, "fb0: second mmap aliases the same scanout");
+
+            // A3: 4 MiB класс fill/copy через WC-отображение + scanout.
+            // QEMU не моделирует кэш CPU, поэтому тики здесь — наблюдаемое
+            // значение (real-hardware evidence), а проверяется корректность:
+            // запись доходит до физического scanout, а sfence сбрасывает
+            // WC-буферы перед чтением через HHDM-алиас.
+            const TIMED_BYTES: usize = 4 << 20;
+            let span = info.smem_len as usize & !3;
+            assert_kernel!(span >= 4096, "fb0: scanout span is at least one page");
+
+            let fill_t0 = scheduler::ticks();
+            let mut written = 0usize;
+            while written < TIMED_BYTES {
+                // Проход пишет не больше целого scanout, поэтому 1280×800×4
+                // (3.9 MiB) не переполняется: остаток 4 MiB дописывается
+                // вторым проходом с начала кадра.
+                let n = core::cmp::min(span, TIMED_BYTES - written);
+                // SAFETY: base..base+span — writable-отображение scanout,
+                // n <= span, запись не выходит за smem_len.
+                unsafe {
+                    core::ptr::write_bytes(base as *mut u8, 0xA5, n);
+                }
+                written += n;
+            }
+            // SAFETY: sfence — архитектурный барьер WC-буферов.
+            unsafe {
+                core::arch::x86_64::_mm_sfence();
+            }
+            let fill_ticks = scheduler::ticks().wrapping_sub(fill_t0);
+
+            static COPY_SRC: [u8; 64 * 1024] = [0x5A; 64 * 1024];
+            let copy_t0 = scheduler::ticks();
+            let mut copied = 0usize;
+            while copied < TIMED_BYTES {
+                let n = core::cmp::min(
+                    core::cmp::min(COPY_SRC.len(), TIMED_BYTES - copied),
+                    span,
+                );
+                // SAFETY: COPY_SRC — статический буфер, приёмник — fb-маппинг;
+                // n <= span, области не пересекаются.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(COPY_SRC.as_ptr(), base as *mut u8, n);
+                }
+                copied += n;
+            }
+            // SAFETY: как выше.
+            unsafe {
+                core::arch::x86_64::_mm_sfence();
+            }
+            let copy_ticks = scheduler::ticks().wrapping_sub(copy_t0);
+
+            // Scanout correctness: три точки в разных страницах кадра,
+            // прочитанные и через отображение, и через физический алиас.
+            let probes = [0usize, (span / 2) & !3, span - 4];
+            for (i, &probe) in probes.iter().enumerate() {
+                let value = 0xC0DE_0000u32 | i as u32;
+                // SAFETY: probe + 4 <= span, отображение writable.
+                unsafe {
+                    core::ptr::write_unaligned((base + probe as u64) as *mut u32, value);
+                }
+            }
+            // SAFETY: барьер перед чтением scanout.
+            unsafe {
+                core::arch::x86_64::_mm_sfence();
+            }
+            for (i, &probe) in probes.iter().enumerate() {
+                let value = 0xC0DE_0000u32 | i as u32;
+                // SAFETY: отображение и HHDM-алиас валидны для probe+4.
+                let via_map =
+                    unsafe { core::ptr::read_unaligned((base + probe as u64) as *const u32) };
+                let via_scanout = unsafe {
+                    core::ptr::read_volatile(
+                        vmm::phys_to_virt(info.phys + probe as u64) as *const u32
+                    )
+                };
+                assert_eq_kernel!(
+                    via_map,
+                    value,
+                    "fb0: WC write readable through the mapping"
+                );
+                assert_eq_kernel!(
+                    via_scanout,
+                    value,
+                    "fb0: WC write reached the physical scanout"
+                );
+            }
+            crate::kprintln!(
+                "[selftest] fb0: {} B fill in {} tick(s), {} B copy in {} tick(s), span {} B, cache={}",
+                TIMED_BYTES,
+                fill_ticks,
+                TIMED_BYTES,
+                copy_ticks,
+                span,
+                if wc { "wc" } else { "uncached" }
+            );
+
+            // Восстановить пиксель и снять отображения.
+            // SAFETY: оба отображения живут до munmap ниже.
+            unsafe {
+                core::ptr::write_unaligned((base2 + off as u64) as *mut u32, orig);
+            }
+            assert_eq_kernel!(mem_sys::sys_munmap(base2, map_len), Ok(0), "fb0: munmap #2");
+            assert_eq_kernel!(mem_sys::sys_munmap(base, map_len), Ok(0), "fb0: munmap #1");
+            assert_kernel!(
+                vmm::virt_to_phys(base).is_none(),
+                "fb0: unmapped scanout leaves no translation"
+            );
+            assert_eq_kernel!(io_sys::sys_close(fd), Ok(0), "fb0: close");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        // Вернуть экран консоли и перерисовать её из shadow-буфера.
+        crate::drivers::framebuffer::release_takeover();
+        crate::drivers::framebuffer::repaint_grid();
+        assert_kernel!(ran, "fb0: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "fb0: routine returned every PMM frame (fresh AS teardown)"
+        );
+    }
+
+    /// `/dev/input/event0`: open → EAGAIN без событий (O_NONBLOCK) → HID
+    /// keyboard report → poll POLLIN → read EV_KEY/KEY_A + SYN → HID mouse
+    /// report → BTN_LEFT/REL_X/REL_Y.
+    pub fn evdev_read_poll_keyboard_mouse() {
+        let frames_before = pmm::free_frames();
+        evdev::reset();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"/dev/input/event0");
+            let fd = match io_sys::sys_open(SCRATCH_VA, O_RDONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    crate::skip_kernel!("open failed", "event0: open failed");
+                    return;
+                }
+            };
+
+            // Пустая очередь + O_NONBLOCK → EAGAIN.
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(fd, F_SETFL, O_NONBLOCK),
+                Ok(0),
+                "event0: F_SETFL(O_NONBLOCK)"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Err(Errno::EAGAIN),
+                "event0: read with no events is EAGAIN"
+            );
+
+            // poll без событий — 0.
+            put(0x300, &(fd as i32).to_le_bytes());
+            put(0x304, &POLLIN.to_le_bytes());
+            put(0x306, &0i16.to_le_bytes());
+            assert_eq_kernel!(
+                io_sys::sys_poll(SCRATCH_VA + 0x300, 1, 0),
+                Ok(0),
+                "event0: poll before any event is 0"
+            );
+
+            // USB HID keyboard report: 'a' (usage 0x04). Он попадает и в
+            // evdev-очередь, и в PS/2-кольцо shell (ниже кольцо вычитывается).
+            usb_hid::feed(&[0, 0, 0x04, 0, 0, 0, 0, 0], 1);
+            assert_kernel!(evdev::has_events(), "event0: HID key queued an event");
+            assert_eq_kernel!(
+                io_sys::sys_poll(SCRATCH_VA + 0x300, 1, 0),
+                Ok(1),
+                "event0: poll reports an event"
+            );
+            assert_eq_kernel!(
+                get_i16(0x306) & POLLIN,
+                POLLIN,
+                "event0: revents has POLLIN"
+            );
+
+            // Первое событие — нажатие 'a' (KEY_A=30).
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: read returns one full input_event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 16), EV_KEY as i16, "event0: EV_KEY type");
+            assert_eq_kernel!(get_i16(0x400 + 18), 30, "event0: KEY_A code");
+            assert_eq_kernel!(get_u32(0x400 + 20), 1, "event0: pressed value");
+            // Второе — SYN_REPORT.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: packet ends with a SYN event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 16), EV_SYN as i16, "event0: EV_SYN type");
+
+            // HID mouse: left button, dx=+4, dy=+2 (screen down).
+            usb_hid::feed(&[0x01, 0x04, 0x02], 2);
+            // BTN_LEFT press.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: mouse packet event"
+            );
+            assert_eq_kernel!(
+                get_i16(0x400 + 16),
+                EV_KEY as i16,
+                "event0: mouse button EV_KEY"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 18), BTN_LEFT as i16, "event0: BTN_LEFT");
+            assert_eq_kernel!(get_u32(0x400 + 20), 1, "event0: BTN_LEFT pressed");
+            // REL_X +4.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: mouse packet event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 16), EV_REL as i16, "event0: EV_REL type");
+            assert_eq_kernel!(get_i16(0x400 + 18), REL_X as i16, "event0: REL_X");
+            assert_eq_kernel!(get_u32(0x400 + 20), 4, "event0: REL_X +4");
+            // REL_Y +2: HID-отчёт `dy=+2` (вниз) переворачивается в PS/2-
+            // соглашение, а evdev REL_Y снова screen-вниз — итог +2.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: mouse packet event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 18), REL_Y as i16, "event0: REL_Y");
+            assert_eq_kernel!(get_u32(0x400 + 20), 2, "event0: REL_Y +2 (screen down)");
+            // SYN.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x400, INPUT_EVENT_SIZE as u64),
+                Ok(INPUT_EVENT_SIZE as u64),
+                "event0: mouse packet event"
+            );
+            assert_eq_kernel!(get_i16(0x400 + 16), EV_SYN as i16, "event0: mouse SYN");
+
+            assert_eq_kernel!(io_sys::sys_close(fd), Ok(0), "event0: close");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        // Отпустить клавишу/кнопку и вычистить оба потока: PS/2-кольцо не
+        // должно напечатать 'a' в shell после selftest.
+        usb_hid::feed(&[0, 0, 0, 0, 0, 0, 0, 0], 1);
+        usb_hid::feed(&[0, 0, 0], 2);
+        let mut guard = 0;
+        while crate::drivers::ps2_kbd::take_scancode().is_some() && guard < 1024 {
+            guard += 1;
+        }
+        evdev::reset();
+        assert_kernel!(ran, "event0: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "event0: routine returned every PMM frame"
+        );
+    }
+
+    /// memfd + ftruncate + MAP_SHARED: два отображения одного fd видят одни
+    /// байты, fd/read и mapping согласованы, mprotect сохраняет SHARED-маркер,
+    /// а MAP_SHARED обычного файла честно отвергается.
+    pub fn memfd_mmap_shared_coherent() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"desktop-shm");
+            let fd = match io_sys::sys_memfd_create(SCRATCH_VA, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    crate::skip_kernel!("memfd_create failed", "memfd: no fd");
+                    return;
+                }
+            };
+            // ftruncate задаёт размер SHM-буфера; read() до записи даёт нули.
+            assert_eq_kernel!(
+                io_sys::sys_ftruncate(fd, 8192),
+                Ok(0),
+                "memfd: ftruncate(8192)"
+            );
+            let node = match io_sys::file_node_for_fd(fd as u32) {
+                Some(n) => n,
+                None => {
+                    crate::skip_kernel!("no node", "memfd: fd has no VFS node");
+                    return;
+                }
+            };
+            assert_eq_kernel!(node.size(), 8192, "memfd: size after ftruncate");
+            assert_eq_kernel!(
+                io_sys::sys_pread64(fd, SCRATCH_VA + 0x500, 8, 0),
+                Ok(8),
+                "memfd: pread of a zero page"
+            );
+            assert_eq_kernel!(get_u32(0x500), 0, "memfd: page starts zeroed");
+
+            let len = 8192;
+            let base = match mem_sys::sys_mmap(
+                0,
+                len,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            ) {
+                Ok(b) => b,
+                Err(_) => {
+                    crate::skip_kernel!("mmap failed", "memfd: MAP_SHARED mmap failed");
+                    return;
+                }
+            };
+            const MAGIC: u64 = 0x1122_3344_5566_7788;
+            // SAFETY: отображение MAP_SHARED writable длиной 8192.
+            unsafe {
+                core::ptr::write_unaligned(base as *mut u64, MAGIC);
+                core::ptr::write_unaligned((base + 4096) as *mut u64, !MAGIC);
+            }
+            // fd-чтение видит запись через отображение (один page cache).
+            assert_eq_kernel!(
+                io_sys::sys_pread64(fd, SCRATCH_VA + 0x500, 8, 0),
+                Ok(8),
+                "memfd: pread sees the shared-mapping write"
+            );
+            // SAFETY: scratch readable.
+            let seen = unsafe { core::ptr::read_unaligned((SCRATCH_VA + 0x500) as *const u64) };
+            assert_eq_kernel!(seen, MAGIC, "memfd: fd and mapping are coherent");
+
+            // Второе отображение того же fd — те же физические страницы.
+            let base2 = mem_sys::sys_mmap(
+                0,
+                len,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            )
+            .expect("memfd second mmap");
+            // SAFETY: оба отображения валидны.
+            let seen2 = unsafe { core::ptr::read_unaligned(base2 as *const u64) };
+            assert_eq_kernel!(seen2, MAGIC, "memfd: second mmap aliases the page");
+            // SAFETY: как выше.
+            unsafe {
+                core::ptr::write_unaligned((base2 + 4096) as *mut u64, 0xA5A5_5A5A_A5A5_5A5A);
+            }
+            // SAFETY: как выше.
+            let cross = unsafe { core::ptr::read_unaligned((base + 4096) as *const u64) };
+            assert_eq_kernel!(
+                cross,
+                0xA5A5_5A5A_A5A5_5A5A,
+                "memfd: write through the second mapping is visible through the first"
+            );
+
+            // mprotect(PROT_READ) сохраняет SHARED_BIT и снимает WRITABLE.
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, 4096, PROT_READ as u64),
+                Ok(0),
+                "memfd: mprotect(PROT_READ)"
+            );
+            let pte = vmm::walk_pte(base).expect("memfd: PTE exists");
+            assert_kernel!(
+                pte.flags().contains(vmm::SHARED_BIT),
+                "memfd: mprotect preserves the SHARED marker"
+            );
+            assert_kernel!(
+                !pte.flags().contains(PageTableFlags::WRITABLE),
+                "memfd: mprotect(PROT_READ) removes WRITABLE"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, 4096, (PROT_READ | PROT_WRITE) as u64),
+                Ok(0),
+                "memfd: mprotect(RW) again"
+            );
+            assert_kernel!(
+                vmm::walk_pte(base)
+                    .map(|p| p.flags().contains(PageTableFlags::WRITABLE))
+                    .unwrap_or(false),
+                "memfd: mprotect(RW) restores WRITABLE"
+            );
+
+            // MAP_SHARED обычного файла не должен притворяться memfd.
+            put_cstr(0x600, b"/dev/null");
+            let null_fd =
+                io_sys::sys_open(SCRATCH_VA + 0x600, O_RDWR, 0).expect("memfd: /dev/null open");
+            assert_eq_kernel!(
+                mem_sys::sys_mmap(0, 4096, PROT_READ as u64, MAP_SHARED as u64, null_fd, 0),
+                Err(Errno::EINVAL),
+                "memfd: MAP_SHARED on a non-memfd file is EINVAL"
+            );
+            assert_eq_kernel!(io_sys::sys_close(null_fd), Ok(0), "memfd: close /dev/null");
+
+            assert_eq_kernel!(mem_sys::sys_munmap(base2, len), Ok(0), "memfd: munmap #2");
+            assert_eq_kernel!(mem_sys::sys_munmap(base, len), Ok(0), "memfd: munmap #1");
+            assert_eq_kernel!(
+                io_sys::sys_close(fd),
+                Ok(0),
+                "memfd: close drops the page cache"
+            );
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "memfd: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "memfd: routine returned every PMM frame"
+        );
+    }
+
+    /// fork-семантика MAP_SHARED: общая страница memfd видна родителю и
+    /// ребёнку, запись родителя после fork видна ребёнку, обе стороны держат
+    /// ровно одну ссылку владения, `drop_user_space` всё возвращает.
+    pub fn memfd_mmap_shared_survives_fork() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"fork-shm");
+            let fd = io_sys::sys_memfd_create(SCRATCH_VA, 0).expect("fork-shm: memfd_create");
+            io_sys::sys_ftruncate(fd, 4096).expect("fork-shm: ftruncate");
+            let node = io_sys::file_node_for_fd(fd as u32).expect("fork-shm: node");
+
+            let parent = vmm::current_pml4_phys();
+            let child = vmm::new_user_pml4().expect("fork-shm: child PML4");
+
+            // Parent AS: одна SHARED-страница memfd по FORK_VA.
+            let frame = node.shared_page(0).expect("fork-shm: page");
+            pmm::cow_ref(frame); // ссылка отображения родителя
+            let flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE
+                | PageTableFlags::NO_EXECUTE
+                | vmm::SHARED_BIT;
+            vmm::map(frame, FORK_VA, flags).expect("fork-shm: map parent");
+            const BEFORE: u64 = 0x0123_4567_89AB_CDEF;
+            // SAFETY: FORK_VA отображён writable в активном (parent) AS.
+            unsafe {
+                core::ptr::write_unaligned(FORK_VA as *mut u64, BEFORE);
+            }
+
+            // fork-COW должен СОХРАНИТЬ общий кадр, а не сделать COW-копию.
+            vmm::fork_user_space_cow(parent, child).expect("fork-shm: fork_user_space_cow");
+            let child_phys = vmm::virt_to_phys_in(child, FORK_VA).expect("fork-shm: child PTE");
+            assert_eq_kernel!(
+                child_phys,
+                frame,
+                "fork-shm: child maps the SAME physical page, not a COW copy"
+            );
+            // SAFETY: кадр доступен через HHDM, ребёнок его отображает.
+            let child_sees =
+                unsafe { core::ptr::read_volatile(vmm::phys_to_virt(child_phys) as *const u64) };
+            assert_eq_kernel!(child_sees, BEFORE, "fork-shm: child sees pre-fork data");
+
+            // Запись родителя ПОСЛЕ fork видна ребёнку (общая, не COW).
+            const AFTER: u64 = 0x0FED_CBA9_8765_4321;
+            // SAFETY: parent AS активен, FORK_VA writable.
+            unsafe {
+                core::ptr::write_unaligned(FORK_VA as *mut u64, AFTER);
+            }
+            // SAFETY: как выше.
+            let child_after =
+                unsafe { core::ptr::read_volatile(vmm::phys_to_virt(child_phys) as *const u64) };
+            assert_eq_kernel!(
+                child_after,
+                AFTER,
+                "fork-shm: post-fork write is shared, not copy-on-write"
+            );
+
+            // Флаги ребёнка: SHARED + WRITABLE (не COW/RO).
+            // SAFETY: переключаем CR3 на ребёнка и сразу возвращаемся.
+            unsafe {
+                vmm::load_cr3(child);
+            }
+            let child_flags = vmm::walk_pte(FORK_VA).map(|p| p.flags());
+            // SAFETY: возврат на parent AS.
+            unsafe {
+                vmm::load_cr3(parent);
+            }
+            let cf = child_flags.expect("fork-shm: child leaf");
+            assert_kernel!(
+                cf.contains(vmm::SHARED_BIT),
+                "fork-shm: child leaf keeps SHARED_BIT"
+            );
+            assert_kernel!(
+                cf.contains(PageTableFlags::WRITABLE),
+                "fork-shm: child leaf stays writable"
+            );
+            assert_kernel!(
+                !cf.contains(vmm::COW_BIT),
+                "fork-shm: child leaf is not COW"
+            );
+
+            // Ребёнок не должен освободить кадр, который родитель ещё держит.
+            let saved_cr3 = vmm::current_pml4_phys();
+            // SAFETY: child inactive, drop идёт через HHDM.
+            vmm::drop_user_space(child);
+            // SAFETY: parent всё ещё активен.
+            assert_eq_kernel!(saved_cr3, parent, "fork-shm: parent AS stayed active");
+            assert_kernel!(
+                vmm::virt_to_phys(FORK_VA).is_some(),
+                "fork-shm: child teardown leaves the parent mapping alive"
+            );
+            // SAFETY: parent AS активен, отображение валидно.
+            let still = unsafe { core::ptr::read_unaligned(FORK_VA as *const u64) };
+            assert_eq_kernel!(
+                still,
+                AFTER,
+                "fork-shm: parent mapping survives child teardown"
+            );
+
+            // Родительское отображение снимается вместе с его AS (`with_user_space`
+            // сделает drop_user_space); закрытие fd отпускает кэш-страницу.
+            assert_eq_kernel!(io_sys::sys_close(fd), Ok(0), "fork-shm: close");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "fork-shm: test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "fork-shm: routine returned every PMM frame"
+        );
+    }
+
+    /// `/dev/vtconsole0` + `/dev/vtinput`: shared surface видит текст shell,
+    /// mmap read-only/seqlock валиден, ioctl отдаёт геометрию, а записанная в
+    /// vtinput команда доходит до shell (после возврата из selftest он выполнит
+    /// `echo vtinput-ok`; e2e проверяет строку вывода).
+    pub fn vtconsole_shared_surface_and_input() {
+        let frames_before = pmm::free_frames();
+        // Маркер печатается в framebuffer (не в serial) — его должен увидеть
+        // shared surface через снимок, который делает activate().
+        crate::fb_println!("vt-surface-marker");
+        crate::kprintln!("[VT] selftest: opening /dev/vtconsole0");
+
+        fn rd_u16(base: u64, off: u64) -> u16 {
+            // SAFETY: base — валидное пользовательское отображение поверхности,
+            // off внутри заголовка.
+            unsafe { core::ptr::read_unaligned((base + off) as *const u16) }
+        }
+        fn rd_u32(base: u64, off: u64) -> u32 {
+            // SAFETY: как выше.
+            unsafe { core::ptr::read_unaligned((base + off) as *const u32) }
+        }
+
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_cstr(0, b"/dev/vtconsole0");
+            let fd = match io_sys::sys_open(SCRATCH_VA, O_RDONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "vtconsole: open failed");
+                    return;
+                }
+            };
+            assert_kernel!(
+                vtsurface::is_active(),
+                "vtconsole: open activates publishing"
+            );
+
+            // PGVT_IOC_INFO (32 байта) по адресу scratch+0x100.
+            assert_eq_kernel!(
+                io_sys::sys_ioctl(fd, vt_abi::PGVT_IOC_INFO, SCRATCH_VA + 0x100),
+                Ok(0),
+                "vtconsole: PGVT_IOC_INFO succeeds"
+            );
+            let info = vtsurface::info().expect("vtconsole: surface info");
+            assert_eq_kernel!(get_u32(0x100), 1, "vtconsole: abi_version=1");
+            assert_eq_kernel!(
+                get_u32(0x104),
+                info.total_bytes,
+                "vtconsole: ioctl total_bytes"
+            );
+            assert_eq_kernel!(get_u32(0x108) as u16, info.cols, "vtconsole: ioctl cols");
+            assert_eq_kernel!(get_u32(0x10c) as u16, info.rows, "vtconsole: ioctl rows");
+            assert_eq_kernel!(get_u32(0x110), 16, "vtconsole: cell_size=16");
+            assert_eq_kernel!(get_u32(0x114), 128, "vtconsole: header_len=128");
+
+            let base = match mem_sys::sys_mmap(
+                0,
+                info.total_bytes as u64,
+                PROT_READ as u64,
+                MAP_SHARED as u64,
+                fd,
+                0,
+            ) {
+                Ok(base) => base,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "vtconsole: MAP_SHARED mmap failed");
+                    return;
+                }
+            };
+
+            // Заголовок ABI v1: magic/version/header_len/чётный seq/размеры.
+            assert_eq_kernel!(rd_u32(base, 0), vt_abi::MAGIC, "vtconsole: magic PGVT");
+            assert_eq_kernel!(rd_u16(base, 4), vt_abi::VERSION, "vtconsole: version=1");
+            assert_eq_kernel!(rd_u16(base, 6), 128, "vtconsole: header_len=128");
+            let seq = rd_u32(base, 8);
+            assert_eq_kernel!(seq & 1, 0, "vtconsole: mmap snapshot has an even seqlock");
+            assert_eq_kernel!(rd_u16(base, 16) as u32, info.cols as u32, "vtconsole: cols");
+            assert_eq_kernel!(rd_u16(base, 18) as u32, info.rows as u32, "vtconsole: rows");
+            assert_eq_kernel!(rd_u32(base, 40), 128, "vtconsole: cells_offset=128");
+            let cells_bytes = info.cols as u32 * info.rows as u32 * 16;
+            assert_eq_kernel!(rd_u32(base, 44), cells_bytes, "vtconsole: cells_bytes");
+            assert_eq_kernel!(rd_u32(base, 56), info.total_bytes, "vtconsole: total_bytes");
+            let cx = rd_u16(base, 20);
+            let cy = rd_u16(base, 22);
+            assert_kernel!(
+                cx < info.cols && cy < info.rows,
+                "vtconsole: cursor inside grid"
+            );
+
+            // Найти маркер в видимой матрице: shell-текст опубликован снимком
+            // activate() ещё до первого нового символа.
+            let mut marker_found = false;
+            let mut marker_row = 0u16;
+            for row in 0..info.rows as u32 {
+                let mut line = alloc::string::String::new();
+                for col in 0..info.cols as u32 {
+                    let off = 128 + (row * info.cols as u32 + col) * 16;
+                    let cp = rd_u32(base, off as u64);
+                    let ch = if cp == 0 {
+                        ' '
+                    } else {
+                        core::char::from_u32(cp).unwrap_or('?')
+                    };
+                    line.push(ch);
+                }
+                if line.contains("vt-surface-marker") {
+                    marker_found = true;
+                    marker_row = row as u16;
+                }
+            }
+            assert_kernel!(
+                marker_found,
+                "vtconsole: shared surface contains the shell marker text"
+            );
+            assert_kernel!(
+                marker_row < info.rows,
+                "vtconsole: marker row inside the visible matrix"
+            );
+
+            // Отображение read-only на уровне PTE и с маркером VT_RO_BIT.
+            let pte = vmm::walk_pte(base).expect("vtconsole: PTE exists");
+            assert_kernel!(
+                !pte.flags().contains(PageTableFlags::WRITABLE),
+                "vtconsole: mmap is not writable"
+            );
+            assert_kernel!(
+                pte.flags().contains(vmm::VT_RO_BIT),
+                "vtconsole: mmap carries VT_RO_BIT"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_mprotect(base, 4096, (PROT_READ | PROT_WRITE) as u64),
+                Err(Errno::EACCES),
+                "vtconsole: mprotect(PROT_WRITE) is refused"
+            );
+
+            // read(2) fallback: один целостный снимок с начала.
+            assert_eq_kernel!(
+                io_sys::sys_read(fd, SCRATCH_VA + 0x800, 128),
+                Ok(128),
+                "vtconsole: read() returns the header snapshot"
+            );
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned((SCRATCH_VA + 0x800) as *const u32) },
+                vt_abi::MAGIC,
+                "vtconsole: read() snapshot starts with PGVT"
+            );
+            // Регрессия клиента `pagh-terminal --vt`: см. helper ниже.
+            check_vtconsole_lazy_read(fd, info.total_bytes);
+
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(base, info.total_bytes as u64),
+                Ok(0),
+                "vtconsole: munmap"
+            );
+            assert_eq_kernel!(io_sys::sys_close(fd), Ok(0), "vtconsole: close");
+            assert_kernel!(
+                !vtsurface::is_active(),
+                "vtconsole: close deactivates publishing"
+            );
+
+            // vtinput: команда уходит в shell как set-1-скан-коды.
+            put_cstr(0, b"/dev/vtinput");
+            let ifd = match io_sys::sys_open(SCRATCH_VA, O_WRONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "vtinput: open failed");
+                    return;
+                }
+            };
+            let cmd = b"echo vtinput-ok\r";
+            // ── Дедупликация ввода: пока клавиатурой владеет VT-клиент,
+            // физический байт не попадает в shell-кольцо (в shell он придёт
+            // через vtinput), но event0 его по-прежнему видит — композитор не
+            // ломается. Запись в vtinput от compat-процесса (selftest ставит
+            // синтетический `CompatState`) защёлкивает владельца.
+            evdev::reset();
+            put(0x300, b"x");
+            assert_eq_kernel!(
+                io_sys::sys_write(ifd, SCRATCH_VA + 0x300, 1),
+                Ok(1),
+                "dedup: probe write to vtinput"
+            );
+            assert_kernel!(
+                crate::drivers::vtinput::client_active(),
+                "dedup: vtinput write from userspace marks the VT client"
+            );
+            while ps2_kbd::take_scancode().is_some() {}
+            evdev::reset();
+            ps2_kbd::inject_scancode(0x1E); // физический `a` make (USB-путь)
+            assert_kernel!(
+                !ps2_kbd::has_scancode(),
+                "dedup: physical key is not duplicated into the shell ring"
+            );
+            assert_kernel!(
+                evdev::pending() > 0,
+                "dedup: event0 still receives the physical key (compositor)"
+            );
+            ps2_kbd::inject_scancode_from_vt(0x1E);
+            assert_kernel!(
+                ps2_kbd::has_scancode(),
+                "dedup: the vtinput path is the single delivery to the shell"
+            );
+            while ps2_kbd::take_scancode().is_some() {}
+            evdev::reset();
+            crate::drivers::vtinput::reset();
+            assert_kernel!(
+                !crate::drivers::vtinput::client_active(),
+                "dedup: reset clears the VT client latch"
+            );
+
+            put(0x300, cmd);
+            assert_eq_kernel!(
+                io_sys::sys_write(ifd, SCRATCH_VA + 0x300, cmd.len() as u64),
+                Ok(cmd.len() as u64),
+                "vtinput: write accepts the whole buffer"
+            );
+            assert_kernel!(
+                ps2_kbd::has_scancode(),
+                "vtinput: bytes were translated into the shell scancode ring"
+            );
+            assert_eq_kernel!(io_sys::sys_close(ifd), Ok(0), "vtinput: close");
+            // Сбросить только ESC-парсер; кольцо scancode'ов намеренно НЕ
+            // трогаем — shell должен выполнить команду после selftest.
+            crate::drivers::vtinput::reset();
+        })
+        .is_some();
+        restore_synth(me, saved);
+        vtsurface::reset_for_tests();
+        assert_kernel!(ran, "vtconsole: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "vtconsole: routine returned every PMM frame (surface is preallocated)"
+        );
+        crate::kprintln!("[VT] selftest: vtinput injected; expecting shell echo after return");
+    }
+
+    /// Регрессия `read(2)` в ещё не подпертый буфер — ровно то, что делает
+    /// `pagh-terminal --vt`: клиент читает остаток снимка в свежий анонимный
+    /// mmap. Сплошная проверка присутствия отвергала такой законный буфер
+    /// `EFAULT`'ом, и второе окно терминала падало на kernel VT-мост.
+    fn check_vtconsole_lazy_read(fd: u64, total_bytes: u32) {
+        let rest = total_bytes as u64 - 128;
+        let lazy = match mem_sys::sys_mmap(
+            0,
+            rest,
+            (PROT_READ | PROT_WRITE) as u64,
+            (MAP_PRIVATE | MAP_ANONYMOUS) as u64,
+            u64::MAX,
+            0,
+        ) {
+            Ok(base) => base,
+            Err(_) => {
+                assert_eq_kernel!(0, 1, "vtconsole: lazy mmap for read() failed");
+                return;
+            }
+        };
+        assert_kernel!(
+            vmm::virt_to_phys(lazy).is_none(),
+            "vtconsole: regression buffer starts demand-paged"
+        );
+        assert_eq_kernel!(
+            io_sys::sys_read(fd, lazy, rest),
+            Ok(rest),
+            "vtconsole: read() fills a demand-paged buffer"
+        );
+        let mut marker_rest = false;
+        for cell in 0..(rest as usize / 16).saturating_sub(2) {
+            // SAFETY: `lazy` — валидное пользовательское отображение длины
+            // `rest`, страницы подперты чтением выше; codepoint лежит в первых
+            // 4 байтах 16-байтной клетки.
+            let cp = |k: usize| unsafe {
+                core::ptr::read_unaligned((lazy as *const u8).add((cell + k) * 16) as *const u32)
+            };
+            if cp(0) == 'v' as u32 && cp(1) == 't' as u32 && cp(2) == '-' as u32 {
+                marker_rest = true;
+            }
+        }
+        assert_kernel!(
+            marker_rest,
+            "vtconsole: read() cell snapshot carries the shell marker"
+        );
+        assert_eq_kernel!(
+            mem_sys::sys_munmap(lazy, rest),
+            Ok(0),
+            "vtconsole: munmap of the read() buffer"
+        );
+    }
+
+    /// Регрессия ОБЩЕГО пути `read(2)`/`write(2)`: буфер, ни одна страница
+    /// которого ещё не подперта demand paging'ом.
+    ///
+    /// До фикса `check_user_ptr` требовал PRESENT на всех страницах всего
+    /// `count`, поэтому `read` в свежий `mmap` и `write` из свежего `Vec`/`Box`
+    /// возвращали `EFAULT` уже на второй странице, хотя это законная память
+    /// процесса. Ровно на этом падали клиент kernel VT-моста (read снимка) и
+    /// приложения, пишущие крупные буферы (Files и др.). Здесь проверяется
+    /// общий файловый/pipe путь, а не `/dev/vtconsole0` (у него собственный
+    /// ранний путь и своя регрессия выше).
+    pub fn lazy_anon_user_buffers() {
+        let frames_before = pmm::free_frames();
+        // 3 страницы данных через pipe: ёмкость 64 КиБ, запись не блокируется.
+        const DATA: u64 = 3 * 4096;
+        const CHUNK: usize = 0x800; // scratch-страница: шаблон в 0x800..0x1000
+        let mut pattern = alloc::vec::Vec::with_capacity(CHUNK);
+        for i in 0..CHUNK {
+            pattern.push((i % 251) as u8);
+        }
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            put_u32(0x200, 0);
+            put_u32(0x204, 0);
+            assert_eq_kernel!(
+                io_sys::sys_pipe(SCRATCH_VA + 0x200),
+                Ok(0),
+                "userbuf: pipe() for the lazy-buffer regression"
+            );
+            let rd = get_u32(0x200) as u64;
+            let wr = get_u32(0x204) as u64;
+
+            // ── read(2) в ленивый anon-буфер: 8 страниц приёмника, 3 страницы
+            // данных. Требование PRESENT на всём `count` отвергало такой буфер.
+            let rdbuf = match mem_sys::sys_mmap(
+                0,
+                8 * 4096,
+                (PROT_READ | PROT_WRITE) as u64,
+                (MAP_PRIVATE | MAP_ANONYMOUS) as u64,
+                u64::MAX,
+                0,
+            ) {
+                Ok(base) => base,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "userbuf: lazy read mmap failed");
+                    return;
+                }
+            };
+            assert_kernel!(
+                vmm::virt_to_phys(rdbuf).is_none(),
+                "userbuf: read buffer starts demand-paged"
+            );
+            // Наполнить pipe шаблоном через настоящий write(2).
+            put(0x800, &pattern);
+            let mut written = 0u64;
+            while written < DATA {
+                match io_sys::sys_write(wr, SCRATCH_VA + 0x800, CHUNK as u64) {
+                    Ok(n) if n > 0 => written += n,
+                    other => {
+                        assert_eq_kernel!(other, Ok(CHUNK as u64), "userbuf: prime the pipe");
+                        return;
+                    }
+                }
+            }
+            let mut got = 0u64;
+            while got < DATA {
+                let n = match io_sys::sys_read(rd, rdbuf + got, 8 * 4096 - got) {
+                    Ok(n) if n > 0 => n,
+                    other => {
+                        assert_eq_kernel!(
+                            other,
+                            Ok(DATA - got),
+                            "userbuf: read() into a demand-paged buffer"
+                        );
+                        return;
+                    }
+                };
+                got += n;
+            }
+            assert_eq_kernel!(got, DATA, "userbuf: read() filled all buffered bytes");
+            let mut payload_ok = true;
+            for i in 0..DATA as usize {
+                // SAFETY: `rdbuf` — отображение длины 8 страниц; байты
+                // 0..DATA подперты чтением выше.
+                let b = unsafe { core::ptr::read_volatile((rdbuf + i as u64) as *const u8) };
+                if b != pattern[i % CHUNK] {
+                    payload_ok = false;
+                    break;
+                }
+            }
+            assert_kernel!(payload_ok, "userbuf: read() payload matches the pattern");
+            // min(count, available): приёмник объявлен на 8 страниц, данных 3,
+            // поэтому последняя скопированная страница резидентна, а всё, что
+            // дальше, обязано остаться ленивым — иначе `read` подпёр бы весь
+            // заявленный `count` (до 2 ГиБ) и раздул память вызова.
+            assert_kernel!(
+                vmm::virt_to_phys(rdbuf + DATA - 1).is_some(),
+                "userbuf: the last copied page is resident"
+            );
+            assert_kernel!(
+                vmm::virt_to_phys(rdbuf + 8 * 4096 - 1).is_none(),
+                "userbuf: pages past min(count, available) stay lazy"
+            );
+
+            // ── write(2) из ленивого anon-буфера: страницы источника подпирает
+            // ядро (пользователь их не трогал), поэтому данные — нули. До
+            // фикса `check_user_ptr` возвращал здесь EFAULT.
+            let src = match mem_sys::sys_mmap(
+                0,
+                3 * 4096,
+                (PROT_READ | PROT_WRITE) as u64,
+                (MAP_PRIVATE | MAP_ANONYMOUS) as u64,
+                u64::MAX,
+                0,
+            ) {
+                Ok(base) => base,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "userbuf: lazy write mmap failed");
+                    return;
+                }
+            };
+            assert_kernel!(
+                vmm::virt_to_phys(src).is_none(),
+                "userbuf: write source starts demand-paged"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, src, 3 * 4096),
+                Ok(3 * 4096),
+                "userbuf: write() accepts a demand-paged source"
+            );
+            assert_kernel!(
+                vmm::virt_to_phys(src).is_some(),
+                "userbuf: write() backed the source pages"
+            );
+
+            // ── Настоящие отказы остаются EFAULT ──
+            // PROT_NONE: подпирать нельзя (иначе mprotect стал бы совещательным).
+            let pn = match mem_sys::sys_mmap(
+                0,
+                4096,
+                0, // PROT_NONE
+                (MAP_PRIVATE | MAP_ANONYMOUS) as u64,
+                u64::MAX,
+                0,
+            ) {
+                Ok(base) => base,
+                Err(_) => {
+                    assert_eq_kernel!(0, 1, "userbuf: PROT_NONE mmap failed");
+                    return;
+                }
+            };
+            put(0x800, &[0x5A; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, SCRATCH_VA + 0x800, 8),
+                Ok(8),
+                "userbuf: prime the pipe with one refusal probe"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_read(rd, pn, 8),
+                Err(Errno::EFAULT),
+                "userbuf: read() into PROT_NONE is EFAULT"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, pn, 8),
+                Err(Errno::EFAULT),
+                "userbuf: write() from PROT_NONE is EFAULT"
+            );
+            // Адрес в пользовательской половине, но вне всех регионов.
+            const WILD: u64 = 0x0000_7abc_0000_0000;
+            put(0x800, &[0x11; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, SCRATCH_VA + 0x800, 8),
+                Ok(8),
+                "userbuf: prime the pipe for the wild-address probe"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_read(rd, WILD, 8),
+                Err(Errno::EFAULT),
+                "userbuf: read() into an unregistered user address is EFAULT"
+            );
+            // Огромный `count` не должен превращаться в panic кучи ядра
+            // (`panic = abort` = машина мертва): буфер под копию выделяется
+            // fallible, поэтому `read(2)` отдаёт `ENOMEM` — так же, как нехватка
+            // памяти в Linux. До этого фикса такой `count` был недостижим только
+            // потому, что проверка PRESENT по всему диапазону отсекала его
+            // раньше, чем дело доходило до аллокации.
+            assert_eq_kernel!(
+                io_sys::sys_read(rd, SCRATCH_VA, 0x7FFF_FFFF),
+                Err(Errno::ENOMEM),
+                "userbuf: a 2 GiB count is ENOMEM, not a heap panic"
+            );
+            // `write(2)` с тем же `count`: диапазон не покрыт ленивым регионом,
+            // поэтому отказ — `EFAULT` (подпираются только свои ленивые
+            // страницы), и машина остаётся жива.
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, SCRATCH_VA, 0x7FFF_FFFF),
+                Err(Errno::EFAULT),
+                "userbuf: a 2 GiB write with a non-lazy tail is EFAULT"
+            );
+            // Адрес ядра отсекается диапазонной проверкой ещё до копии.
+            assert_eq_kernel!(
+                io_sys::sys_read(rd, 0xffff_8000_0000_0000, 8),
+                Err(Errno::EFAULT),
+                "userbuf: kernel address is EFAULT"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_write(wr, 0xffff_8000_0000_0000, 8),
+                Err(Errno::EFAULT),
+                "userbuf: kernel address is EFAULT on write"
+            );
+
+            assert_eq_kernel!(io_sys::sys_close(rd), Ok(0), "userbuf: close read end");
+            assert_eq_kernel!(io_sys::sys_close(wr), Ok(0), "userbuf: close write end");
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(rdbuf, 8 * 4096),
+                Ok(0),
+                "userbuf: munmap read buffer"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(src, 3 * 4096),
+                Ok(0),
+                "userbuf: munmap src"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(pn, 4096),
+                Ok(0),
+                "userbuf: munmap PROT_NONE"
+            );
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "userbuf: syscall test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "userbuf: routine returned every PMM frame"
+        );
+    }
+
+    /// SCM_RIGHTS по AF_UNIX socketpair: данные и memfd в одном `sendmsg`,
+    /// получатель принимает dup fd и через `mmap(MAP_SHARED)` видит те же
+    /// страницы; отправитель свой fd не теряет. Плюс несколько fd в одном cmsg
+    /// и `MSG_CMSG_CLOEXEC`, переживающий exec-вычистку (`close_cloexec` —
+    /// ровно тот путь, которым `execve` вычищает fd в `task/process.rs`).
+    pub fn scm_rights_memfd_passing() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "scm: socketpair(AF_UNIX, SOCK_STREAM)"
+            );
+            let a = get_u32(0x40) as u64;
+            let b = get_u32(0x44) as u64;
+            assert_kernel!(a != b, "scm: socketpair gives two distinct ends");
+
+            // ── данные + memfd в одном sendmsg ──
+            const MAGIC: u64 = 0x5343_4D52_4947_4854; // "SCMRIGHT"
+            let (memfd, node) = make_shm(b"scm-one", MAGIC);
+            put(0x100, b"HELLO");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 5);
+            let space = put_cmsg_rights(0x180, &[memfd as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm: sendmsg carries payload + fd in one call"
+            );
+            // Отправитель не теряет дескриптор.
+            assert_eq_kernel!(read_shm_word(memfd), MAGIC, "scm: sender keeps its fd");
+
+            // ── recvmsg отдаёт данные, cmsg и новый fd ──
+            put(0x140, &[0u8; 32]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 32);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm: recvmsg returns the payload"
+            );
+            // SAFETY: scratch writable, данные лежат по 0x140.
+            let data = unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 5) };
+            assert_eq_kernel!(data, b"HELLO", "scm: payload arrives with the fd");
+            assert_eq_kernel!(get_u64(0x1c0), 20, "scm: cmsg_len = CMSG_LEN(4)");
+            assert_eq_kernel!(get_u32(0x1c0 + 8), 1, "scm: cmsg_level = SOL_SOCKET");
+            assert_eq_kernel!(get_u32(0x1c0 + 12), 1, "scm: cmsg_type = SCM_RIGHTS");
+            let got = get_i32(0x1c0 + 16);
+            assert_kernel!(got >= 3, "scm: received fd is a dynamic descriptor");
+            assert_kernel!(
+                got as u64 != memfd,
+                "scm: receiver gets a dup, not the sender's number"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(got as u64, 3 /*F_GETFL*/, 0),
+                Ok(2 /*O_RDWR*/),
+                "scm: received fd inherits the sender's access mode"
+            );
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                24,
+                "scm: msg_controllen = CMSG_SPACE(sizeof(int))"
+            );
+            assert_eq_kernel!(get_u32(0x080 + 8), 0, "scm: msg_namelen = 0");
+            assert_eq_kernel!(get_u32(0x080 + 48), 0, "scm: no MSG_CTRUNC");
+
+            // ── dup ссылается на тот же открытый файл ──
+            let node2 = io_sys::file_node_for_fd(got as u32).expect("scm: received fd node");
+            assert_kernel!(
+                Arc::ptr_eq(&node, &node2),
+                "scm: received fd refers to the same open file"
+            );
+
+            // ── MAP_SHARED полученного fd: те же физические страницы ──
+            let base = mem_sys::sys_mmap(
+                0,
+                4096,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                memfd,
+                0,
+            )
+            .expect("scm: mmap sender memfd");
+            assert_eq_kernel!(get_u64(0x300), MAGIC, "scm: scratch seed intact");
+            // SAFETY: отображение MAP_SHARED writable на 4096 байт.
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned(base as *const u64) },
+                MAGIC,
+                "scm: sender mapping sees the seed"
+            );
+            let base2 = mem_sys::sys_mmap(
+                0,
+                4096,
+                (PROT_READ | PROT_WRITE) as u64,
+                MAP_SHARED as u64,
+                got as u64,
+                0,
+            )
+            .expect("scm: mmap received fd");
+            // SAFETY: оба отображения валидны и MAP_SHARED.
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned(base2 as *const u64) },
+                MAGIC,
+                "scm: mmap of the received fd aliases the sender's page"
+            );
+            // SAFETY: как выше.
+            unsafe {
+                core::ptr::write_unaligned((base2 + 8) as *mut u64, !MAGIC);
+            }
+            // SAFETY: как выше.
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned((base + 8) as *const u64) },
+                !MAGIC,
+                "scm: write through the received mapping is visible to the sender"
+            );
+
+            // Закрытие отправного fd не вырывает страницы из-под отображения и
+            // не ломает принятый fd.
+            assert_eq_kernel!(io_sys::sys_close(memfd), Ok(0), "scm: close sender fd");
+            // SAFETY: отображение живо (держит кадр).
+            assert_eq_kernel!(
+                unsafe { core::ptr::read_unaligned(base2 as *const u64) },
+                MAGIC,
+                "scm: page survives the sender's close"
+            );
+            assert_eq_kernel!(
+                read_shm_word(got as u64),
+                MAGIC,
+                "scm: received fd still reads"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(base2, 4096),
+                Ok(0),
+                "scm: munmap received"
+            );
+            assert_eq_kernel!(mem_sys::sys_munmap(base, 4096), Ok(0), "scm: munmap sender");
+            assert_eq_kernel!(
+                io_sys::sys_close(got as u64),
+                Ok(0),
+                "scm: close received fd"
+            );
+
+            // ── два fd в одном cmsg + MSG_CMSG_CLOEXEC ──
+            let (m1, n1) = make_shm(b"scm-two-a", 0x1111_2222_3333_4444);
+            let (m2, n2) = make_shm(b"scm-two-b", 0x5555_6666_7777_8888);
+            put(0x100, b"XY");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 2);
+            let space = put_cmsg_rights(0x180, &[m1 as i32, m2 as i32]);
+            assert_eq_kernel!(space, 24, "scm: CMSG_SPACE(2*sizeof(int)) = 24");
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(2),
+                "scm: sendmsg with two fds"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(
+                    b,
+                    SCRATCH_VA + 0x080,
+                    0x4000_0000 /*MSG_CMSG_CLOEXEC*/
+                ),
+                Ok(2),
+                "scm: recvmsg with MSG_CMSG_CLOEXEC"
+            );
+            assert_eq_kernel!(get_u64(0x1c0), 24, "scm: one cmsg with two fd");
+            let f1 = get_i32(0x1c0 + 16);
+            let f2 = get_i32(0x1c0 + 20);
+            assert_kernel!(
+                f1 != f2 && f1 >= 3 && f2 >= 3,
+                "scm: two distinct installed fds"
+            );
+            // SAFETY: scratch readable; узлы установленных fd.
+            assert_kernel!(
+                io_sys::file_node_for_fd(f1 as u32)
+                    .map(|n| Arc::ptr_eq(&n, &n1))
+                    .unwrap_or(false),
+                "scm: first fd is the dup of the first passed fd"
+            );
+            assert_kernel!(
+                io_sys::file_node_for_fd(f2 as u32)
+                    .map(|n| Arc::ptr_eq(&n, &n2))
+                    .unwrap_or(false),
+                "scm: second fd is the dup of the second passed fd"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(f1 as u64, 1 /*F_GETFD*/, 0),
+                Ok(1),
+                "scm: MSG_CMSG_CLOEXEC sets FD_CLOEXEC on the received fd"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(f2 as u64, 1, 0),
+                Ok(1),
+                "scm: every received fd is close-on-exec"
+            );
+            // execve вычищает ровно close_cloexec-множество (task/process.rs).
+            assert_kernel!(
+                compat::with_current_compat(|cs| {
+                    cs.fds.close_cloexec();
+                })
+                .is_some(),
+                "scm: simulates exec close-on-exec sweep"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(f1 as u64, 1, 0),
+                Err(Errno::EBADF),
+                "scm: cloexec fd is gone after exec"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(f2 as u64, 1, 0),
+                Err(Errno::EBADF),
+                "scm: second cloexec fd is gone after exec"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_fcntl(a as u64, 1, 0),
+                Ok(0),
+                "scm: inherited sockets survive the exec sweep"
+            );
+            assert_eq_kernel!(io_sys::sys_close(m1), Ok(0), "scm: close m1");
+            assert_eq_kernel!(io_sys::sys_close(m2), Ok(0), "scm: close m2");
+            assert_eq_kernel!(io_sys::sys_close(a as u64), Ok(0), "scm: close end a");
+            assert_eq_kernel!(io_sys::sys_close(b as u64), Ok(0), "scm: close end b");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "scm: fd passing test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "scm: fd passing routine returned every PMM frame"
+        );
+    }
+
+    /// `SCM_RIGHTS` после **обычной** записи в тот же поток — форма `SHM_OFFER`.
+    ///
+    /// Регрессия, найденная на живом desktop: `PipeEndpoint::write` не двигал
+    /// `written_total`, поэтому первое `sendmsg` с fd после любого `write(2)`
+    /// регистрировало cmsg в координате 0 — ПОЗАДИ `read_total` — и `read_scm`
+    /// выбрасывал её как «пройденную». Получатель видел данные без fd.
+    ///
+    /// Ровно это и убивало каждого реального клиента: `hello`/`create` уходят
+    /// через `write(2)`, memfd — следующим `sendmsg`; композитор отвечал
+    /// `shm_offer без SCM_RIGHTS fd` и закрывал соединение (клиент — `EPIPE`,
+    /// окно навсегда с плейсхолдером «waiting for first frame»). Прежние
+    /// routine'ы этой формы не покрывали: у них весь трафик шёл через
+    /// `sendmsg`/`recvmsg`, где обе координаты ведёт один и тот же код, поэтому
+    /// расхождение счётчиков не проявлялось, и same-process selftest оставался
+    /// зелёным.
+    pub fn scm_rights_after_plain_write() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "scm-plain: socketpair(AF_UNIX, SOCK_STREAM)"
+            );
+            let a = get_u32(0x40) as u64;
+            let b = get_u32(0x44) as u64;
+
+            // ── история потока: два кадра обычной записью, чтение — recvmsg ──
+            // (клиент пишет `write(2)`, серверный read_loop читает `recvmsg`.)
+            put(0x100, b"HELLO");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 5),
+                Ok(5),
+                "scm-plain: hello via plain write(2)"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm-plain: recvmsg returns the plain-written hello"
+            );
+            // SAFETY: scratch writable, данные лежат по 0x140.
+            assert_eq_kernel!(
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 5) },
+                b"HELLO",
+                "scm-plain: hello payload intact"
+            );
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                0,
+                "scm-plain: no ancillary data on a plain write"
+            );
+
+            put(0x100, b"CREATE");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 6),
+                Ok(6),
+                "scm-plain: create via plain write(2)"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(6),
+                "scm-plain: recvmsg returns the plain-written create"
+            );
+
+            // ── теперь memfd тем же потоком: cmsg обязан дойти ──
+            const MAGIC: u64 = 0x5343_4D50_4C41_494E; // "SCMPLAIN"
+            let (memfd, node) = make_shm(b"scm-plain", MAGIC);
+            put(0x100, b"OFFER");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 5);
+            let space = put_cmsg_rights(0x180, &[memfd as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm-plain: sendmsg carries the offer + memfd"
+            );
+
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(5),
+                "scm-plain: recvmsg returns the offer"
+            );
+            // SAFETY: scratch writable, данные лежат по 0x140.
+            assert_eq_kernel!(
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 5) },
+                b"OFFER",
+                "scm-plain: offer payload arrives"
+            );
+            // Главная проверка: fd не потерялся после обычной записи в поток.
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                24,
+                "scm-plain: msg_controllen = CMSG_SPACE(sizeof(int))"
+            );
+            assert_eq_kernel!(
+                get_u32(0x080 + 48) & 0x8,
+                0,
+                "scm-plain: no MSG_CTRUNC — the control buffer had room"
+            );
+            assert_eq_kernel!(get_u64(0x1c0), 20, "scm-plain: cmsg_len = CMSG_LEN(4)");
+            assert_eq_kernel!(get_u32(0x1c0 + 8), 1, "scm-plain: cmsg_level = SOL_SOCKET");
+            assert_eq_kernel!(get_u32(0x1c0 + 12), 1, "scm-plain: cmsg_type = SCM_RIGHTS");
+            let got = get_i32(0x1c0 + 16);
+            assert_kernel!(
+                got >= 3 && got as u64 != memfd,
+                "scm-plain: receiver gets a fresh dup descriptor"
+            );
+            assert_eq_kernel!(
+                read_shm_word(got as u64),
+                MAGIC,
+                "scm-plain: the received fd reads the sender's memfd page"
+            );
+            // SAFETY: scratch readable; узел установленного fd.
+            assert_kernel!(
+                io_sys::file_node_for_fd(got as u32)
+                    .map(|n| Arc::ptr_eq(&n, &node))
+                    .unwrap_or(false),
+                "scm-plain: received fd refers to the same open file"
+            );
+
+            // ── точки потока продолжают сходиться после передачи fd ──
+            put(0x100, b"TAIL");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 4),
+                Ok(4),
+                "scm-plain: plain write after the fd-carrying frame"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(4),
+                "scm-plain: recvmsg returns the trailing frame"
+            );
+            // SAFETY: scratch writable, данные лежат по 0x140.
+            assert_eq_kernel!(
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 4) },
+                b"TAIL",
+                "scm-plain: trailing payload intact"
+            );
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                0,
+                "scm-plain: trailing frame carries no ancillary data"
+            );
+
+            assert_eq_kernel!(
+                io_sys::sys_close(got as u64),
+                Ok(0),
+                "scm-plain: close received fd"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(memfd),
+                Ok(0),
+                "scm-plain: close sender fd"
+            );
+            assert_eq_kernel!(io_sys::sys_close(a), Ok(0), "scm-plain: close end a");
+            assert_eq_kernel!(io_sys::sys_close(b), Ok(0), "scm-plain: close end b");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "scm-plain: routine ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "scm-plain: routine returned every PMM frame"
+        );
+    }
+
+    /// SCM_RIGHTS: грницы/ошибки, `MSG_CTRUNC`, закрытие недоставленных fd,
+    /// отбрасывание cmsg обычным `read(2)` и то, что обычный AF_UNIX-поток
+    /// (nvim/libuv) не изменился.
+    pub fn scm_rights_truncation_and_errors() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "scm-err: socketpair"
+            );
+            let a = get_u32(0x40) as u64;
+            let b = get_u32(0x44) as u64;
+
+            // ── MSG_CTRUNC: два fd, ёмкость — ровно один fd ──
+            let (t1, _tn1) = make_shm(b"scm-trunc-a", 0x1111_1111_1111_1111);
+            let (t2, tn2) = make_shm(b"scm-trunc-b", 0x2222_2222_2222_2222);
+            put(0x100, b"T");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 1);
+            let space = put_cmsg_rights(0x180, &[t1 as i32, t2 as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(1),
+                "scm-err: send two fds with one byte"
+            );
+            // Отправительские fd закрыты: очередь держит dup'ы.
+            assert_eq_kernel!(io_sys::sys_close(t1), Ok(0), "scm-err: close t1");
+            assert_eq_kernel!(io_sys::sys_close(t2), Ok(0), "scm-err: close t2");
+            assert_eq_kernel!(
+                Arc::strong_count(&tn2),
+                2,
+                "scm-err: queue holds a dup of the second fd"
+            );
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 20);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(1),
+                "scm-err: truncated receive still returns the data"
+            );
+            assert_kernel!(
+                get_u32(0x080 + 48) & 0x8 != 0,
+                "scm-err: MSG_CTRUNC is reported"
+            );
+            assert_eq_kernel!(
+                get_u64(0x080 + 40),
+                20,
+                "scm-err: msg_controllen = capacity"
+            );
+            assert_eq_kernel!(get_u64(0x1c0), 20, "scm-err: partial cmsg = CMSG_LEN(4)");
+            let first = get_i32(0x1c0 + 16);
+            assert_eq_kernel!(
+                read_shm_word(first as u64),
+                0x1111_1111_1111_1111,
+                "scm-err: the fd that fit is the first one"
+            );
+            assert_eq_kernel!(
+                Arc::strong_count(&tn2),
+                1,
+                "scm-err: the fd that did not fit was closed, not installed"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(first as u64),
+                Ok(0),
+                "scm-err: close truncated fd"
+            );
+
+            // ── без control-буфера fd закрываются, MSG_CTRUNC выставлен ──
+            let (nc, ncn) = make_shm(b"scm-nocontrol", 0x3333_3333_3333_3333);
+            put(0x100, b"N");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 1);
+            let space = put_cmsg_rights(0x180, &[nc as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(1),
+                "scm-err: send N + fd"
+            );
+            assert_eq_kernel!(io_sys::sys_close(nc), Ok(0), "scm-err: close nc");
+            put(0x140, &[0u8; 16]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 16);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(1),
+                "scm-err: receive without control buffer"
+            );
+            assert_kernel!(
+                get_u32(0x080 + 48) & 0x8 != 0,
+                "scm-err: MSG_CTRUNC without a control buffer"
+            );
+            assert_eq_kernel!(get_u64(0x080 + 40), 0, "scm-err: msg_controllen = 0");
+            assert_eq_kernel!(
+                Arc::strong_count(&ncn),
+                1,
+                "scm-err: undeliverable fd is closed"
+            );
+
+            // ── read(2) отбрасывает ancillary data, как Linux ──
+            let (rd, rdn) = make_shm(b"scm-read", 0x4444_4444_4444_4444);
+            put(0x100, b"PQQQ");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 4);
+            let space = put_cmsg_rights(0x180, &[rd as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x180, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(4),
+                "scm-err: send PQQQ + fd"
+            );
+            assert_eq_kernel!(io_sys::sys_close(rd), Ok(0), "scm-err: close rd");
+            assert_eq_kernel!(
+                Arc::strong_count(&rdn),
+                2,
+                "scm-err: queue holds the read-test dup"
+            );
+            put(0x140, &[0u8; 16]);
+            assert_eq_kernel!(
+                io_sys::sys_read(b, SCRATCH_VA + 0x140, 4),
+                Ok(4),
+                "scm-err: plain read(2) consumes the bytes"
+            );
+            // SAFETY: scratch writable/readable.
+            let read_data =
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 4) };
+            assert_eq_kernel!(read_data, b"PQQQ", "scm-err: plain read payload");
+            assert_eq_kernel!(
+                Arc::strong_count(&rdn),
+                1,
+                "scm-err: read(2) discards (closes) the passed fd"
+            );
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 8);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, SCRATCH_VA + 0x1c0, 64);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0x40 /*MSG_DONTWAIT*/),
+                Err(Errno::EAGAIN),
+                "scm-err: nothing left after read(2) discarded the cmsg"
+            );
+
+            // ── обычный AF_UNIX-поток не изменился ──
+            put(0x100, b"abcdef");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 6),
+                Ok(6),
+                "scm-err: plain write"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(b, SCRATCH_VA + 0x140, 6),
+                Ok(6),
+                "scm-err: plain read back"
+            );
+            // SAFETY: scratch readable.
+            let echoed =
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 6) };
+            assert_eq_kernel!(echoed, b"abcdef", "scm-err: stream bytes are unchanged");
+            // data-only sendmsg/recvmsg (control = NULL) — обычный путь libuv.
+            put(0x100, b"zz");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 2);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(2),
+                "scm-err: sendmsg without control behaves like write"
+            );
+            put(0x140, &[0u8; 8]);
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 8);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0),
+                Ok(2),
+                "scm-err: recvmsg without control behaves like read"
+            );
+            // SAFETY: scratch readable.
+            let plain =
+                unsafe { core::slice::from_raw_parts((SCRATCH_VA + 0x140) as *const u8, 2) };
+            assert_eq_kernel!(plain, b"zz", "scm-err: data-only recvmsg payload");
+
+            // ── EINVAL: битые и неподдержанные cmsg ──
+            put(0x100, b"E");
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 1);
+            put(0x1c0, &[0u8; 32]);
+            put_u64(0x1c0, 8); // cmsg_len < sizeof(cmsghdr)
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, 24);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EINVAL),
+                "scm-err: malformed cmsg_len is EINVAL"
+            );
+            put_u64(0x1c0, 200); // cmsg_len за пределами control-буфера
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EINVAL),
+                "scm-err: cmsg_len past the control buffer is EINVAL"
+            );
+            put_u64(0x1c0, 32); // SOL_SOCKET/SCM_CREDENTIALS(2) не поддержан
+            put_u32(0x1c0 + 8, 1);
+            put_u32(0x1c0 + 12, 2);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, 32);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EINVAL),
+                "scm-err: SCM_CREDENTIALS is EINVAL"
+            );
+
+            // ── EBADF: несуществующие fd в массиве и сам syscall-fd ──
+            let space = put_cmsg_rights(0x1c0, &[-1]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EBADF),
+                "scm-err: negative passed fd is EBADF"
+            );
+            let space = put_cmsg_rights(0x1c0, &[4242]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EBADF),
+                "scm-err: unopened passed fd is EBADF"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(4242, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EBADF),
+                "scm-err: sendmsg on a closed fd is EBADF"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(4242, SCRATCH_VA + 0x080, 0x40),
+                Err(Errno::EBADF),
+                "scm-err: recvmsg on a closed fd is EBADF"
+            );
+
+            // ── нулевая длина sendmsg: fd валидируются, но не передаются ──
+            let (zf, zfn) = make_shm(b"scm-zero", 0x5555_5555_5555_5555);
+            put_iovec(0x0c0, SCRATCH_VA + 0x100, 0);
+            let space = put_cmsg_rights(0x1c0, &[zf as i32]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Ok(0),
+                "scm-err: zero-length sendmsg returns 0"
+            );
+            assert_eq_kernel!(io_sys::sys_close(zf), Ok(0), "scm-err: close zf");
+            assert_eq_kernel!(
+                Arc::strong_count(&zfn),
+                1,
+                "scm-err: zero-length sendmsg does not queue the fd"
+            );
+            // Пустой iovec с неоткрытым fd: Linux всё равно отвечает EBADF.
+            let space = put_cmsg_rights(0x1c0, &[999]);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, space);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EBADF),
+                "scm-err: zero-length sendmsg still validates the passed fd"
+            );
+            put_iovec(0x0e0, SCRATCH_VA + 0x140, 8);
+            put_msghdr(0x080, SCRATCH_VA + 0x0e0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0x40),
+                Err(Errno::EAGAIN),
+                "scm-err: zero-length sendmsg queues nothing"
+            );
+
+            // ── ENOBUFS: control-буфер сверх INT_MAX / сверх предела копии ──
+            put_msghdr(
+                0x080,
+                SCRATCH_VA + 0x0c0,
+                1,
+                SCRATCH_VA + 0x1c0,
+                0x8000_0001,
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::ENOBUFS),
+                "scm-err: msg_controllen > INT_MAX is ENOBUFS"
+            );
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x1c0, 65537);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::ENOBUFS),
+                "scm-err: control buffer above the 64 KiB copy cap is ENOBUFS"
+            );
+            put_msghdr(
+                0x080,
+                SCRATCH_VA + 0x0e0,
+                1,
+                SCRATCH_VA + 0x1c0,
+                0x8000_0001,
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 0x40),
+                Err(Errno::ENOBUFS),
+                "scm-err: recvmsg msg_controllen > INT_MAX is ENOBUFS"
+            );
+
+            // ── ENOTSOCK: sendmsg/recvmsg на pipe ──
+            assert_eq_kernel!(
+                io_sys::sys_pipe2(SCRATCH_VA + 0x40, 0),
+                Ok(0),
+                "scm-err: pipe2"
+            );
+            let rfd = get_u32(0x40);
+            let wfd = get_u32(0x44);
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(wfd as u64, SCRATCH_VA + 0x080, 0),
+                Err(Errno::ENOTSOCK),
+                "scm-err: sendmsg on a pipe is ENOTSOCK"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(rfd as u64, SCRATCH_VA + 0x080, 0),
+                Err(Errno::ENOTSOCK),
+                "scm-err: recvmsg on a pipe is ENOTSOCK"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(rfd as u64),
+                Ok(0),
+                "scm-err: close pipe r"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(wfd as u64),
+                Ok(0),
+                "scm-err: close pipe w"
+            );
+
+            // ── EINVAL флагов: MSG_OOB у send, MSG_PEEK у recv ──
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, 0, 0);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 1 /*MSG_OOB*/),
+                Err(Errno::EINVAL),
+                "scm-err: MSG_OOB on AF_UNIX SOCK_STREAM is EINVAL"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_recvmsg(b, SCRATCH_VA + 0x080, 2 /*MSG_PEEK*/),
+                Err(Errno::EINVAL),
+                "scm-err: MSG_PEEK is EINVAL (not supported, not silently wrong)"
+            );
+
+            // ── > SCM_MAX_FD(253) дескрипторов в одном cmsg — EINVAL ──
+            put(0x400, &[0u8; 1032]);
+            put_u64(0x400, 1032); // CMSG_LEN(254 * 4)
+            put_u32(0x400 + 8, 1);
+            put_u32(0x400 + 12, 1);
+            for i in 0..254u64 {
+                put_i32(0x400 + 16 + 4 * i, 3);
+            }
+            put_msghdr(0x080, SCRATCH_VA + 0x0c0, 1, SCRATCH_VA + 0x400, 1032);
+            assert_eq_kernel!(
+                unix_sock::sys_sendmsg(a, SCRATCH_VA + 0x080, 0),
+                Err(Errno::EINVAL),
+                "scm-err: more than SCM_MAX_FD descriptors is EINVAL"
+            );
+
+            assert_eq_kernel!(io_sys::sys_close(a as u64), Ok(0), "scm-err: close end a");
+            assert_eq_kernel!(io_sys::sys_close(b as u64), Ok(0), "scm-err: close end b");
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "scm-err: truncation/errors test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "scm-err: routine returned every PMM frame"
+        );
+    }
+
+    /// `shutdown(2)` (nr 48) на AF_UNIX: полузакрытие, EOF/EPIPE у обеих
+    /// сторон, идемпотентность, `dup` и отказы в порядке Linux.
+    ///
+    /// Пробуждение уже ЗАБЛОКИРОВАННОГО читателя здесь не проверяется: в этом
+    /// ядре блокирующий вызов крутит `yield_current()`, а boot-selftest идёт в
+    /// одном потоке, которому некому сделать `shutdown` во время ожидания.
+    /// Сама политика пробуждения (что значит флаг для read/write/poll) закреплена
+    /// host-свойством `p59`.
+    pub fn shutdown_half_close() {
+        let frames_before = pmm::free_frames();
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "shutdown: socketpair"
+            );
+            let a = get_u32(0x40) as u64;
+            let b = get_u32(0x44) as u64;
+
+            // ── SHUT_WR: пир-читатель видит EOF, своя запись — EPIPE ──
+            put(0x100, b"hi");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 2),
+                Ok(2),
+                "shutdown: write a->b"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(b, SCRATCH_VA + 0x140, 2),
+                Ok(2),
+                "shutdown: read b"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(a, 1 /*SHUT_WR*/),
+                Ok(0),
+                "shutdown(SHUT_WR)"
+            );
+            // EOF пира наступает, хотя пишущий fd ещё открыт.
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(b, SCRATCH_VA + 0x140, 8),
+                Ok(0),
+                "shutdown: peer sees EOF after SHUT_WR"
+            );
+            // Собственная запись закрыта...
+            put(0x100, b"x");
+            assert_eq_kernel!(
+                io_sys::sys_write(a, SCRATCH_VA + 0x100, 1),
+                Err(Errno::EPIPE),
+                "shutdown: write after own SHUT_WR is EPIPE"
+            );
+            // ...но приём своей стороны цел: пир пишет, мы читаем.
+            put(0x100, b"z");
+            assert_eq_kernel!(
+                io_sys::sys_write(b, SCRATCH_VA + 0x100, 1),
+                Ok(1),
+                "shutdown: b still writes after a's SHUT_WR"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(a, SCRATCH_VA + 0x140, 1),
+                Ok(1),
+                "shutdown: a still reads after its own SHUT_WR"
+            );
+
+            // ── SHUT_RD: свой приём = 0, пир при записи = EPIPE ──
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(a, 0 /*SHUT_RD*/),
+                Ok(0),
+                "shutdown(SHUT_RD)"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(a, SCRATCH_VA + 0x140, 8),
+                Ok(0),
+                "shutdown: own read after SHUT_RD is 0"
+            );
+            put(0x100, b"q");
+            assert_eq_kernel!(
+                io_sys::sys_write(b, SCRATCH_VA + 0x100, 1),
+                Err(Errno::EPIPE),
+                "shutdown: peer write after our SHUT_RD is EPIPE"
+            );
+            // ── идемпотентность SHUT_RDWR ──
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(a, 2 /*SHUT_RDWR*/),
+                Ok(0),
+                "shutdown(SHUT_RDWR)"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(a, 2),
+                Ok(0),
+                "shutdown is idempotent"
+            );
+            assert_eq_kernel!(io_sys::sys_close(a), Ok(0), "shutdown: close a");
+            assert_eq_kernel!(io_sys::sys_close(b), Ok(0), "shutdown: close b");
+
+            // ── dup видит тот же сокет: shutdown действует на сокет, не на fd ──
+            assert_eq_kernel!(
+                io_sys::sys_socketpair(1, 1, 0, SCRATCH_VA + 0x40),
+                Ok(0),
+                "shutdown: socketpair 2"
+            );
+            let c = get_u32(0x40) as u64;
+            let d = get_u32(0x44) as u64;
+            let c2 = match io_sys::sys_dup(c) {
+                Ok(f) => f,
+                Err(_) => u64::MAX,
+            };
+            assert_kernel!(c2 != u64::MAX, "shutdown: dup");
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(c2, 1 /*SHUT_WR*/),
+                Ok(0),
+                "shutdown on the dup"
+            );
+            put(0x140, &[0u8; 8]);
+            assert_eq_kernel!(
+                io_sys::sys_read(d, SCRATCH_VA + 0x140, 8),
+                Ok(0),
+                "shutdown: dup closes the same direction for the original"
+            );
+            assert_eq_kernel!(io_sys::sys_close(c), Ok(0), "shutdown: close c");
+            assert_eq_kernel!(io_sys::sys_close(c2), Ok(0), "shutdown: close c2");
+            assert_eq_kernel!(io_sys::sys_close(d), Ok(0), "shutdown: close d");
+
+            // ── отказы: EBADF, ENOTSOCK (раньше EINVAL), EINVAL, ENOTCONN ──
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(4242, 0),
+                Err(Errno::EBADF),
+                "shutdown: bad fd is EBADF"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_pipe2(SCRATCH_VA + 0x40, 0),
+                Ok(0),
+                "shutdown: pipe2"
+            );
+            let rfd = get_u32(0x40) as u64;
+            let wfd = get_u32(0x44) as u64;
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(rfd, 0),
+                Err(Errno::ENOTSOCK),
+                "shutdown: pipe is ENOTSOCK"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(rfd, 99),
+                Err(Errno::ENOTSOCK),
+                "shutdown: pipe with garbage how is still ENOTSOCK"
+            );
+            assert_eq_kernel!(io_sys::sys_close(rfd), Ok(0), "shutdown: close pipe r");
+            assert_eq_kernel!(io_sys::sys_close(wfd), Ok(0), "shutdown: close pipe w");
+
+            // AF_UNIX без соединения: Linux успешно игнорирует, но `how` всё
+            // равно проверяет.
+            let ufd = match unix_sock::sys_socket(1, 1, 0) {
+                Ok(f) => f,
+                Err(_) => u64::MAX,
+            };
+            assert_kernel!(ufd != u64::MAX, "shutdown: unconnected AF_UNIX socket");
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(ufd, 2),
+                Ok(0),
+                "shutdown: unconnected AF_UNIX is a successful no-op"
+            );
+            assert_eq_kernel!(
+                unix_sock::sys_shutdown(ufd, 99),
+                Err(Errno::EINVAL),
+                "shutdown: bad how on a socket is EINVAL"
+            );
+            assert_eq_kernel!(io_sys::sys_close(ufd), Ok(0), "shutdown: close u");
+
+            // TCP до connect: ENOTCONN, а мусорный how — EINVAL (порядок Linux).
+            let tfd = match crate::arch::x86_64::linux::inet_sock::sys_socket_in(2, 1) {
+                Ok(f) => f,
+                Err(_) => u64::MAX,
+            };
+            if tfd != u64::MAX {
+                assert_eq_kernel!(
+                    unix_sock::sys_shutdown(tfd, 1),
+                    Err(Errno::ENOTCONN),
+                    "shutdown: unconnected TCP is ENOTCONN"
+                );
+                assert_eq_kernel!(
+                    unix_sock::sys_shutdown(tfd, 99),
+                    Err(Errno::EINVAL),
+                    "shutdown: EINVAL precedes ENOTCONN"
+                );
+                assert_eq_kernel!(io_sys::sys_close(tfd), Ok(0), "shutdown: close t");
+            }
+        })
+        .is_some();
+        restore_synth(me, saved);
+        assert_kernel!(ran, "shutdown: half-close test ran");
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "shutdown: routine returned every PMM frame"
+        );
+    }
+}
+
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
         (
@@ -7525,6 +10802,13 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "procfs::maps file identity (slice 7)",
             procfs_tests::maps_file_identity
+        ),
+        // Сетевые данные для userspace (этап K): `SIOCGIF*` на mapped `ifreq`
+        // (адрес = net::ip_config, UP/RUNNING, MAC, MTU, INDEX, NAME, ENODEV) и
+        // монотонные счётчики `/proc/net/dev`. Без канала — NETDATA SKIP.
+        (
+            "netdata::SIOCGIF* and /proc/net/dev live data",
+            netdata_tests::if_ioctl_reports_live_interface
         ),
         ("pmm::total_frames > 0", pmm_tests::total_frames),
         ("pmm::alloc+free cycle", pmm_tests::alloc_free),
@@ -7790,6 +11074,18 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "security::get/set*id syscall round-trip",
             security_tests::syscall_cred_roundtrip
         ),
+        (
+            "security::device nodes carry group modes + supplementary-gid checks",
+            security_tests::device_group_permissions
+        ),
+        (
+            "security::/etc/passwd + /etc/group parse into ids and groups",
+            security_tests::identity_database_files
+        ),
+        (
+            "security::fork/clone inherit supplementary groups",
+            security_tests::group_inheritance
+        ),
         ("usb: HID key make/break", usb_hid_tests::key_make_break),
         ("usb: HID Ctrl+C ordering", usb_hid_tests::ctrl_c_order),
         (
@@ -7823,6 +11119,56 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "sysinfo::loads match /proc/loadavg in 16.16 fixed point",
             sysinfo_tests::loads_match_the_procfs_view_in_fixed_point
+        ),
+        // Desktop-вариант B (2.24.0): kernel-примитивы под userspace-композитор.
+        (
+            "desktop-b::/dev/fb0 ioctl + mmap scanout pixel",
+            desktop_b_tests::fbdev_ioctl_mmap_pixel
+        ),
+        (
+            "desktop-b::/dev/input/event0 keyboard + mouse read/poll",
+            desktop_b_tests::evdev_read_poll_keyboard_mouse
+        ),
+        (
+            "desktop-b::memfd ftruncate + MAP_SHARED coherence",
+            desktop_b_tests::memfd_mmap_shared_coherent
+        ),
+        (
+            "desktop-b::MAP_SHARED memfd survives fork",
+            desktop_b_tests::memfd_mmap_shared_survives_fork
+        ),
+        (
+            "desktop-b::/dev/vtconsole0 shared VT surface + vtinput",
+            desktop_b_tests::vtconsole_shared_surface_and_input
+        ),
+        (
+            "desktop-b::SCM_RIGHTS memfd fd passing + shared pages",
+            desktop_b_tests::scm_rights_memfd_passing
+        ),
+        (
+            "desktop-b::SCM_RIGHTS after plain write (SHM_OFFER shape)",
+            desktop_b_tests::scm_rights_after_plain_write
+        ),
+        (
+            "desktop-b::SCM_RIGHTS truncation, errors, plain-stream regression",
+            desktop_b_tests::scm_rights_truncation_and_errors
+        ),
+        (
+            "desktop-b::shutdown(2) half-close EOF/EPIPE + errno order",
+            desktop_b_tests::shutdown_half_close
+        ),
+        // MVP S4b: ring-3 отказ без CompatState убивает задачу, ядро выживает.
+        (
+            "arch::ring-3 #PF kills the task, kernel survives (S4b)",
+            ring3_fault_tests::ring3_page_fault_kills_task_not_kernel
+        ),
+        // Общий путь read(2)/write(2) через ещё не подпёртый ленивый
+        // анонимный буфер. Живёт рядом с desktop-b scaffolding'ом, потому что
+        // тест исполняет настоящие syscall'ы в свежем пользовательском PML4 с
+        // синтетическим `CompatState` (там же `with_user_space`).
+        (
+            "userbuf::lazy anon read/write through demand paging",
+            desktop_b_tests::lazy_anon_user_buffers
         ),
     ]
 }
@@ -8782,6 +12128,27 @@ mod shell_prop_tests {
                 "registry: required command present"
             );
         }
+
+        // The user-facing package manager is `ppkg`. The old `apt` spelling is
+        // NOT a command and has no alias (renamed for Pagh's own naming scheme);
+        // every `help`-visible string names `ppkg`.
+        match registry::lookup("ppkg") {
+            Some(spec) => {
+                assert_kernel!(
+                    spec.usage.starts_with("ppkg "),
+                    "registry: ppkg usage names ppkg"
+                );
+                assert_kernel!(
+                    spec.usage.contains("install"),
+                    "registry: ppkg usage lists install"
+                );
+            }
+            None => assert_kernel!(false, "registry: ppkg command present"),
+        }
+        assert_kernel!(
+            registry::lookup("apt").is_none(),
+            "registry: apt is no longer a command"
+        );
     }
 
     /// Regression: Shift+letter must uppercase while CapsLock is off, and
@@ -9448,5 +12815,137 @@ mod texttools_tests {
         let out = head_of(&long, 1);
         assert_eq_kernel!(out.len(), 601, "head: a 600-byte line spans chunks");
         assert_eq_kernel!(out[600], b'\n', "head: the spanning line is terminated");
+    }
+}
+
+// ============================================================================
+// ring-3 отказ убивает задачу, а не машину (MVP S4b, ветка fix/ring3-pf-kill-task)
+// ============================================================================
+//
+// Регрессия критического фикса: `idt.rs` больше НЕ требует `CompatState`, чтобы
+// убить задачу, сфолтившую в ring 3. До фикса нативная ring-3 задача pagh (та,
+// что создаёт `create_user_process` до `install_compat`) на #PF попадала в ветку
+// `halt()` и уносила всю машину вместо себя.
+//
+// Сценарий — тот же эксперимент, которым фикс проверялся вручную: задача пишет
+// в неотображённую пользовательскую страницу `0x1337_0000`. Проверки:
+//   1) задача создана без compat-состояния (`create_user_process` его не ставит);
+//   2) после отказа её стек ядра снова не отображён — reaper снял задачу;
+//   3) она ушла из ready-очереди, а self-test продолжается (тики идут);
+//   4) PMM вернулся к исходному числу кадров, поэтому `selftest 2` не видит
+//      расхождения проходов.
+//
+// Не будь фикса, первый же тик с этой задачей увёл бы CPU в `halt()` и до
+// `SELFTEST SUMMARY` дело бы не дошло — `tools/e2e.py selftest` (и этот
+// `assert_kernel!`) упали бы.
+mod ring3_fault_tests {
+    use crate::arch::x86_64::apic::TICK_HZ;
+    use crate::memory::layout::kernel_stack_for_pid;
+    use crate::memory::{pmm, vmm};
+    use crate::task::{process, scheduler};
+
+    /// Потолок ожидания reap'а. Отказ обрабатывается мгновенно, а тик снимает не
+    /// больше одной задачи за проход; секунды (1000 тиков) хватает с запасом.
+    const REAP_TIMEOUT_TICKS: u64 = TICK_HZ;
+
+    pub fn ring3_page_fault_kills_task_not_kernel() {
+        // `create_user_process` ставит пользовательский CR3 на время отображения
+        // ELF/стека, поэтому запускать его обязательно с выключенными
+        // прерываниями (так делают kernel_main и shell-команда `exec`).
+        //
+        // ВСЕ наблюдения «до/после spawn» снимаются ПОД тем же запретом:
+        // `without_interrupts` возвращается через `sti`, и отложенный тик может
+        // вытеснить нас ровно на этой границе — в том числе сразу
+        // перепланировать уже стоящую в ready-очереди fault-задачу. Тогда её
+        // отказ случается ДО первого чтения после возврата, и счётчики
+        // «до/после» разъезжаются: рутина приняла бы собственный успех за FAIL
+        // (так и произошло в первом прогоне).
+        let spawned = crate::arch::cpu::without_interrupts(|| {
+            let frames_before = pmm::free_frames();
+            let ready_before = scheduler::ready_count();
+            let ticks_before = scheduler::ticks();
+            let pid = process::spawn_faulting_test_user_process()?;
+            let (_guard, stack_base, _top) = kernel_stack_for_pid(pid);
+            let stack_mapped = vmm::virt_to_phys(stack_base).is_some();
+            let ready_after = scheduler::ready_count();
+            // Регрессия проверяет именно НАТИВНУЮ задачу: появись у неё
+            // `CompatState`, отказ пошёл бы старым (compat) путём и фикс S4b
+            // остался бы непокрытым.
+            let native = !crate::task::compat::compat_exists(pid);
+            Ok::<_, &'static str>((
+                pid,
+                stack_base,
+                stack_mapped,
+                native,
+                ready_after,
+                ready_before,
+                frames_before,
+                ticks_before,
+            ))
+        });
+        let (
+            pid,
+            stack_base,
+            stack_mapped,
+            native,
+            ready_after,
+            ready_before,
+            frames_before,
+            ticks_before,
+        ) = match spawned {
+            Ok(v) => v,
+            Err(e) => {
+                assert_kernel!(false, e);
+                return;
+            }
+        };
+
+        assert_kernel!(
+            stack_mapped,
+            "ring3-fault: spawned task has a mapped kernel stack"
+        );
+        assert_kernel!(
+            native,
+            "ring3-fault: spawned task has NO CompatState (native ring-3 path)"
+        );
+        assert_eq_kernel!(
+            ready_after,
+            ready_before + 1,
+            "ring3-fault: spawned task is queued exactly once"
+        );
+
+        // Дать задаче поработать: тик перепланирует её, `mov [0x13370000], 0x41`
+        // даёт #PF, обработчик убивает задачу, следующий тик её reaps'ит. Если
+        // отказ уже случился на границе `sti`, цикл не выполнится ни разу —
+        // это нормально, ниже проверяется итоговое состояние.
+        let mut waited = 0u64;
+        while vmm::virt_to_phys(stack_base).is_some() && waited < REAP_TIMEOUT_TICKS {
+            scheduler::sleep_ticks(1);
+            waited = waited.saturating_add(1);
+        }
+
+        assert_kernel!(
+            vmm::virt_to_phys(stack_base).is_none(),
+            "ring3-fault: faulting task was killed and reaped (kernel stack unmapped)"
+        );
+        assert_eq_kernel!(
+            scheduler::ready_count(),
+            ready_before,
+            "ring3-fault: killed task left the scheduler ready queue"
+        );
+        assert_kernel!(
+            scheduler::ticks() > ticks_before,
+            "ring3-fault: kernel kept running after the ring-3 fault"
+        );
+        assert_eq_kernel!(
+            pmm::free_frames(),
+            frames_before,
+            "ring3-fault: routine returned every PMM frame"
+        );
+        crate::kprintln!(
+            "ring3-fault: pid {} killed by #PF, kernel survived ({} ticks)",
+            pid,
+            waited
+        );
     }
 }

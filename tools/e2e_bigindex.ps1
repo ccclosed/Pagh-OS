@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  DIAGNOSTIC (Part B): reproduce + discriminate the `apt update` parse-stage
+  DIAGNOSTIC (Part B): reproduce + discriminate the `ppkg update` parse-stage
   crash (#14 PF, RIP=0x1) over a LOCAL big index. Clone of e2e_local_mirror.ps1.
 
 .DESCRIPTION
@@ -13,7 +13,7 @@
       `lx_bigindex_inram`, the "Test A" in-RAM / no-concurrent-net variant),
     * serves the BIG index (`bigindex N`) instead of the tiny hello-pagh repo,
     * scans serial for the parse-stage crash marker `[EXC #14] ... RIP=0x...01`
-      and the `BIGINDEX ...` / `apt: ... parsed P packages` progress evidence.
+      and the `BIGINDEX ...` / `ppkg: ... parsed P packages` progress evidence.
 
   Steps:
     1. cargo build --release [--features lx_bigindex[,lx_bigindex_inram]], link PAGH.elf.
@@ -151,7 +151,7 @@ foreach ($p in @($qemu,$mirror)) {
 # 6. Evidence
 $serial = if (Test-Path $serialLog) { Get-Content $serialLog -Raw } else { '' }
 Write-Host "`n================ SERIAL EVIDENCE ================" -ForegroundColor Yellow
-$serial -split "`r?`n" | Select-String -Pattern 'apt:|BIGINDEX|LXSELFTEST bigindex|EXC #14|PAGE FAULT|RIP=' | ForEach-Object { $_.Line }
+$serial -split "`r?`n" | Select-String -Pattern 'ppkg:|BIGINDEX|LXSELFTEST bigindex|EXC #14|PAGE FAULT|RIP=' | ForEach-Object { $_.Line }
 
 $crash = [regex]::Match($serial, 'EXC #14[^\r\n]*')
 if ($crash.Success) {

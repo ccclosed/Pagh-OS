@@ -316,7 +316,7 @@ The acceptance rule is:
    `cause=NoTrustedSignature` (this includes the "signature by an unknown key only" case,
    where `gpgv` itself refuses — rc=2 for unchecked signatures **[verified]**).
 5. Record the verifying fingerprint (and its UID label) for the success line
-   `apt: verify OK release=… signer=<fpr>`.
+   `ppkg: verify OK release=… signer=<fpr>`.
 
 The data hashed is the **same** for every signature: the whole file (detached) or the whole
 canonical cleartext (clearsigned). Never re-frame per signature.
@@ -420,7 +420,7 @@ parser must accept both forms.
 * Triggers (documented in `SECURITY.md` under the trust-root policy that HARDENING item 4
   asks for): a Debian archive-key rotation (new fingerprint), an expiring pinned key, or a
   new `debian-archive-keyring` release. The *mechanism* that surfaces the trigger is the
-  runtime refusal `apt: verify FAIL stage=key cause=Untrusted|Expired` naming the
+  runtime refusal `ppkg: verify FAIL stage=key cause=Untrusted|Expired` naming the
   fingerprint — the operator then regenerates and ships a new pagh.
 * Ship the generator's pinned .deb version + sha256 in the generated module's doc comment so
   the provenance of the committed bytes is self-describing.
@@ -499,7 +499,7 @@ The local-mirror integration tests need a key the kernel trusts. Design:
      (mismatch => hard refusal, no fallback to another variant)
 7. decompress + stream-parse (existing pipeline, unchanged limits)
 8. publish INDEX atomically (5.6)
-9. `apt install`: per record -> Filename + SHA256 + Size from the SAME signed record ->
+9. `ppkg install`: per record -> Filename + SHA256 + Size from the SAME signed record ->
    GET -> check SHA-256 **and** Size -> only then parse_ar/decompress/tar/install (5.4)
 ```
 
@@ -544,7 +544,7 @@ byte-identical to the standalone `Release` **[verified]**. Rules:
   code already keeps them together; keep it that way);
   * empty `Filename` → refuse (today an ad-hoc `Download` error; make it a named cause);
   * missing/unparsable `SHA256` → refuse to install **that package** (`DigestUnavailable`);
-    `apt show`/`list` may still display the record, but it must be visible in the output
+    `ppkg show`/`list` may still display the record, but it must be visible in the output
     that the package cannot be verified (implementer's choice of wording; no silent install);
   * after `cfg.fetch(&url)` and **before** `deb::parse_ar` → compare SHA-256 and size;
     mismatch → `DigestMismatch`/`SizeMismatch` and **no unpacking, no file written**.
@@ -561,10 +561,10 @@ byte-identical to the standalone `Release` **[verified]**. Rules:
 ### 5.5 Mirrors without signatures — visible refusal, never silent trust
 
 * No `InRelease`, no `Release.gpg` → `AptOpError::Unsigned { url }` and the serial line
-  `apt: verify FAIL stage=metadata cause=Unsigned url=<…>`.
+  `ppkg: verify FAIL stage=metadata cause=Unsigned url=<…>`.
 * The shell must print a single explicit line naming the mirror and the fact that pagh
   refuses unauthenticated package metadata by design (pointing at `SECURITY.md`), e.g.
-  `apt: update failed: <host> serves no signed metadata (no InRelease/Release.gpg) — refusing unauthenticated package metadata (see SECURITY.md)`.
+  `ppkg: update failed: <host> serves no signed metadata (no InRelease/Release.gpg) — refusing unauthenticated package metadata (see SECURITY.md)`.
 * There is **no** flag, config key, environment variable or build feature that turns
   verification off for the `network_packages` build. The only documented way to run without
   a trust anchor is `cargo build --no-default-features`, where
@@ -578,7 +578,7 @@ byte-identical to the standalone `Release` **[verified]**. Rules:
   parse have all succeeded (`Ok(count)`).
 * On **any** verification failure the INDEX is **cleared** (not left holding the previous
   boot's or previous run's index). Rationale: the index is RAM-only and rebuilt by
-  `apt update` every boot, so clearing costs nothing while "keep the last verified index
+  `ppkg update` every boot, so clearing costs nothing while "keep the last verified index
   after a failed update" would let an attacker freeze the mirror view. Record this deviation
   from apt's "keep old lists" behaviour in the subsystem README.
 * `install()` requires a published, verified index; with none it returns `NoIndex` (existing).
@@ -627,16 +627,16 @@ expected/actual digests truncated to a readable length.
 Exactly one line per failure, greppable by the e2e harness:
 
 ```
-apt: verify FAIL stage=<armor|clearsign|signature|key|clock|metadata|release|index|deb> cause=<Cause> [key=<fpr>] [path=<…>] [pkg=<name>]
-apt: verify OK release=<InRelease|Release.gpg> signer=<primary-fpr> key=<used-fpr> suites=<suite>
+ppkg: verify FAIL stage=<armor|clearsign|signature|key|clock|metadata|release|index|deb> cause=<Cause> [key=<fpr>] [path=<…>] [pkg=<name>]
+ppkg: verify OK release=<InRelease|Release.gpg> signer=<primary-fpr> key=<used-fpr> suites=<suite>
 ```
 
 and for a successful `.deb` check (debug level, one per package):
-`apt: verify deb pkg=<name> sha256=<hex-prefix> ok`.
+`ppkg: verify deb pkg=<name> sha256=<hex-prefix> ok`.
 
 The existing markers the harnesses depend on must keep working unchanged:
-`apt: Get <scheme>://<host><path> […]`, `apt: fetched … body - decompressing...`,
-`apt: index ready - N packages`, `apt: [n/total] Unpacked <pkg> (N files, size)` and
+`ppkg: Get <scheme>://<host><path> […]`, `ppkg: fetched … body - decompressing...`,
+`ppkg: index ready - N packages`, `ppkg: [n/total] Unpacked <pkg> (N files, size)` and
 `LXSELFTEST apt_e2e PASS`. New scenario markers are additive (§8.3).
 
 ### 6.4 Concrete decisions
@@ -734,11 +734,11 @@ one boot (or five boots; implementer's choice, but all five must be asserted by 
 
 | # | Mirror state | Required kernel behaviour | Evidence |
 |---|---|---|---|
-| 1 | signed, correct (positive control) | `apt update` + `apt install hello-pagh` succeed, the ELF runs | `LXSELFTEST apt_sig control PASS`, existing `apt: [1/1] Unpacked hello-pagh`, `hello from apt` |
-| 2 | `Packages.gz` does not match the signed `Release` | update refused, index NOT published | `apt: verify FAIL stage=index cause=HashMismatch`, `LXSELFTEST apt_sig tampered_index PASS` |
-| 3 | `.deb` does not match the signed `Packages` | install refused **before unpacking**; `/mnt/usr/bin/hello-pagh` must not exist afterwards | `apt: verify FAIL stage=deb cause=HashMismatch`, `LXSELFTEST apt_sig tampered_deb PASS` |
-| 4 | no `InRelease`, no `Release.gpg` | update refused, explicit user-visible message | `apt: verify FAIL stage=metadata cause=Unsigned`, `LXSELFTEST apt_sig unsigned PASS` |
-| 5 | signed by a key not in the anchor set | update refused | `apt: verify FAIL stage=signature cause=NoTrustedSignature`, `LXSELFTEST apt_sig untrusted PASS` |
+| 1 | signed, correct (positive control) | `ppkg update` + `ppkg install hello-pagh` succeed, the ELF runs | `LXSELFTEST apt_sig control PASS`, existing `ppkg: [1/1] Unpacked hello-pagh`, `hello from apt` |
+| 2 | `Packages.gz` does not match the signed `Release` | update refused, index NOT published | `ppkg: verify FAIL stage=index cause=HashMismatch`, `LXSELFTEST apt_sig tampered_index PASS` |
+| 3 | `.deb` does not match the signed `Packages` | install refused **before unpacking**; `/mnt/usr/bin/hello-pagh` must not exist afterwards | `ppkg: verify FAIL stage=deb cause=HashMismatch`, `LXSELFTEST apt_sig tampered_deb PASS` |
+| 4 | no `InRelease`, no `Release.gpg` | update refused, explicit user-visible message | `ppkg: verify FAIL stage=metadata cause=Unsigned`, `LXSELFTEST apt_sig unsigned PASS` |
+| 5 | signed by a key not in the anchor set | update refused | `ppkg: verify FAIL stage=signature cause=NoTrustedSignature`, `LXSELFTEST apt_sig untrusted PASS` |
 
 Requirements on the test:
 
@@ -762,7 +762,7 @@ Requirements on the test:
 
 ### 8.4 What the implementing task must NOT do
 
-Rename existing markers (`apt: Get`, `apt: [n/m] Unpacked`, `LXSELFTEST apt_e2e*`), change
+Rename existing markers (`ppkg: Get`, `ppkg: [n/m] Unpacked`, `LXSELFTEST apt_e2e*`), change
 the resolver, change decompression limits, disable the four AGENTS.md gates, or add a
 "verify off" escape hatch.
 
@@ -807,7 +807,7 @@ An implementation satisfies this contract only if **all** of the following hold:
    order, deterministic regeneration).
 3. The update path implements §5.1 exactly, including "verify before publish" (§5.6) and
    "no variant fallback after a digest failure".
-4. `apt install` verifies SHA-256 **and** size of every `.deb` before `deb::parse_ar`.
+4. `ppkg install` verifies SHA-256 **and** size of every `.deb` before `deb::parse_ar`.
 5. §6 holds: every refusal is terminal, greppable, and no override exists; the unsigned
    mirror refusal is visible to the user.
 6. §8.1 properties pass, §8.3's five cases pass in QEMU under `tools/e2e.py`, and the

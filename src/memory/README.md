@@ -12,6 +12,7 @@
 | `layout.rs` | Единственный источник правды о фиксированных виртуальных регионах: стеки ядра per-PID, user-стек, mmap-база, размер кучи; хелперы границ образа ядра |
 | `pmm.rs` | Physical Memory Manager — битовый аллокатор кадров 4 KiB + счётчики COW |
 | `cow.rs` | Чистый (host-testable) учёт владения COW-кадрами: счётчик шарящих адресных пространств, `CowRefs` |
+| `pat.rs` | Чистая (host-testable) политика PAT/write-combining: CPUID-бит PAT, кодирование `IA32_PAT` (entry 4/5 = WC), флаги WC/fallback листа `/dev/fb0`, сохранение кэш-политики в `mprotect` |
 | `vmm.rs` | Virtual Memory Manager — 4-уровневый paging, map/unmap/translate, единый release листов, clone/fork/drop user-space, MMIO, управление CR3 |
 | `heap.rs` | Ядровая куча, `#[global_allocator]` (обёртка над `good_memory_allocator` с маскировкой прерываний) |
 
@@ -23,6 +24,9 @@
   `kernel_start()/kernel_end()/kernel_size()/heap_base()` (из linker-символов).
 - `pmm`: `init(&MemmapResponse)`, `alloc_frame()`, `free_frame()`, `alloc_frames_contiguous(n)`,
   `free_frames_contiguous()`, `cow_ref()/cow_unref()/cow_refs()`, `total_frames()/free_frames()`.
+- `pat`: `cpuid_supports_pat(edx)`, `pat_msr_value(current)`, `wc_pte_flags(writable, nx)`,
+  `fallback_pte_flags(writable, nx)`, `fb0_pte_flags(writable, nx, wc)`, `mmio_cache_bits_from(old, wc)`,
+  `set_supported(bool)/wc_supported()`; привилегированная половина — `arch::x86_64::pat::init`.
 - `cow`: `CowRefs::{new, acquire, release, refs, tracked_frames}` — чистый учёт без локов
   и paging; `pmm` оборачивает один экземпляр в `Spinlock`.
 - `vmm`: `init(hhdm_offset)`, `kernel_pml4_phys()`, `phys_to_virt()/virt_to_phys()`,
@@ -69,8 +73,11 @@
 - `drop_user_space`: освобождает листы через `release_leaf_frame` (с `cow_unref` для COW),
   затем PT/PD/PDPT/PML4 — по одному кадру промежуточного уровня строго **после** внутреннего
   цикла (ранний баг освобождал PD на каждый PT-entry и ловил double-free детектор).
-- `map_mmio` маппит `PRESENT|WRITABLE|NO_CACHE|NO_EXECUTE` в `virt = phys_to_virt(phys)`
-  (конвенция: MMIO живёт в HHDM-окне, отдельного окна нет).
+- `map_mmio` маппит ядерное MMIO как `PRESENT|WRITABLE|NO_CACHE|NO_EXECUTE` в
+  `virt = phys_to_virt(phys)` (конвенция: MMIO живёт в HHDM-окне, отдельного окна нет).
+  Пользовательский `/dev/fb0` — отдельный случай: если boot запрограммировал PAT, строки
+  scanout отображаются write-combined (`PAT` bit 7, без `NO_CACHE|WRITE_THROUGH`), потому что
+  композитор пишет в них потоком. Ядерные MMIO-маппинги это не меняет.
 - `load_cr3` — **единственное место записи CR3** (оба пути, tick и yield, идут через него).
 
 ### Куча (`heap.rs`)
@@ -108,7 +115,7 @@
 - Куча не растёт: `HEAP_INITIAL_PAGES = 131072` (512 MiB) — жёсткий потолок
   `good_memory_allocator` (аллокатор не растит регион); `init()` капит его по
   фактической RAM и логирует `[WARN]`.
-  Полный Debian-индекс (`apt update`) идёт стримингом и ограничен
+  Полный Debian-индекс (`ppkg update`) идёт стримингом и ограничен
   `pkg::deb::MAX_INDEX_STREAM_BYTES = 512 MiB` (единого буфера под декомпрессию
   больше нет; `MAX_INDEX_DECOMPRESSED = 96 MiB` остался только для вызывающих,
   которые декодируют индекс целиком), поэтому превышение даёт чистый

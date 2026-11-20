@@ -12,8 +12,11 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
+use super::identity;
 use super::registry::ShellCtx;
+use crate::arch::x86_64::linux::cred::{Creds, GROUPS_CAP};
 
 /// Напечатать строку в serial и framebuffer, соблюдая двойное соглашение shell
 /// о выводе.
@@ -617,6 +620,451 @@ pub(super) fn cmd_pci(_ctx: &mut ShellCtx, _args: &[&str]) {
     }
 }
 
+/// `id [user]`: идентичность сессии или запись `/etc/passwd`.
+///
+/// Без аргумента — сессионные креденшелы shell (то, с чем `lxrun` запускает
+/// Linux-программы; `su` меняет именно их). С аргументом — пользователь из
+/// `/etc/passwd` и его группы из `/etc/group`; это чисто справочный вывод и он
+/// не требует, чтобы пользователь был текущим. Формат повторяет coreutils
+/// (`uid=1000(oleg) gid=1000(oleg) groups=…`), чтобы привычные скрипты/глаза
+/// не удивлялись.
+pub(super) fn cmd_id(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() > 1 {
+        shell_println("id: usage: id [user]");
+        return;
+    }
+    if let Some(name) = args.first() {
+        let Some(user) = identity::lookup_user(name) else {
+            shell_println(&alloc::format!("id: '{}': no such user", name));
+            return;
+        };
+        let groups = identity::display_groups_for_user(name).unwrap_or_else(|| {
+            let mut v = alloc::vec::Vec::new();
+            v.push(user.gid);
+            v
+        });
+        shell_println(&alloc::format!(
+            "uid={}({}) gid={}({}) groups={}",
+            user.uid,
+            user.name,
+            user.gid,
+            identity::group_label(user.gid),
+            identity::format_gids(&groups)
+        ));
+        return;
+    }
+    let creds = identity::current();
+    let groups = identity::session_groups();
+    let mut line = alloc::format!(
+        "uid={}({}) gid={}({})",
+        creds.uid,
+        identity::user_label(creds.uid),
+        creds.gid,
+        identity::group_label(creds.gid)
+    );
+    if creds.euid != creds.uid {
+        line.push_str(&alloc::format!(
+            " euid={}({})",
+            creds.euid,
+            identity::user_label(creds.euid)
+        ));
+    }
+    if creds.egid != creds.gid {
+        line.push_str(&alloc::format!(
+            " egid={}({})",
+            creds.egid,
+            identity::group_label(creds.egid)
+        ));
+    }
+    line.push_str(&alloc::format!(
+        " groups={}",
+        identity::format_gids(&groups)
+    ));
+    shell_println(&line);
+}
+
+/// `groups [user]`: имена групп сессии (или пользователя из `/etc/group`).
+pub(super) fn cmd_groups(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() > 1 {
+        shell_println("groups: usage: groups [user]");
+        return;
+    }
+    let gids = match args.first() {
+        Some(name) => match identity::display_groups_for_user(name) {
+            Some(gids) => gids,
+            None => {
+                shell_println(&alloc::format!("groups: '{}': no such user", name));
+                return;
+            }
+        },
+        None => identity::session_groups(),
+    };
+    let groups = identity::load_groups();
+    let mut line = alloc::string::String::new();
+    for (i, gid) in gids.iter().enumerate() {
+        if i > 0 {
+            line.push(' ');
+        }
+        match crate::shell::identity_db::group_name(&groups, *gid) {
+            Some(name) => line.push_str(name),
+            None => line.push_str(&alloc::format!("{}", gid)),
+        }
+    }
+    if line.is_empty() {
+        line.push_str("(none)");
+    }
+    shell_println(&line);
+}
+
+/// `su [-p] [user]`: сменить сессионную идентичность shell.
+///
+/// Пароль требуется там, где он что-то доказывает: из **не-root** сессии
+/// (`su` без аргумента — возврат к root, `su <user>` — переход под другим
+/// именем). Root-сессия понижается без пароля, как `su` из root в Linux, а
+/// `-p` заставляет спросить пароль и там — это единственный способ проверить
+/// сохранённый хэш с консоли. Закрытая запись (`!`/`*`, как `oleg` на свежем
+/// диске) не пускает никого: fail-closed, пока root-сессия не задаст пароль
+/// через `passwd`.
+///
+/// Shell-встроенные команды по-прежнему исполняются kernel-кодом; меняется
+/// идентичность процессов, которые запускает `lxrun`.
+pub(super) fn cmd_su(_ctx: &mut ShellCtx, args: &[&str]) {
+    let Some((target, require_password)) = parse_identity_args("su", args, true) else {
+        return;
+    };
+    switch_session("su", target, require_password);
+}
+
+/// `login [-p] <user>`: установить сессионную идентичность пользователя.
+///
+/// В отличие от `su` (переключение) цель обязательна. Аутентификация — та же,
+/// что у `su`: из не-root сессии спрашивается пароль цели, `-p` спрашивает его
+/// и из root-сессии. `root` аутентифицируется своим паролем из `/etc/shadow`;
+/// пока он закрыт (`*`), `login root` из не-root невозможен.
+pub(super) fn cmd_login(_ctx: &mut ShellCtx, args: &[&str]) {
+    let Some((target, require_password)) = parse_identity_args("login", args, false) else {
+        return;
+    };
+    switch_session("login", target, require_password);
+}
+
+/// `whoami`: имя пользователя по **effective** uid из `/etc/passwd`.
+///
+/// Это ровно то, с чем `lxrun` запускает программы: сессионная идентичность
+/// (`su`/`login`/`/etc/pagh-session`). Если записи нет — печатается число,
+/// как `id`, а не выдуманное имя.
+pub(super) fn cmd_whoami(_ctx: &mut ShellCtx, args: &[&str]) {
+    if !args.is_empty() {
+        shell_println("whoami: usage: whoami");
+        return;
+    }
+    let creds = identity::current();
+    shell_println(&identity::user_label(creds.euid));
+}
+
+/// Разбор аргументов `su`/`login`: `[-p|--password] <user>`.
+///
+/// `default_root` — `su` без цели переключает на root; `login` цель обязан
+/// назвать. `None` — сообщение об ошибке уже напечатано (вызывающий
+/// возвращается молча).
+fn parse_identity_args<'a>(
+    command: &str,
+    args: &'a [&'a str],
+    default_root: bool,
+) -> Option<(&'a str, bool)> {
+    let mut require_password = false;
+    let mut target: Option<&'a str> = None;
+    for arg in args {
+        if *arg == "-p" || *arg == "--password" {
+            require_password = true;
+        } else if arg.starts_with('-') {
+            shell_println(&format!("{}: unknown option '{}'", command, arg));
+            print_identity_usage(command, default_root);
+            return None;
+        } else if target.is_none() {
+            target = Some(arg);
+        } else {
+            print_identity_usage(command, default_root);
+            return None;
+        }
+    }
+    match (target, default_root) {
+        (Some(target), _) => Some((target, require_password)),
+        (None, true) => Some(("root", require_password)),
+        (None, false) => {
+            print_identity_usage(command, false);
+            None
+        }
+    }
+}
+
+fn print_identity_usage(command: &str, default_root: bool) {
+    if default_root {
+        shell_println(&format!("{}: usage: {} [-p] [user]", command, command));
+    } else {
+        shell_println(&format!("{}: usage: {} [-p] <user>", command, command));
+    }
+}
+
+/// Общая часть `su`/`login`: доказать право (если нужно), построить
+/// идентичность цели и поставить её сессии.
+///
+/// Пароль спрашивается, когда сессия не root (иначе смена была бы эскалацией
+/// без аутентификации) или когда `require_password` выставлен явно (`-p`).
+/// Root-сессия понижается без пароля — как `su` из root в Linux.
+///
+/// Возвращает `None`, если переключение не состоялось (сообщение уже
+/// напечатано). Отдельная функция, чтобы `su` и `login` не расходились в
+/// правилах: обе идут через [`identity::login_creds`].
+fn switch_session(command: &str, target: &str, require_password: bool) -> Option<Creds> {
+    let current = identity::current();
+    let to_root = target == "root" || target == "0";
+    let authenticated = require_password || !current.is_root();
+
+    if to_root {
+        if authenticated && !authenticate(command, "root") {
+            return None;
+        }
+        identity::set_session(Creds::ROOT);
+        if authenticated {
+            shell_println(&format!(
+                "{}: authenticated as root: session identity is root (uid=0, gid=0, no groups)",
+                command
+            ));
+        } else {
+            shell_println(&format!(
+                "{}: session identity is root (uid=0, gid=0, no groups)",
+                command
+            ));
+        }
+        return Some(Creds::ROOT);
+    }
+
+    if authenticated && !authenticate(command, target) {
+        return None;
+    }
+    match identity::login_creds(target) {
+        Ok(creds) => {
+            identity::set_session(creds);
+            let how = if authenticated {
+                format!("authenticated as {}", target)
+            } else {
+                String::from("root session: no password required")
+            };
+            shell_println(&format!(
+                "{}: {}: {} -> {} (uid={} gid={})",
+                command,
+                how,
+                identity::user_label(current.euid),
+                target,
+                creds.uid,
+                creds.gid
+            ));
+            shell_println(&format!(
+                "{}: groups={}",
+                command,
+                identity::format_gids(&identity::session_groups())
+            ));
+            shell_println(&format!(
+                "{}: 'lxrun' now starts programs with these credentials; shell built-ins still run as kernel/root (phase-1 limitation)",
+                command
+            ));
+            Some(creds)
+        }
+        Err(identity::LoginError::UnknownUser) => {
+            shell_println(&format!(
+                "{}: user '{}' does not exist in /etc/passwd",
+                command, target
+            ));
+            None
+        }
+        Err(identity::LoginError::RootTarget) => {
+            shell_println(&format!(
+                "{}: '{}' has uid 0; use '{} root' to reset to the root session",
+                command, target, command
+            ));
+            None
+        }
+        Err(identity::LoginError::GroupDatabase) => {
+            shell_println(&format!(
+                "{}: '{}': group database (/etc/group) unavailable",
+                command, target
+            ));
+            None
+        }
+        Err(identity::LoginError::TooManyGroups) => {
+            shell_println(&format!(
+                "{}: '{}': too many supplementary groups (this kernel supports at most {})",
+                command, target, GROUPS_CAP
+            ));
+            None
+        }
+    }
+}
+
+/// Спросить пароль и проверить его против `/etc/shadow` (fail-closed).
+///
+/// Отсутствие записи, закрытый хэш (`!`/`*`), отсутствие клавиатуры и неверный
+/// пароль одинаково возвращают `false`: «не смогли проверить» не должно
+/// превращаться в «пустить». Сообщение печатается здесь, чтобы `su`/`login`
+/// не дублировали формулировки.
+fn authenticate(command: &str, user: &str) -> bool {
+    if identity::lookup_user(user).is_none() {
+        shell_println(&format!(
+            "{}: user '{}' does not exist in /etc/passwd",
+            command, user
+        ));
+        return false;
+    }
+    if !identity::has_password(user) {
+        shell_println(&format!(
+            "{}: '{}' has no password set (locked in /etc/shadow); a root session must run 'passwd {}'",
+            command, user, user
+        ));
+        return false;
+    }
+    let Some(password) = read_secret(&format!("Password for {}: ", user)) else {
+        shell_println(&format!("{}: authentication cancelled", command));
+        return false;
+    };
+    if !identity::verify_user_password(user, &password) {
+        shell_println(&format!("{}: incorrect password", command));
+        return false;
+    }
+    true
+}
+
+/// `passwd [user]`: сменить пароль записи `/etc/shadow`.
+///
+/// root-сессия меняет пароль любой записи без старого пароля (как root в
+/// Linux). Не-root сессия может менять **только свой** пароль и доказывает
+/// владение: если хэш уже задан — вводится текущий пароль. Закрытая (`!`/`*`)
+/// запись — это «первый пароль» учётки (доказывать нечего), но root при этом
+/// остаётся закрытым: задать ему пароль может только root-сессия, поэтому
+/// `su root` из не-root по-прежнему невозможен.
+///
+/// Пароль читается с клавиатуры без эха и не попадает ни в history, ни в
+/// вывод. Пустой пароль отвергается: `passwd` не должен молча открыть учётку.
+pub(super) fn cmd_passwd(_ctx: &mut ShellCtx, args: &[&str]) {
+    if args.len() > 1 {
+        shell_println("passwd: usage: passwd [user]");
+        return;
+    }
+    let current = identity::current();
+    let target = match args.first() {
+        Some(name) => String::from(*name),
+        None => match identity::name_for_uid(current.euid) {
+            Some(name) => name,
+            None => {
+                shell_println(&format!(
+                    "passwd: no /etc/passwd entry for uid {}",
+                    current.euid
+                ));
+                return;
+            }
+        },
+    };
+    if identity::lookup_user(&target).is_none() {
+        shell_println(&format!(
+            "passwd: user '{}' does not exist in /etc/passwd",
+            target
+        ));
+        return;
+    }
+    if !current.is_root() {
+        if identity::name_for_uid(current.euid).as_deref() != Some(target.as_str()) {
+            shell_println(
+                "passwd: permission denied (only a root session may change another user's password)",
+            );
+            return;
+        }
+        if identity::has_password(&target) {
+            let Some(old) = read_secret("Current password: ") else {
+                shell_println("passwd: cancelled");
+                return;
+            };
+            if !identity::verify_user_password(&target, &old) {
+                shell_println("passwd: incorrect current password");
+                return;
+            }
+        }
+    }
+    let Some(new) = read_secret("New password: ") else {
+        shell_println("passwd: cancelled");
+        return;
+    };
+    if new.is_empty() {
+        shell_println("passwd: empty password is not allowed");
+        return;
+    }
+    let Some(again) = read_secret("Retype new password: ") else {
+        shell_println("passwd: cancelled");
+        return;
+    };
+    if new != again {
+        shell_println("passwd: the passwords do not match");
+        return;
+    }
+    if identity::set_user_password(&target, &new) {
+        shell_println(&format!("passwd: password updated for '{}'", target));
+    } else {
+        shell_println("passwd: cannot update /etc/shadow");
+    }
+}
+
+/// Прочитать строку с клавиатуры **без эха** (пароль).
+///
+/// `None` — нет клавиатуры (headless-прогон не должен висеть на промпте) или
+/// Ctrl+C/Esc. Введённое не печатается и не попадает в history: эхо выключено
+/// на уровне этого цикла, а строка живёт только в стеке. Backspace правит
+/// накопленный текст. В idle цикл уходит в `halt` с включёнными прерываниями
+/// (как основной цикл shell), поэтому не жжёт CPU и не спит вечно.
+fn read_secret(prompt: &str) -> Option<String> {
+    if !crate::drivers::any_keyboard() {
+        shell_println("no keyboard detected; cannot read a password");
+        return None;
+    }
+    crate::kprint!("{}", prompt);
+    crate::fb_print!("{}", prompt);
+    let mut decoder = super::keys::Decoder::new();
+    let mut line = String::new();
+    loop {
+        let Some(scancode) = super::try_read_scancode() else {
+            crate::arch::cpu::halt();
+            continue;
+        };
+        match decoder.feed(scancode) {
+            Some(super::keys::KeyEvent::Enter) => {
+                crate::kprintln!();
+                crate::fb_println!();
+                return Some(line);
+            }
+            Some(super::keys::KeyEvent::Ctrl('c')) | Some(super::keys::KeyEvent::Escape) => {
+                // Защёлку ^C, которую ставит декодер, гасим: она предназначена
+                // для ожидания foreground-ребёнка `lxrun`, и оставлять её
+                // взведённой значило бы мгновенно завершить следующую программу.
+                super::keys::CTRL_C_LATCH.store(false, core::sync::atomic::Ordering::Relaxed);
+                crate::kprintln!();
+                crate::fb_println!();
+                return None;
+            }
+            Some(super::keys::KeyEvent::Backspace) => {
+                line.pop();
+            }
+            Some(super::keys::KeyEvent::Char(c)) => {
+                // Верхняя граница — в байтах (`shadow::PASSWORD_MAX`), поэтому
+                // проверяем длину будущей строки, а не число символов: иначе
+                // многобайтный символ на пределе дал бы «пароль слишком
+                // длинный» уже после двух одинаковых вводов.
+                if line.len() + c.len_utf8() <= super::shadow::PASSWORD_MAX {
+                    line.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `exec`: запустить встроенный тестовый пользовательский процесс.
 pub(super) fn cmd_exec(_ctx: &mut ShellCtx, _args: &[&str]) {
     // create_user_process программирует TSS RSP0 и ненадолго переключает CR3;
@@ -1205,44 +1653,40 @@ pub(super) fn cmd_nano(_ctx: &mut ShellCtx, args: &[&str]) {
     super::nano::run(args[0]);
 }
 
-/// `rust <path> [args...]`: запустить мини-Rust исходник/пакет или Linux ELF.
-/// Путь `.rs`/`.pbc` идёт во встроенный мини-Rust toolchain; всё остальное
-/// передаётся загрузчику Linux-совместимости (`cmd_lxrun`).
+/// `rust <path> [args...]`: запустить Linux ELF через слой совместимости.
+///
+/// Встроенный мини-Rust интерпретатор удалён: он разбирал и исполнял недоверенный
+/// `.rs`/`.pbc` прямо в ring 0, то есть парсер атакующего работал кодом ядра.
+/// Команда оставлена чистым алиасом `lxrun` для нативных Rust-userland бинарников
+/// (статических musl ELF); исходники и `.pbc`-пакеты отвергаются.
 pub(super) fn cmd_rust(ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
-        shell_println("usage: rust <file.rs|file.pbc|static-elf> [args...]");
+        shell_println("usage: rust <static-elf> [args...]");
         return;
     }
     if args[0].ends_with(".rs") || args[0].ends_with(".pbc") {
-        if let Err(e) = super::toolchain::run_path(args[0]) {
-            super::render::error_line(&alloc::format!("rust: {}", e));
-        }
-    } else {
-        cmd_lxrun(ctx, args);
+        super::render::error_line("rust: mini-Rust removed; use lxrun for Linux ELF binaries");
+        return;
     }
+    cmd_lxrun(ctx, args);
 }
 
-/// Встроенный офлайн мини-Rust пакетный менеджер.
+/// `cargo`: запустить установленный `/mnt/usr/bin/cargo` через Linux-слой.
 pub(super) fn cmd_cargo(ctx: &mut ShellCtx, args: &[&str]) {
     if crate::vfs::lookup_path("/mnt/usr/bin/cargo").is_ok() {
         runtime_command(ctx, "/mnt/usr/bin/cargo", &[], args);
     } else {
-        super::toolchain::cargo(args);
+        super::render::error_line("cargo: not installed (the embedded mini-Rust was removed)");
     }
 }
 
-/// Скомпилировать мини-Rust исходник в переносимый `.pbc`-пакет исходников.
+/// `rustc`: запустить установленный `/mnt/usr/bin/rustc` через Linux-слой.
 pub(super) fn cmd_rustc(ctx: &mut ShellCtx, args: &[&str]) {
     if crate::vfs::lookup_path("/mnt/usr/bin/rustc").is_ok() {
         runtime_command(ctx, "/mnt/usr/bin/rustc", &[], args);
     } else {
-        super::toolchain::rustc(args);
+        super::render::error_line("rustc: not installed (the embedded mini-Rust was removed)");
     }
-}
-
-/// Показать встроенный мини-Rust toolchain.
-pub(super) fn cmd_rustup(_ctx: &mut ShellCtx, args: &[&str]) {
-    super::toolchain::rustup(args);
 }
 
 fn runtime_command(ctx: &mut ShellCtx, path: &'static str, prefix: &[&'static str], args: &[&str]) {
@@ -1279,7 +1723,7 @@ fn find_python() -> Option<alloc::string::String> {
 
 pub(super) fn cmd_python(ctx: &mut ShellCtx, args: &[&str]) {
     let Some(py) = find_python() else {
-        shell_println("python: no python3 in /mnt/usr/bin yet; run 'apt install python3' or wait for first-boot provisioning");
+        shell_println("python: no python3 in /mnt/usr/bin yet; run 'ppkg install python3' or wait for first-boot provisioning");
         return;
     };
     let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(1 + args.len());
@@ -1370,7 +1814,7 @@ pub(super) fn cmd_pythonc(ctx: &mut ShellCtx, args: &[&str]) {
         return;
     }
     let Some(py) = find_python() else {
-        shell_println("pythonc: no python3 in /mnt/usr/bin yet; run 'apt install python3' first");
+        shell_println("pythonc: no python3 in /mnt/usr/bin yet; run 'ppkg install python3' first");
         return;
     };
     let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(3 + args.len());
@@ -1412,7 +1856,7 @@ pub(super) fn cmd_pkg(_ctx: &mut ShellCtx, args: &[&str]) {
         shell_println("usage: pkg <host> <path> [port]");
         shell_println("  downloads a .deb over HTTP and installs it under /mnt");
         shell_println("  note: only gzip-compressed .deb data is supported (not xz/zstd)");
-        shell_println("  tip: for name-based installs with dependency resolution, use `apt`");
+        shell_println("  tip: for name-based installs with dependency resolution, use `ppkg`");
         return;
     }
     let host = args[0];
@@ -1708,7 +2152,12 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     // прерываниях: он берёт локи framebuffer/serial, ни один не берётся дважды и
     // ни один не блокирует.
     let result = crate::arch::cpu::without_interrupts(|| {
-        let r = crate::task::process::run_linux_binary(&path, &argv, &env);
+        let r = crate::task::process::run_linux_binary_as(
+            crate::shell::identity::current(),
+            &path,
+            &argv,
+            &env,
+        );
         if let Ok(pid) = r {
             let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
             crate::task::compat::mark_tty_job(pid);
@@ -1757,16 +2206,16 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
     }
 }
 
-/// `apt <subcommand> ...`: пакетный менеджер по именам.
+/// `ppkg <subcommand> ...`: пакетный менеджер по именам.
 ///
-/// В отличие от `pkg` (сырые host/path/port), `apt` работает по *имени пакета*
+/// В отличие от `pkg` (сырые host/path/port), `ppkg` работает по *имени пакета*
 /// против скачанного индекса репозитория, автоматически разрешая зависимости:
 ///
-///   * `apt update`                  — скачать + разобрать индекс `Packages`.
-///   * `apt install <name> [name2…]` — разрешить зависимости и поставить каждый пакет.
-///   * `apt show <name>`             — напечатать метаданные пакета из индекса.
-///   * `apt list [substr]`           — перечислить (подходящие) имена доступных пакетов.
-///   * `apt setmirror <host> [base]` — направить apt на другое зеркало.
+///   * `ppkg update`                  — скачать + разобрать индекс `Packages`.
+///   * `ppkg install <name> [name2…]` — разрешить зависимости и поставить каждый пакет.
+///   * `ppkg show <name>`             — напечатать метаданные пакета из индекса.
+///   * `ppkg list [substr]`           — перечислить (подходящие) имена доступных пакетов.
+///   * `ppkg setmirror <host> [base]` — направить apt на другое зеркало.
 ///
 /// Транспорт: обычная dev-сборка pagh включает исходящий доступ к пакетам через
 /// дефолтную фичу `network_packages`. HTTPS шифруется, но остаётся
@@ -1775,7 +2224,7 @@ pub(super) fn cmd_lxrun(_ctx: &mut ShellCtx, args: &[&str]) {
 /// принимает префикс схемы.
 ///
 /// Индекс живёт только в RAM (64 MiB диска слишком мало для кэша), поэтому
-/// `apt update` надо повторять каждую загрузку до `install`/`show`/`list`.
+/// `ppkg update` надо повторять каждую загрузку до `install`/`show`/`list`.
 pub(super) fn cmd_apt(_ctx: &mut ShellCtx, args: &[&str]) {
     if args.is_empty() {
         apt_usage();
@@ -1788,17 +2237,18 @@ pub(super) fn cmd_apt(_ctx: &mut ShellCtx, args: &[&str]) {
         "list" => cmd_apt_list(&args[1..]),
         "setmirror" => cmd_apt_setmirror(&args[1..]),
         other => {
-            shell_println(&alloc::format!("apt: unknown subcommand '{}'", other));
+            shell_println(&alloc::format!("ppkg: unknown subcommand '{}'", other));
             apt_usage();
         }
     }
 }
 
-/// Напечатать сводку usage `apt`.
+/// Напечатать сводку usage `ppkg`.
 fn apt_usage() {
-    shell_println("usage: apt <command> [args]");
+    shell_println("usage: ppkg <command> [args]");
     shell_println("  update                  download & parse the package index");
-    shell_println("  install <name> [name...]  install package(s) by name + deps");
+    shell_println("  install [--quiet] [--progress=ansi|cr|plain] <name> [name...]");
+    shell_println("                          install package(s) by name + deps, with progress");
     shell_println("  show <name>             show a package's metadata");
     shell_println("  list [substr]           list available package names");
     shell_println("  setmirror [scheme://]<host> [base]  set the mirror");
@@ -1819,21 +2269,21 @@ fn apt_usage() {
     shell_println("             an unsigned mirror is REFUSED; there is no 'continue anyway' flag");
 }
 
-/// `apt update`: обновить in-RAM индекс пакетов.
+/// `ppkg update`: обновить in-RAM индекс пакетов.
 fn cmd_apt_update() {
     let cfg = crate::pkg::apt::config();
     if cfg.tls {
         shell_println(
-            "apt: HTTPS transport: server certificate verified against the committed CA bundle",
+            "ppkg: HTTPS transport: server certificate verified against the committed CA bundle",
         );
     } else {
-        shell_println("apt: HTTP transport: the mirror is NOT authenticated (cleartext)");
+        shell_println("ppkg: HTTP transport: the mirror is NOT authenticated (cleartext)");
     }
     shell_println(
-        "apt: metadata will be verified against the pinned Debian archive keys (InRelease/Release.gpg)",
+        "ppkg: metadata will be verified against the pinned Debian archive keys (InRelease/Release.gpg)",
     );
     shell_println(&alloc::format!(
-        "apt: updating from {}://{}:{}{} ({}/{}/{})",
+        "ppkg: updating from {}://{}:{}{} ({}/{}/{})",
         cfg.scheme(),
         cfg.host,
         cfg.port,
@@ -1844,49 +2294,102 @@ fn cmd_apt_update() {
     ));
     match crate::pkg::apt::update() {
         Ok(n) => {
-            super::render::success_line(&alloc::format!("apt: done - {} packages available", n))
+            super::render::success_line(&alloc::format!("ppkg: done - {} packages available", n))
         }
-        Err(e) => super::render::error_line(&alloc::format!("apt: update failed: {}", e.message())),
+        Err(e) => {
+            super::render::error_line(&alloc::format!("ppkg: update failed: {}", e.message()))
+        }
     }
 }
 
-/// `apt install <name> [name2 …]`: разрешить и установить каждый названный пакет.
-fn cmd_apt_install(names: &[&str]) {
+/// Parse the `ppkg install` progress flags.
+///
+/// `--quiet`/`-q` forces [`ProgressMode::Plain`] (no live UI at all);
+/// `--progress=ansi|cr|plain` picks a renderer explicitly; otherwise the mode is
+/// auto-detected from console capability ([`super::progress::auto_mode`]).
+/// Returns the names to install or `None` on a malformed flag.
+fn parse_install_args<'a>(
+    args: &'a [&'a str],
+) -> Option<(super::ppkg_progress::ProgressMode, Vec<&'a str>)> {
+    use super::ppkg_progress::ProgressMode;
+    let mut mode: Option<ProgressMode> = None;
+    let mut quiet = false;
+    let mut names: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--quiet" || arg == "-q" {
+            quiet = true;
+        } else if arg == "--progress" {
+            i += 1;
+            let value = args.get(i)?;
+            mode = Some(ProgressMode::parse(value)?);
+        } else if let Some(value) = arg.strip_prefix("--progress=") {
+            mode = Some(ProgressMode::parse(value)?);
+        } else if arg.starts_with("--") {
+            return None;
+        } else {
+            names.push(arg);
+        }
+        i += 1;
+    }
+    let mode = if quiet {
+        ProgressMode::Plain
+    } else {
+        mode.unwrap_or_else(super::progress::auto_mode)
+    };
+    Some((mode, names))
+}
+
+/// `ppkg install [--quiet] [--progress=ansi|cr|plain] <name> [name2 …]`: разрешить
+/// и установить каждый названный пакет, рисуя ход установки (DNF-style).
+fn cmd_apt_install(args: &[&str]) {
+    let Some((mode, names)) = parse_install_args(args) else {
+        shell_println(
+            "usage: ppkg install [--quiet] [--progress=ansi|cr|plain] <name> [name2 ...]",
+        );
+        return;
+    };
     if names.is_empty() {
-        shell_println("usage: apt install <name> [name2 ...]");
+        shell_println(
+            "usage: ppkg install [--quiet] [--progress=ansi|cr|plain] <name> [name2 ...]",
+        );
         return;
     }
     let mut any_installed = false;
     for name in names {
-        shell_println(&alloc::format!("apt: resolving {} ...", name));
-        match crate::pkg::apt::install(name) {
+        shell_println(&alloc::format!("ppkg: resolving {} ...", name));
+        let mut progress = super::progress::ProgressDriver::new(mode);
+        let result = crate::pkg::apt::install_observed(name, &mut progress);
+        progress.finish();
+        match result {
             Ok(installed) => {
                 if installed.is_empty() {
                     shell_println(&alloc::format!(
-                        "apt: {} is already installed (nothing to do)",
+                        "ppkg: {} is already installed (nothing to do)",
                         name
                     ));
                 } else {
                     any_installed = true;
                     super::render::success_line(&alloc::format!(
-                        "apt: installed {} package(s): {}",
+                        "ppkg: installed {} package(s): {}",
                         installed.len(),
                         installed.join(" ")
                     ));
                 }
             }
-            Err(e) => super::render::error_line(&alloc::format!("apt: {}: {}", name, e.message())),
+            Err(e) => super::render::error_line(&alloc::format!("ppkg: {}: {}", name, e.message())),
         }
     }
     if any_installed {
-        shell_println("apt: run an installed static binary with: lxrun /mnt/<path>");
+        shell_println("ppkg: run an installed static binary with: lxrun /mnt/<path>");
     }
 }
 
-/// `apt show <name>`: напечатать метаданные пакета из индекса.
+/// `ppkg show <name>`: напечатать метаданные пакета из индекса.
 fn cmd_apt_show(args: &[&str]) {
     if args.is_empty() {
-        shell_println("usage: apt show <name>");
+        shell_println("usage: ppkg show <name>");
         return;
     }
     let name = args[0];
@@ -1906,24 +2409,24 @@ fn cmd_apt_show(args: &[&str]) {
         }
         None => {
             if crate::pkg::apt::has_index() {
-                shell_println(&alloc::format!("apt: no such package '{}'", name));
+                shell_println(&alloc::format!("ppkg: no such package '{}'", name));
             } else {
-                shell_println("apt: no package index - run `apt update` first");
+                shell_println("ppkg: no package index - run `ppkg update` first");
             }
         }
     }
 }
 
-/// `apt list [substr]`: перечислить (подходящие) имена доступных пакетов с ограничением.
+/// `ppkg list [substr]`: перечислить (подходящие) имена доступных пакетов с ограничением.
 fn cmd_apt_list(args: &[&str]) {
     let filter = args.first().copied();
     if !crate::pkg::apt::has_index() {
-        shell_println("apt: no package index - run `apt update` first");
+        shell_println("ppkg: no package index - run `ppkg update` first");
         return;
     }
     let names = crate::pkg::apt::list(filter);
     if names.is_empty() {
-        shell_println("apt: no matching packages");
+        shell_println("ppkg: no matching packages");
         return;
     }
     // Ограничить вывод, чтобы полный индекс не залил консоль.
@@ -1933,16 +2436,16 @@ fn cmd_apt_list(args: &[&str]) {
     }
     if names.len() > MAX_LINES {
         shell_println(&alloc::format!(
-            "... ({} more; narrow with `apt list <substr>`)",
+            "... ({} more; narrow with `ppkg list <substr>`)",
             names.len() - MAX_LINES
         ));
     }
 }
 
-/// `apt setmirror <host> [basepath]`: сменить активное зеркало.
+/// `ppkg setmirror <host> [basepath]`: сменить активное зеркало.
 fn cmd_apt_setmirror(args: &[&str]) {
     if args.is_empty() {
-        shell_println("usage: apt setmirror <host> [basepath]");
+        shell_println("usage: ppkg setmirror <host> [basepath]");
         return;
     }
     let host = args[0];
@@ -1950,7 +2453,7 @@ fn cmd_apt_setmirror(args: &[&str]) {
     crate::pkg::apt::set_mirror(host, base);
     let cfg = crate::pkg::apt::config();
     shell_println(&alloc::format!(
-        "apt: mirror set to {}://{}:{}{}",
+        "ppkg: mirror set to {}://{}:{}{}",
         cfg.scheme(),
         cfg.host,
         cfg.port,
@@ -1958,12 +2461,12 @@ fn cmd_apt_setmirror(args: &[&str]) {
     ));
     if cfg.tls {
         shell_println(
-            "apt: transport is HTTPS (TLS 1.3) with fail-closed certificate verification",
+            "ppkg: transport is HTTPS (TLS 1.3) with fail-closed certificate verification",
         );
-        shell_println("apt: NOTE: only hosts chaining to the committed CA bundle are accepted (ISRG X1/X2, GTS R1/R4)");
+        shell_println("ppkg: NOTE: only hosts chaining to the committed CA bundle are accepted (ISRG X1/X2, GTS R1/R4)");
     } else {
         shell_println(
-            "apt: transport is HTTP (cleartext) -- the mirror and the index are NOT authenticated",
+            "ppkg: transport is HTTP (cleartext) -- the mirror and the index are NOT authenticated",
         );
     }
 }

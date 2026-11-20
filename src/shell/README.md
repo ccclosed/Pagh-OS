@@ -1,8 +1,7 @@
-# `src/shell/` — интерактивный shell, paint, nano, мини-toolchain
+# `src/shell/` — интерактивный shell, paint, nano
 
 Framebuffer-shell с редактированием строки, историей, таб-комплишном, цветным выводом;
-оконная рисовалка `paint`; полноэкранный редактор `nano+`; интерпретатор мини-Rust
-«pagh-mini». Вход — `shell::shell_main()`, вызывается из `boot.rs` после поднятия ФС/сети.
+оконная рисовалка `paint`; полноэкранный редактор `nano+`. Вход — `shell::shell_main()`, вызывается из `boot.rs` после поднятия ФС/сети.
 
 ## Файлы
 
@@ -10,9 +9,13 @@ Framebuffer-shell с редактированием строки, историе
 |---|---|
 | `mod.rs` | I/O-слой REPL: REPL-цикл (`shell_main`), диспетч через реестр, Tab, autorun, dual serial+framebuffer печать, status bar |
 | `commands.rs` | Тела всех команд (`cmd_help`, `cmd_ls`, `cmd_apt`, …) + хелперы `shell_println`, `resolve_arg`, `rm_path` и др. |
+| `ppkg_progress.rs` | Чистая (core+alloc) модель/рендереры прогресса `ppkg install`: known `[====    ]`, unknown `<=>` (`(elapsed_ms/500)%(width-4)`, `???%`), percent/speed/size/ETA, гейт 10 FPS, ANSI/CR/plain-эмиттеры. Host-тесты: `host-tests/src/properties/ppkg_progress_ui.rs` |
+| `progress.rs` | Effectful-драйвер: `InstallObserver` → serial+framebuffer, выбор режима (framebuffer → CR, serial/`--quiet` → plain, `--progress=ansi` → VT100) |
 | `cat.rs` | Чистое ядро `cat`: потоковое чтение чанками 256 Б с капом 64 KiB, дословный вывод и завершающий `\n`, если файл не заканчивается переводом строки (иначе следующий промпт приклеивался к последней строке файла — QA F-04) |
 | `texttools.rs` | Чистое ядро `head`/`tail`/`wc`/`grep`: один потоковый обход строк (чанки 256 Б, кап 4 MiB), ring на N строк для `tail`, счётчики для `wc`, ASCII case-fold подмножество для `grep -i`; сюда же тонкий VFS-слой этих четырёх команд |
 | `registry.rs` | Статическая таблица `COMMANDS: &[CommandSpec]`; `lookup()`, `command_names()` |
+| `identity.rs` | Сессионная идентичность shell для фазы 1 «группы отдельно от root»: `current`/`set_session` (креденшелы, с которыми `lxrun` запускает Linux-программы), чтение `/mnt/etc/passwd` + `/mnt/etc/group`, метки uid/gid для `id`/`groups`/`su`; обработчики команд — в `commands.rs` |
+| `identity_db.rs` | Чистый (core+alloc) разбор `/etc/passwd` (7 полей) и `/etc/group` (4 поля), first-match lookups, `groups_for_user`/`supplementary_groups_for_user`; host-свойство P58 |
 | `editor.rs` | `LineEditor` — чистая буфер+курсор модель (курсор в чар-юнитах, cap 256) |
 | `history.rs` | `History` — bounded ring (CAP=64), recall вверх/вниз, stash текущей строки, дедуп подряд идущих |
 | `complete.rs` | Чистое таб-дополнение: `longest_common_prefix`, `Completion::{None, Single, Multiple}`, `complete_command`, `complete_path` |
@@ -27,7 +30,6 @@ Framebuffer-shell с редактированием строки, историе
 | `nano.rs` | `nano+` полноэкранный редактор: `Editor`, undo/redo, поиск/замена/goto, clipboard, мигающая каретка, сайдбар с деревом файлов (`^B`) |
 | `tree.rs` | Дерево файлов для сайдбара редактора: плоский список видимых строк с отступами, раскрытие/сворачивание каталогов, навигация с клавиатуры; обход VFS с ограничением глубины и числа записей |
 | `nano_config.rs` | Персист `NanoConfig` в `/mnt/.nanorc`; темы Dark/Light/Blue; CLI `nano --settings` |
-| `toolchain.rs` | «pagh-mini» мини-Rust: интерпретатор (`execute`), `rustc` (компиляция в `.pbc` = магия `PAGH-MINI-RUST:1\n` + исходник), `cargo new/check/build/run`, `rustup` |
 
 ## Ключевые символы
 
@@ -38,9 +40,11 @@ Framebuffer-shell с редактированием строки, историе
 - `complete::{longest_common_prefix, complete_command, complete_path}`
 - `keys::{KeyEvent, Decoder::{new, feed}, CTRL_C_LATCH, CTRL_Z_LATCH}`
 - `jobs::{Job, record, remove, snapshot, last, set_stopped}`
+- `identity::{current, set_session, load_users, load_groups, display_groups_for_user, supplementary_groups_for_user, session_groups}`
+- `identity_db::{parse_passwd, parse_group, user_by_name, groups_for_user, supplementary_groups_for_user}`
 - `path::{normalize, resolve, cwd, set_cwd}`
 - `suggest::{edit_distance, nearest_command}`
-- `paint::run()`, `nano::run(path)`, `toolchain::{execute, run_path, rustc, cargo, rustup}`
+- `paint::run()`, `nano::run(path)`; `rust` = алиас `lxrun`, `cargo`/`rustc` = установленные бинарники через Linux-слой
 
 ## Как работает REPL
 
@@ -86,7 +90,10 @@ row 0`).
 **Клавиатура**: `keys::Decoder` применяет Shift в таблице `scancode_to_ascii`, а
 CapsLock — уже поверх результата (`caps` инвертирует регистр буквы, поэтому
 caps+shift = строчная). Старая формула `caps != shift` учитывала Shift дважды и делала
-Shift+букву строчной при выключенном CapsLock.
+Shift+букву строчной при выключенном CapsLock. Пока клавиатурой владеет VT-клиент
+(`/dev/vtinput`), физические скан-коды в это кольцо не кладутся — shell получает их
+один раз через vtinput (`drivers::vtinput::client_active`); когда клиент завершился,
+цикл shell снимает защёлку (`reap_dead_client`) и прямой путь возвращается.
 
 ### Tab-комплишн
 Без whitespace → `complete_command`; иначе `readdir()` родителя токена через VFS →
@@ -115,9 +122,10 @@ Shift+букву строчной при выключенном CapsLock.
 тестовый ring-3 процесс), `ifconfig`, `ping`, `nc`, `selftest` (`test::run_all()`),
 `cd`, `pwd`, `cp` (cap 16 MiB), `mv` (только файлы), `stat`, `chmod` (октальный режим),
 `chown` (числовой `uid[:gid]`), `sleep`, `nano`, `lua`,
-`python`/`python3`, `pythonc`, `cargo`, `rustc`, `rustup`, `rust`, `paint`,
+`python`/`python3`, `pythonc`, `cargo`, `rustc`, `rust`, `paint`,
 `pkg <host> <path> [port]` (HTTP GET .deb → ar → decompress → tar → install в /mnt),
-`apt <update|install|show|list|setmirror>`, `lxrun <path> [args]` (Linux ELF в ring 3,
+`ppkg <update|install|show|list|setmirror>` (`install` принимает `--quiet` и
+`--progress=ansi|cr|plain`, рисуя DNF-style прогресс), `lxrun <path> [args]` (Linux ELF в ring 3,
 fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; забирает терминал у shell'а на время
 работы — см. «Job control»), `jobs`, `fg`, `bg`, `warn <on|off>` (тумблер fb-зеркала
 warn-логов), `usb` (состояние xHCI и PORTSC каждого порта), `disk`

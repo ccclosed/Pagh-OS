@@ -16,7 +16,7 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 | `virtio/blk.rs` | virtio-blk: `PciTransport` + `VirtIOBlk`, обёрнут в `BlockDevice` «virtio-blk0», секторный кэш 2 MiB (write-through), `flush` = `VIRTIO_BLK_T_FLUSH` |
 | `nvme.rs` | NVMe поверх PCIe — поллинг (phase-bit, поиск по CID), BAR0 MMIO, многостраничные PRP (PRP1 + PRP-list), до 4 команд в полёте, FLUSH (opcode 0x00) для дюрабильности WAL (issue #15), RMW для невыровненных записей; регистрируется как `BlockDevice` |
 | `nvme_prp.rs` | Чистая (`core` только) арифметика NVMe: PRP1/PRP2/PRP-list, LBA-чанки команд, SQ/CQ phase-tag и зажим CAP.MQES — включается в host-tests как есть |
-| `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C/Ctrl+Z, защёлки `CTRL_C`/`CTRL_Z`/`FG_PID`; ^C шлёт `SIGINT` foreground-группе терминала (`drivers::tty`), а не только записанному pid |
+| `ps2_kbd.rs` | PS/2 клавиатура (IRQ1): 128-байтное кольцо сканкодов, трекинг Ctrl+C/Ctrl+Z, защёлки `CTRL_C`/`CTRL_Z`/`FG_PID`; ^C шлёт `SIGINT` foreground-группе терминала (`drivers::tty`), а не только записанному pid. Маршрутизация `deliver_physical`: evdev получает байт всегда, shell-кольцо — только пока клавиатурой не владеет VT-клиент (`vtinput::client_active`), иначе тот же байт пришёл бы в shell дважды |
 | `tty.rs` | Управляющий терминал консоли: foreground process group (kernel-side, по умолчанию — группа shell) + `TOSTOP`, `TIOCGPGRP`/`TIOCSPGRP` через чистую модель `linux::tty`, `check_access(kind)` — фоновое чтение/запись JOB-процесса получает `SIGTTIN`/`SIGTTOU` на всю группу и `EINTR` (не-JOB'ы, т.е. служебные spawn'ы ядра, не останавливаются) |
 | `ps2_mouse.rs` | PS/2 мышь (IRQ12) через 8042 aux: IntelliMouse-негоциация (3 magic sample rate + id 3), 4-байтовые пакеты с колесом (Z в младшем ниббле 4-го байта), зажатые координаты + кнопки + `wheel` + `seq`; без колеса — 3-байтовый режим |
 | `scrollback.rs` | Чистое ядро скроллбека консоли: ring прокрученных строк (символы + цвет) и view-offset; `push`/`scroll`/`reset`/`view_row`, тесты в host-tests |
@@ -24,7 +24,14 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 | `usb_rndis_proto.rs` | Чистый протокол RNDIS: INIT/QUERY/SET/KEEPALIVE, разбор ответов по `RequestId`/статусу, data-конверты с 8-байтным префиксом и батчами; host-tests |
 | `usb_rndis.rs` | RNDIS-канал: управляющая последовательность, MAC, packet filter, keepalive, ограниченные RX/TX-очереди и 64-битные счётчики |
 | `xhci_hub.rs` | Чистая (`core` только) политика корневого порта xHCI по `hub.c`/`xhci-hub.c`: neutral-запись PORTSC (PED/PR/WPR/change bits не пишутся обратно), `hub_port_debounce` (25 мс шаг, 100 мс стабильного CCS, 2 с бюджет), `hub_port_wait_reset` (10/200 мс, 800 мс на запись, 5 попыток), 100 мс power settle, стабильность PED+U0 200 мс, backoff ≥1 с, без PP power-cycle; включается в host-tests как есть |
-| `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл + скроллбек (см. `scrollback.rs`), status bar, макросы `fb_print!` |
+| `framebuffer.rs` | Limine framebuffer текстовая консоль + 2D-графика: шрифт Fira Code 8×18 (`assets/font8x18.bin` — 8-битное **покрытие** на пиксель, генерируется `tools/gen_font.py`), `FbWriter`, скролл + скроллбек (см. `scrollback.rs`), status bar, макросы `fb_print!`; `FbInfo`/`fb_info()` — геометрия для `/dev/fb0`, `takeover_{acquire,active,release}()` — handover экрана userspace-композитору (flush консоли останавливается, serial-логи идут) |
+| `fb_abi.rs` | Чистый (`core`) ABI fbdev: `struct fb_var_screeninfo` (160 байт) и `fb_fix_screeninfo` (80 байт), `FBIOGET_VSCREENINFO` 0x4600 / `FBIOGET_FSCREENINFO` 0x4602; host-тесты сверяют размеры/смещения с Linux UAPI |
+| `evdev.rs` | evdev-подобная очередь `/dev/input/event0`: кольцо 256 событий, `feed_scancode` из PS/2 IRQ1 и USB HID, `feed_mouse` (BTN_*/REL_X/REL_Y/REL_WHEEL) из PS/2 IRQ12 и USB HID, `read_event`/`has_events`; композитор читает независимо, shell-stdin не затрагивается (пока клавиатурой владеет VT-клиент, прямой путь IRQ1/USB в shell-кольцо подавлен — см. `vtinput.rs`) |
+| `input_event.rs` | Чистый (`core`) кодек `struct input_event` (24 байта), set-1 → Linux keycodes (extended-таблица, fake shift/ACK/Pause отбрасываются); включается в host-tests |
+| `vt_abi.rs` | Чистый (`core`) ABI `/dev/vtconsole0`: 128-байтный заголовок (magic/version/seqlock/курсор/margins/offsets), 16-байтные клетки, `PGVT_IOC_INFO`; host-тесты сверяют смещения/валидацию/seqlock с `TERMINAL.md` |
+| `vtsurface.rs` | Разделяемая VT-поверхность: кадры PMM + seqlock, публикация клеток/курсора из shell (`framebuffer`) и kernel-VT (`vt.rs`), `read_at` fallback, `page()` для read-only `mmap`; публикация включается первым open `vtconsole0` |
+| `vt_keys.rs` | Чистый (`core`) перевод VT-байтов в PS/2 set-1: printable/Shift/Ctrl, стрелки/CSI split, lone Esc; host-тесты |
+| `vtinput.rs` | `/dev/vtinput`: VT-байты → scancode-кольцо shell (без эха в evdev); запись из userspace защёлкивает **владельца клавиатуры** (`client_active`/`reap_dead_client`), и физические скан-коды перестают дублироваться в shell-кольцо — единственная доставка идёт через этот модуль |
 | `vt.rs` | ANSI/VT-100 эмулятор поверх framebuffer (`Vt`: CSI/OSC/DCS, 256 цветов, scroll regions, ответы на запросы) — stdout compat-программ |
 | `cursor.rs` | Программный курсор мыши 12×19 (save/restore фона); `text_begin`/`text_end` для курсор-безопасного текста |
 | `serial.rs` | COM1 UART консоль (`init`, `write_bytes`, `console()`, макросы `kprint!`/`kprintln!`) |
@@ -49,12 +56,18 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 - `ps2_mouse`: `init(screen_w, screen_h) -> bool`, `irq_handler()`, `poll()`,
   `MouseState { x, y, left, right, middle, seq }`.
 - `framebuffer`: `init()`, `console()`, `clear_screen()`, `set_fg_color()`, `dimensions()`,
-  `with(f)`, `draw_status_bar(left, right)`, `fb_print!/fb_println!`;
+  `with(f)`, `draw_status_bar(left, right)`, `fb_print!/fb_println!`; `fb_info() -> Option<FbInfo>`,
+  `takeover_active()/acquire()/release()` (release — только in-QEMU selftest);
   константы `CHAR_WIDTH=8`, `CHAR_HEIGHT=18`, `CHARS_PER_LINE=100`, `MAX_LINES=37`,
   `STATUS_BAR_HEIGHT=18`. Размер глифа экспортируется **намеренно**: VT, маппинг мыши в
   клетку и тулбар `paint` берут его отсюда, а не заводят свою копию (вторая копия —
   молчаливый баг раскладки при смене шрифта).
-- `vt`: `init()`, `write(bytes)`, `dimensions()`, `take_input_responses()`.
+- `vt`: `init()`, `write(bytes)`, `dimensions()`, `take_input_responses()`;
+  публикует клетки/курсор в `vtsurface` (когда `/dev/vtconsole0` открыт).
+- `vtsurface`: `init()`, `activate()`/`deactivate()`, `info()`, `page()`,
+  `read_at()`, `publish_shell_cell/cursor/full/clear`, `publish_vt_cell/full/
+  cursor`; `vt_abi::{Header, Cell, encode_header, encode_cell, parse_header,
+  PGVT_IOC_INFO}`; `vtinput::write/reset`.
 - `cursor`: `hide()`, `move_to()`, `text_begin()`, `text_end()`.
 - `serial`: `init()`, `write_bytes()`, `console()`.
 

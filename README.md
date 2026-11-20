@@ -32,7 +32,7 @@
 - **Shell:** редактирование строки, история, tab completion, прокрутка консоли (колесо мыши / PageUp / PageDown), `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, файловые операции ext2, `selftest`.
 - **GUI-приложения:** управляемый мышью `paint` (инструменты фигур, 16-цветная палитра, размеры кисти, undo, сохранение в ext2), полноэкранный редактор `nano+` и `settings` с живыми цветовыми темами и обоями.
 - **Хранилище:** ext2-совместимая read/write файловая система с журналом write-ahead-log, на реальном virtio-blk или NVMe-диске (или RAM-диске с загрузочного носителя).
-- **Сеть:** стек TCP/IP поверх e1000 или USB-RNDIS (USB-тетеринг телефона): DHCP/ARP/TCP/UDP; `ifconfig` показывает живой lease.
+- **Сеть:** стек TCP/IP поверх e1000 или USB-RNDIS (USB-тетеринг телефона): DHCP/ARP/TCP/UDP; `ifconfig` показывает живой lease, `/proc/net/dev` — живые байтовые/пакетные счётчики `eth0`, а `SIOCGIFADDR`/`SIOCGIFFLAGS`/`SIOCGIFHWADDR`/`SIOCGIFNETMASK`/`SIOCGIFMTU`/`SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFCONF` на `AF_INET`-сокете отдают userspace те же адрес/маску/флаги/MAC из ядра.
 - **Процессы:** вытесняющий планировщик ~1 кГц, ring-3 пользовательские процессы, `SYSCALL`/`int 0x80`.
 
 *Не показано в демо выше (реализовано, но не задействовано в этой записи):* `apt`-подобный
@@ -74,7 +74,7 @@ ELF-бинарники — статически слинкованные или 
 потоки, `epoll`/`eventfd`, unix-сокеты и VT100-совместимый терминал с raw-mode `termios`),
 включает **`apt`-подобный менеджер пакетов**, который скачивает и ставит Debian-пакеты
 `.deb` по имени через HTTP/HTTPS, и умеет **устанавливать базовый glibc + Python userland**
-на свой ext2-диск по запросу из shell (`apt update` + `apt install python3`) — сама
+на свой ext2-диск по запросу из shell (`ppkg update` + `ppkg install python3`) — сама
 загрузка никогда не останавливается, чтобы что-то спросить.
 
 > Хобби/учебное ядро — **не граница безопасности.** Ring 3 изолирован от ядра
@@ -86,12 +86,23 @@ ELF-бинарники — статически слинкованные или 
 > чтения/записи для root и правилом «для исполнения всё равно нужен x-бит») на `open`,
 > `execve`, мутациях каталогов, `chmod`/`chown`, `kill` и `access`, опираясь на ext2
 > `i_mode`/`i_uid`/`i_gid` (создание проставляет ids и mode вызывающего; `stat` их
-> сообщает). SMEP включается, когда CPUID о нём сообщает. Чего **всё ещё нет**: учётных
-> записей и логина (shell и каждый порождённый ядром процесс по умолчанию root, поэтому
-> модель ограничивает только процессы, которые намеренно сбрасывают привилегии), повышения
-> через setuid-бинарники на `execve`, дополнительных групп, ACL или `fsuid`, наборов
-> capabilities, seccomp или LSM, audit trail, ASLR/KASLR, KPTI, SMAP и namespaces
-> адресного пространства/монтирования. Цепочка TLS + OpenPGP + digest ниже аутентифицирует
+> сообщает). Фаза 1 «группы отдельно от root» добавлена: у процесса есть до 32
+> дополнительных групп (`getgroups`/`setgroups`, nr 115/116), VFS-проверка учитывает
+> **любой** supplementary gid, узлы `/dev/fb0`, `/dev/input/event0`, `/dev/vtconsole0`,
+> `/dev/vtinput` несут `root:video|input|tty 0660` (а `/dev/null|zero|full` — `0666`),
+> а провижининг ставит минимальные `/etc/passwd` + `/etc/group` + `/etc/shadow`
+> (`0600 root:root`, `$6$` SHA-512-crypt, fail-closed проверка) с командами `id`,
+> `groups`, `whoami`, `su`, `login` и `passwd`: `su`/`login` проверяют пароль цели, а
+> опция `/etc/pagh-session` стартует сессию сразу не-root. Успешный `execve` применяет
+> setuid/setgid-биты (`S_ISUID`/`S_ISGID` → `euid`/`egid` и соответствующие saved id
+> владельца образа; real id и дополнительные группы сохраняются; неудачный exec ids не
+> трогает), но полной политики нет: ни `MS_NOSUID`-монтирований, ни `ptrace`/`dumpable`,
+> ни сброса групп для setuid-root. Чего **всё ещё нет**: `getty`/PAM и per-user сессий
+> (вход — только из уже запущенной console-shell; из root-сессии `su` пароля не
+> спрашивает, как в Linux, а встроенные команды shell остаются ring 0), `login.defs` и
+> блокировок после N попыток, `wheel`-гейта для `su`, audit trail, ACL или `fsuid`,
+> наборов capabilities, seccomp или LSM, ASLR/KASLR, KPTI, SMAP и namespaces
+> адресного пространства/монтирования. Модель и roadmap фазы 2 — `docs/security/groups.md`. Цепочка TLS + OpenPGP + digest ниже аутентифицирует
 > **пакеты** против враждебного зеркала; она не сдерживает враждебный локальный код. Не
 > запускайте недоверенные бинарники и не выставляйте это ядро в сеть, которую не
 > контролируете. Подробности — в `SECURITY.md` и `docs/security-model.md`.
@@ -175,12 +186,12 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
 
 ![pagh self-test](docs/selftest.png)
 
-### `apt update` по HTTPS
+### `ppkg update` по HTTPS
 
 Менеджер пакетов по имени скачивает индекс Debian `Packages` по TLS 1.3, проверив цепочку
 сертификата сервера, hostname и срок действия до того, как прочитан хоть байт индекса.
 
-![pagh apt update](docs/apt.png)
+![pagh ppkg update](docs/apt.png)
 
 ---
 
@@ -250,7 +261,10 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
   что хранит каждый раздел (собственный том pagh, пустая область, чужая файловая система), и
   это единственное место, где раздел можно форматировать: `Enter` монтирует, `F`
   форматирует после ввода имени устройства обратно, случайная клавиша ничего не стирает, а
-  20-секундный таймаут выбирает неразрушающий путь. Том считается своим для pagh тогда и
+  20-секундный таймаут выбирает неразрушающий путь. Меню показывается только когда выбор
+  действительно неоднозначен (пустой/чужой носитель, первая провизия): если на машине уже
+  есть том pagh (WAL-маркер), загрузка молча монтирует его и идёт дальше — повторной
+  «первой загрузки» с выбором диска нет. Том считается своим для pagh тогда и
   только тогда, когда несёт WAL-superblock pagh; ext3/ext4 распознаются как чужие и
   отвергаются. Образ на диске можно смонтировать на хосте (`mount -t ext2 -o loop disk.img`).
 - **Сеть:** собственная dual-stack реализация TCP/IP (без внешнего сетевого крейта) поверх
@@ -275,7 +289,8 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
   точке возврата из сисколла (настоящие `rt_sigaction`/`rt_sigprocmask`/`sigaltstack`/
   `rt_sigreturn`, `^C` → SIGINT с пробуждениями `EINTR` в блокирующих ожиданиях);
   синтетический `procfs` отдаёт
-  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`, read-only
+  `/proc/{cpuinfo,meminfo,uptime,stat,version,filesystems,loadavg,mounts}`,
+  `/proc/net/dev` (живые байтовые/пакетные счётчики канала и линк `eth0`), read-only
   заглушки `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
   `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}`, плюс
   `/proc/<pid>/{fd,fdinfo}/<n>` и per-thread представление `/proc/<pid>/task/<tid>/` (с
@@ -287,7 +302,7 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
   (tar-симлинки/hardlink'и создаются настоящими ссылками на ext2).
 - **Провижининг:** идемпотентный first-boot flow засеивает `/mnt`; userland glibc + CPython
   ставится через `apt` (fallback декодирования индекса gz→xz, честная диагностика
-  декодирования, прогресс на serial) по запросу из shell (`apt update` + `apt install
+  декодирования, прогресс на serial) по запросу из shell (`ppkg update` + `ppkg install
   python3`). Загрузка больше не останавливается, чтобы спросить: консольный вопрос без
   таймаута — не то, что загрузка может себе позволить.
 
@@ -335,7 +350,7 @@ chmod +x setup-linux.sh build.sh run.sh
 `run.sh` создаёт при первом запуске raw-диск `disk.img` на 1 GiB и загружает QEMU с 1 GiB
 RAM. Первая загрузка только засеивает скелет файловой системы; базовый userland `python3`
 не ставится из boot-prompt'а (консольный вопрос без таймаута — не то, что загрузка может
-себе позволить). Ставьте его из shell, когда захотите: `apt update`, затем `apt install
+себе позволить). Ставьте его из shell, когда захотите: `ppkg update`, затем `ppkg install
 python3` (≈50 MB загрузки, прогресс на serial). Удалите `disk.img`, чтобы получить чистую,
 заново засеянную систему при следующей загрузке.
 
@@ -440,7 +455,7 @@ soft-float и никогда не трогает векторные регист
 исполняемый в ring 3 через сисколл `SYS_WRITE`. DHCP-lease асинхронно получает поток
 сетевого poll'а после включения прерываний, поэтому он появляется после prompt'а. На
 свежем диске загрузка только засеивает скелет файлов (release-метаданные, `/etc`, пример);
-userland glibc + `python3` ставится по запросу из shell командами `apt update` + `apt
+userland glibc + `python3` ставится по запросу из shell командами `ppkg update` + `apt
 install python3` (прогресс на serial; зеркало лога во framebuffer приостанавливается).
 Prompt показывает текущий рабочий каталог и рендерится в цвете на framebuffer (serial
 остаётся простым текстом).
@@ -493,10 +508,9 @@ Prompt показывает текущий рабочий каталог и ре
 | `fscrash`            | Демо replay журнала + персистентность (запись → remount → проверка) |
 | `sleep <seconds>`    | Спать N секунд                                                  |
 | `nano <path>`        | Полноэкранный редактор: undo/redo, поиск/замена, goto, клипборд  |
-| `rust <path> [...]`  | Запустить `.rs`/`.pbc` через mini-Rust или любой ELF через Linux-слой |
-| `rustc <file.rs>`    | Скомпилировать Rust-исходник в `.pbc` (реальный `/mnt/usr/bin/rustc`, если установлен, иначе встроенный mini-Rust) |
-| `cargo …`            | Реальный `/mnt/usr/bin/cargo`, если установлен, иначе встроенный mini-Rust |
-| `rustup …`           | Посмотреть встроенный офлайн-тулчейн mini-Rust                  |
+| `rust <path> [...]`  | Запустить статический Linux ELF (например, нативный Rust musl-бинарник) через Linux-слой |
+| `rustc <file.rs>`    | Запустить установленный `/mnt/usr/bin/rustc` через Linux-слой (встроенный mini-Rust удалён) |
+| `cargo …`            | Запустить установленный `/mnt/usr/bin/cargo` через Linux-слой  |
 | `lua [file\|-e code]` | Запустить Lua 5.5 (ставится через apt)                        |
 | `python [file\|-c code]` | Запустить установленный CPython 3.16 (glibc) через Linux-слой |
 | `python3 [file\|-c code]` | Алиас `python`                                             |
@@ -510,11 +524,17 @@ Prompt показывает текущий рабочий каталог и ре
 | `df [-h]`            | Смонтированные файловые системы: blocks/size, used, available, use%, mount point |
 | `free [-h]`          | RAM и куча ядра: total/used/free в KiB, `-h` — человеческие единицы |
 | `ps`                 | Процессы: PID, PPID, STAT, COMMAND — compat-процессы из `/proc/<pid>/*`, потоки ядра как `[shell]`/`[net]`/`[usb]` |
+| `id [user]`          | Показать uid/gid/groups сессионной идентичности или пользователя из `/etc/passwd` |
+| `groups [user]`      | Имена групп сессии или пользователя из `/etc/group`             |
+| `su [-p] [user]`     | Сменить сессионную идентичность: из root-сессии пароль не нужен, из не-root — пароль цели (`lxrun` запускает программы от неё) |
+| `login [-p] <user>`  | Аутентифицировать и сменить сессионную идентичность; цель обязательна |
+| `passwd [user]`      | Задать пароль в `/etc/shadow` без эха (root может менять любую запись) |
+| `whoami`             | Имя пользователя по effective uid сессии                    |
 | `nc <ip> <port> [text]` | Открыть TCP-соединение и отправить строку                    |
 | `jobs` / `fg` / `bg` | Таблица jobs shell; возобновить последнюю остановленную job на переднем/фоновом плане |
 | `lxrun <path> […]`   | Загрузить и запустить Linux x86_64 ELF (статический или glibc) в ring 3 |
 | `pkg <host> <path> [port]` | Скачать `.deb` по HTTP(S) и установить в /mnt            |
-| `apt <subcmd> …`     | Менеджер пакетов: `update`/`install`/`show`/`list`/`setmirror`  |
+| `ppkg <subcmd> …`     | Менеджер пакетов: `update`/`install`/`show`/`list`/`setmirror`  |
 | `warn <on\|off>`     | Показывать/скрывать строки `[WARN]` ядра на экране (serial логирует всегда) |
 | `settings` / `theme` / `wallpaper` | Настроить терминал: темы, обои, статус-строка, каретка |
 | `exec`               | Запустить встроенный ring-3 тестовый процесс                    |
@@ -572,31 +592,13 @@ printf 'hello pagh' | nc -u 127.0.0.1 5555
 
 ## Rust-приложения и nano+
 
-### Встроенный mini-Rust
+### Встроенный mini-Rust удалён
 
-pagh включает офлайн-тулчейн в стиле Rust, рассчитанный на исходники, написанные прямо в
-`nano+`. Он намеренно меньше upstream rustc, Cargo и rustup, но использует привычные
-команды и не требует сети или хостового компилятора.
-
-```text
-cargo new /mnt/hello
-nano /mnt/hello/src/main.rs
-cargo run /mnt/hello
-
-nano /mnt/test.rs
-rust /mnt/test.rs
-rustc /mnt/test.rs -o /mnt/test.pbc
-rust /mnt/test.pbc
-
-rustup show
-rustup target list
-```
-
-Поддерживаемый синтаксис mini-Rust включает `fn main()`, целочисленные переменные и
-арифметику, целочисленные массивы, `.iter().sum()`, `println!`/`print!`, присваивания и
-целочисленные диапазоны `for`. Cargo поддерживает `new`, `check`, `build` и `run`. Файлы
-`.pbc` — портативные пакеты исходников, интерпретируемые встроенным runtime, а не
-нативные ELF.
+Раньше `rust`, `rustc`, `cargo` и `rustup` умели исполнять `.rs`/`.pbc` встроенным
+интерпретатором «pagh-mini» прямо в ring 0. Он удалён: парсер недоверенного исходника
+работал кодом ядра. Сейчас `rust <path>` — чистый алиас `lxrun` для Linux ELF,
+`.rs`/`.pbc` отвергаются с сообщением об удалении, а `cargo`/`rustc` запускают только
+установленные `/mnt/usr/bin/{cargo,rustc}` через Linux-слой.
 
 ### Нативный Rust-userland
 
@@ -613,9 +615,9 @@ tools/build-rust-app.sh rust-apps/hello
 rust /mnt/pagh-rust-hello one two
 ```
 
-Для `.rs` и `.pbc` команда `rust` выбирает встроенный интерпретатор. Для остальных файлов
-она выбирает ring-3 Linux ELF-загрузчик — статический или glibc-dynamic, однопоточный или
-многопоточный. GUI-библиотеки для нативных бинарников по-прежнему не поддерживаются.
+Команда `rust` — алиас `lxrun`: она запускает статический или glibc-dynamic Linux ELF
+(однопоточный или многопоточный) в ring 3. `.rs`/`.pbc` больше не исполняются в ядре.
+GUI-библиотеки для нативных бинарников по-прежнему не поддерживаются.
 
 ### Редактор nano+
 
@@ -642,12 +644,12 @@ rust /mnt/pagh-rust-hello one two
 lxrun /mnt/bin/busybox
 
 # point apt at a mirror, refresh the index, then install + run a package
-apt setmirror http://deb.debian.org /debian
-apt update
-apt install busybox-static
+ppkg setmirror http://deb.debian.org /debian
+ppkg update
+ppkg install busybox-static
 lxrun /mnt/bin/busybox
 
-# CPython 3.16 (installed from the shell with `apt install python3`)
+# CPython 3.16 (installed from the shell with `ppkg install python3`)
 python
 ```
 
@@ -676,7 +678,7 @@ python
   `kill(-pgid)` ставит одну копию лидеру группы, а не по одной на thread group (пути
   stop/continue терминала и shell используют broadcast на thread group).
 
-- **Установка ≠ запуск.** `apt install <pkg>` разрешает замыкание зависимостей, скачивает
+- **Установка ≠ запуск.** `ppkg install <pkg>` разрешает замыкание зависимостей, скачивает
   каждый `.deb`, распаковывает его файлы в `/mnt` и создаёт tar-симлинки/hardlink'и
   настоящими ссылками (symlink-inode, общие inode для hardlink'ов — issue #18). Консольные
   программы вроде `python3` действительно работают, и полноэкранные TUI тоже: драйвер VT
@@ -685,8 +687,8 @@ python
   состояние терминала, а `ioctl(FIONBIO)` покрывает non-blocking путь libuv — `nvim`
   работает и сохраняет свой ShaDa. Синтетический `/proc` (issue #11) отдаёт
   `/proc/cpuinfo`, `/proc/meminfo`, `/proc/uptime`, `/proc/stat`, `/proc/version`,
-  `/proc/filesystems`, `/proc/loadavg`, `/proc/mounts`, read-only заглушки
-  `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
+  `/proc/filesystems`, `/proc/loadavg`, `/proc/mounts`, `/proc/net/dev`, read-only
+  заглушки `/proc/sys/kernel/{ostype,osrelease,hostname}`, `/proc/self/*` и per-pid дерево
   `/proc/<pid>/{cmdline,stat,status,maps,cgroup,mountinfo,limits}` из живого состояния
   ядра (CPUID, счётчики PMM, тиковые часы, счётчики задач планировщика, `CompatState`
   целевого процесса), причём `readlink`/`lstat`/`getdents64` обрабатывают `/proc/self/exe`
@@ -722,12 +724,12 @@ python
   приложения. Доверие ограничено четырьмя запиненными корнями бандла (ISRG Root X1/X2, GTS
   R1/R4), а revocation (CRL/OCSP) не проверяется, поэтому HTTPS-зеркало вне этой выдачи
   отвергается, а не принимается на веру. Поверх этого реализовано доверие к репозиторию:
-  `apt update` проверяет `InRelease`/`Release.gpg` против закоммиченного, запиненного по
+  `ppkg update` проверяет `InRelease`/`Release.gpg` против закоммиченного, запиненного по
   отпечатку keyring'а Debian (binding подключей, expiry, revocation, clock gate 2025) и
   отвергает неподписанное зеркало сразу; тело `Packages` должно совпасть с подписанным
   `SHA-256` **и** размером до декодирования, а каждый `.deb` — с дайджестом из подписанного
-  индекса до распаковки. Plain-HTTP-зеркала (`apt setmirror http://…`) проверяются этой
-  цепочкой на целостность, хотя их транспорт не аутентифицирован, а живой `apt update`
+  индекса до распаковки. Plain-HTTP-зеркала (`ppkg setmirror http://…`) проверяются этой
+  цепочкой на целостность, хотя их транспорт не аутентифицирован, а живой `ppkg update`
   идёт по HTTPS (issue #19 закрыт). Что осталось открытым: распространение отзыва, replay
   целой старой тройки на suite'ах без `Valid-Until` и негативные MITM/digest E2E-harness'ы
   — см. `SECURITY.md`.
@@ -735,7 +737,7 @@ python
 - **Масштаб.** Полный Debian-индекс `main` (~60k пакетов, ~150 MiB в разжатом виде)
   потоково парсится в компактный in-RAM byte-arena индекс (держится только в RAM,
   пересобирается каждую загрузку). End-to-end установка доказана на локальном зеркале;
-  живой полный `apt update` с `deb.debian.org` работает, но медленный под QEMU user-mode
+  живой полный `ppkg update` с `deb.debian.org` работает, но медленный под QEMU user-mode
   networking (slirp) + TCG-эмуляцией.
 
 ---
@@ -781,7 +783,6 @@ src/
 │   ├── commands.rs     #   command handlers (ls, cd, cat, cp, mv, stat, write, nc, …)
 │   ├── nano.rs         #   full-screen text editor with undo/search/goto
 │   ├── nano_config.rs  #   persistent nano+ settings (theme, tabs, backups)
-│   ├── toolchain.rs    #   embedded cargo/rustc/rustup + mini-Rust runtime
 │   └── paint.rs        #   windowed mouse-driven framebuffer paint application
 ├── arch/
 │   ├── cpu.rs          # safe wrappers for privileged instrs (hlt/cli/sti/rd-/wrmsr, SSE)
@@ -840,7 +841,7 @@ src/
 │   ├── tar.rs          # pure ustar reader/writer
 │   ├── install.rs      # pure install-path normalization + model
 │   ├── install_fs.rs   # effectful data.tar → ext2 /mnt installer
-│   └── mirror.rs       # `apt setmirror` host/scheme/port argument parser
+│   └── mirror.rs       # `ppkg setmirror` host/scheme/port argument parser
 ├── sync/
 │   └── spinlock.rs     # IRQ-safe spinlock (built on arch::cpu)
 ├── task/

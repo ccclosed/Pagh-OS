@@ -31,11 +31,16 @@ full-screen TUIs such as `nvim`.
 - The `python`/`python3` shell commands find the installed CPython (any `python3*`
   under `/mnt/usr/bin`, preferring the most specific version) and run it with a proper
   `PYTHONHOME`/`PYTHONPATH` environment (`PYTHON_BASIC_REPL=1`).
-- `fork`/`clone`: `clone` handles both the thread and fork paths; a fork creates a real
-  child with a copied address space (`fork_linux_process`). Threads via
-  `CLONE_VM|CLONE_THREAD` share the address space; glibc `pthread_create` works.
+- `fork`/`clone`: `clone` handles the thread, fork and vfork/`posix_spawn` paths; a fork
+  creates a real child with a copied address space (`fork_linux_process`). Threads via
+  `CLONE_VM|CLONE_THREAD` share the address space (musl's `CLONE_DETACHED` is accepted);
+  glibc/musl `pthread_create` works. `clone(CLONE_VM|CLONE_VFORK)` is implemented as a
+  COW fork with the caller-provided `child_stack` plus a parent wait until the child
+  `execve`s or exits, which is what static-musl Rust-std `Command::spawn` uses; the
+  shared-memory part of vfork is deliberately replaced by the copy (documented deviation).
 - `epoll` (create1/ctl/wait/pwait) and `eventfd2` are implemented over the compat fd
-  table, plus unix sockets (`socketpair`/AF_UNIX stream), so libuv event loops run —
+  table, plus unix sockets (`socketpair`/AF_UNIX stream, including `sendmsg`/`recvmsg`
+  with `SOL_SOCKET`/`SCM_RIGHTS` fd passing — `docs/desktop-b.md` §6), so libuv event loops run —
   `nvim` starts, renders through the VT emulator, and saves its ShaDa
   (`rename`/`renameat`/`renameat2`, `fsync`/`fdatasync`, `readv`/`preadv`/`pwritev`).
 - Terminal: the console is a real tty. Honest `tcgetattr` reports actual
@@ -58,14 +63,14 @@ path after `/mnt` is mounted, and is idempotent (its guard is `/mnt/etc/pagh-rel
 
 1. Seeds `/mnt` with release metadata (`etc/pagh-release`) and a motd that carry the same
    crate version, a home skeleton (`home/user/`), `/usr/share/pagh/`, a `resolv.conf`
-   pointing at slirp's DNS (`10.0.2.3`), and a mini-Rust example (`examples/hello`).
+   pointing at slirp's DNS (`10.0.2.3`).
 2. Installs nothing over the network and asks nothing on the console: boot no longer
    stops at a Y/n question, because a console prompt without a timeout is not something
    boot may do.
 
 The glibc + CPython userland is installed on demand from the shell instead:
-`apt update` streams the Debian `Packages` index (gz/xz/zstd decode, honest `deb:`/`apt:`
-diagnostics on failure), then `apt install python3` pulls its dependency closure
+`ppkg update` streams the Debian `Packages` index (gz/xz/zstd decode, honest `deb:`/`ppkg:`
+diagnostics on failure), then `ppkg install python3` pulls its dependency closure
 (≈35 packages, ≈50 MB). Delete `disk.img` to re-seed from scratch.
 
 ## Installer details
@@ -118,5 +123,5 @@ gaps left are the ones named above, plus the deliberately unverified manual `pkg
   the **interpreter or a library** was missing, not the binary — check serial for
   `[linux] interpreter … fallback` lines.
 - `Package_Installer: … cause=NoSpace` names the file that failed to write.
-- Decode problems during `apt update` appear as `deb: inflate …` / `apt: index decode
+- Decode problems during `ppkg update` appear as `deb: inflate …` / `ppkg: index decode
   failed …` lines before any fallback is tried.

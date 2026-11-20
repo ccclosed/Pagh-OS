@@ -6,7 +6,9 @@ use x86_64::registers::rflags::RFlags;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::VirtAddr;
 
-use crate::arch::x86_64::linux::trap_frame::{exception_action, TrapAction};
+use crate::arch::x86_64::linux::trap_frame::{
+    exception_action, page_fault_action, PageFaultAction, TrapAction,
+};
 
 // IDT живёт в `SyncUnsafeCell`, а не в `static mut`, чтобы весь доступ шёл
 // через сырой указатель `.get()`, никогда через ссылку на изменяемый static
@@ -279,15 +281,26 @@ extern "x86-interrupt" fn gp_fault_handler(stack: InterruptStackFrame, error_cod
         }
     }
     // #GP, полученный при исполнении кода ring 3, — ошибка пользовательской
-    // программы (или нашего compat-слоя), а не ядра. Убить только виновный
-    // Compat_Process (код выхода 139 = 128+SIGSEGV), оставив ядро и шелл
-    // работать; раньше это останавливало всю машину.
-    if stack.instruction_pointer.as_u64() < 0x8000_0000_0000
-        && crate::task::compat::compat_exists_for_exit(pid)
-    {
+    // программы (или нашего compat-слоя), а не ядра. Убить только виновную
+    // задачу (код выхода 139 = 128+SIGSEGV), оставив ядро и шелл работать;
+    // раньше это останавливало всю машину.
+    //
+    // MVP S4b: решение принимает та же чистая политика, что у остальных
+    // синхронных исключений. Ring-3 отказ убивает задачу и БЕЗ
+    // compat-состояния — прежняя проверка `compat_exists_for_exit` отправляла
+    // нативную ring-3 задачу в `halt()`; отказ ring 0 остаётся фатальным, кроме
+    // заслона «ring 0 на пользовательском RIP у Compat_Process».
+    let action = exception_action(
+        (stack.code_segment.0 & 3) == 3,
+        stack.instruction_pointer.as_u64(),
+        crate::arch::x86_64::linux::validate::USER_ADDR_MAX,
+        crate::task::compat::compat_exists_for_exit(pid),
+    );
+    if action == TrapAction::KillProcess {
+        crate::task::compat::abandon_held_registry();
         crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
         crate::error!(
-            "[EXC #13] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running",
+            "[EXC #13] killing task pid={} (SIGSEGV) - kernel keeps running",
             pid
         );
         crate::task::scheduler::exit_current();
@@ -312,6 +325,7 @@ extern "x86-interrupt" fn page_fault_handler(
         fault_addr.as_u64(),
         error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
         error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+        error_code.contains(PageFaultErrorCode::USER_MODE),
     ) {
         return;
     }
@@ -378,7 +392,14 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::arch::cpu::halt_loop();
     }
     // Page fault ring 3 не должен ронять машину: сообщить одну краткую строку
-    // SIGSEGV и убить только виновный Compat_Process.
+    // SIGSEGV и убить только виновную задачу.
+    //
+    // MVP S4b: убивать обязан ЛЮБОЙ ring-3 отказ, а не только отказ
+    // Compat_Process. Клиент в userspace без compat-состояния (нативная ring-3
+    // задача pagh до `install_compat`, любой будущий non-Linux userspace) раньше
+    // проходил мимо `compat_exists_for_exit` в `halt()` и уносил машину. Решение
+    // принимает чистая host-тестируемая политика `page_fault_action(.., true, ..)`:
+    // ring 3 — пользовательский код, поэтому виновная задача есть всегда.
     let pid = crate::task::scheduler::current_pid();
     crate::error!(
         "[EXC #14] SIGSEGV pid={} addr=0x{:016x} RIP=0x{:016x}",
@@ -386,11 +407,19 @@ extern "x86-interrupt" fn page_fault_handler(
         fault_addr.as_u64(),
         stack.instruction_pointer.as_u64()
     );
-    if crate::task::compat::compat_exists_for_exit(pid) {
+    let action = page_fault_action(
+        error_code.contains(PageFaultErrorCode::USER_MODE),
+        fault_addr.as_u64(),
+        crate::arch::x86_64::linux::validate::USER_ADDR_MAX,
+        crate::task::compat::compat_exists_for_exit(pid),
+    );
+    if action == PageFaultAction::KillProcess {
+        // F-r4-arch-1: не входить в реестр повторно; аварийно отпустить лок,
+        // который мог удерживать прерванный `with_current_compat`.
         crate::task::compat::abandon_held_registry();
         crate::task::compat::with_current_compat(|cs| cs.exit_code = Some(139));
         crate::error!(
-            "[EXC #14] killing Compat_Process pid={} (SIGSEGV) - kernel keeps running",
+            "[EXC #14] killing task pid={} (SIGSEGV) - kernel keeps running",
             pid
         );
         crate::task::scheduler::exit_current();
@@ -545,8 +574,10 @@ fn user_exception_or_halt_inner(
         );
         crate::task::scheduler::exit_current();
     }
-    // Ring 0 на адресе ядра (или нет compat-состояния, чтобы кого-то винить):
-    // настоящий отказ ядра/железа. Обработчик уже напечатал вектор и RIP.
+    // Сюда доходит только отказ ring 0: ring-3 вектор убивает задачу всегда
+    // (политика `exception_action` выше), поэтому оставшийся случай — отказ
+    // ring 0 на ядерном RIP или без compat-состояния, чтобы кого-то винить.
+    // Это настоящий отказ ядра/железа; обработчик уже напечатал вектор и RIP.
     halt();
 }
 

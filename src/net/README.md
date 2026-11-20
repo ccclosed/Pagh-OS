@@ -14,7 +14,8 @@ net-поток или bounded locked-step помпы); из IRQ-контекст
 | Файл | Роль |
 |---|---|
 | `mod.rs` | Корень: `Stack`, лок `NET`, init, poll-цикл, `net_thread`, публичный TCP/UDP API, DNS `resolve`, `ping`, `nc_echo`, demo echo-сервисы |
-| `link.rs` | Канальный уровень: `Link::{E1000, UsbRndis}`, активный канал, `send`/`recv`, позднее подключение RNDIS |
+| `link.rs` | Канальный уровень: `Link::{E1000, UsbRndis}`, активный канал, `send`/`recv`, позднее подключение RNDIS, `counters()`/`running()` |
+| `netstats.rs` | Чистые (`core`-only) атомарные счётчики канала: байты/пакеты RX и TX, снимок `LinkCounters`. Host-свойство `net_counters` |
 | `wire.rs` | Чистые wire-форматы + encode/decode: Ethernet, ARP, IPv4/IPv6 (+ext headers), ICMP/ICMPv6/NDP/RA, UDP, TCP (MSS/WS/SACK-опции), internet checksum. Юнит-тесты инлайн |
 | `arp.rs` | Link-слой: `ArpTable` (IPv4, RFC 826), `NdpTable` (IPv6, RFC 4861); парковка кадров + rate-limited запросы |
 | `ip.rs` | IPv4/IPv6: next-hop роутинг, TX-фрагментация v4, RX-реассемблинг обоих семейств, ICMP echo-ответы, SLAAC (`ra_apply`), разрешение ping-waiter'ов |
@@ -84,6 +85,22 @@ ARP/NDP lookup; не резолвится → парковка кадра + rate
 `arp`/`ip` не держат `Stack` и берут активный канал из отдельного локата `link.rs`, поэтому
 отправка не может задедлочить сетевой лок.
 
+### Интерфейс и счётчики для userspace
+
+У стека один интерфейс с Linux-совместимым именем `eth0` (`net::IFACE_NAME`,
+`net::iface_name()` — `Some`, только когда канал уже выбран). `net::iface_stats()` отдаёт
+снимок `IfaceStats`: MAC, `cidr`/`gateway` (до DHCP — `None`), `running` (физический линк:
+`STATUS.LU` у e1000, готовность RNDIS), MTU 1500 и счётчики `netstats::LinkCounters`.
+Из него живут `/proc/net/dev` и ioctl `SIOCGIF*`; форматтеры не знают о драйверах.
+
+Учёт кадров — в `Link::send`/`Link::recv` (`netstats::LINK`), то есть **после драйвера**:
+считается кадр, который драйвер принял (`send` вернул ненулевой размер) или отдал
+(`recv` вернул `Some(len)`), а не байты на проводе. Отброшенный кадр (`send` = 0) не
+становится пакетом. Ошибки/потери приёма берутся из `usb_rndis::stats()` (у e1000
+статистики нет — честные нули, а не выдуманные числа). Счётчики атомарные и без спинлока:
+`Link::recv` вызывается из `Stack::step` под `NET`, и второй лок в этой вложенности ничего
+не защищает.
+
 ### IPv4/IPv6
 - IPv4: приём только своих/broadcast адресов; реассемблер ≤4 буферов, выравнивание 8 байт;
   диспетчер по proto на ICMP/UDP/TCP.
@@ -128,7 +145,7 @@ QEMU/TCG). Исторически стойка наблюдалась ещё н�
 
 **Регрессионный пин:** feature `lx_tlsbig` (`selftest_lx::run_tls_big_check`) — один
 много-МБ HTTPS GET того же объекта, ДО фаз decompress/parse, печатает
-`LXSELFTEST tls_big PASS (TLS 1.3; N bytes decrypted end to end)`. Живой `apt update`
+`LXSELFTEST tls_big PASS (TLS 1.3; N bytes decrypted end to end)`. Живой `ppkg update`
 (`lx_livetest`) идёт по HTTPS и сам отказывается стартовать при cleartext-конфиге
 (`set_mirror` без схемы из общих констант `apt::DEFAULT_MIRROR_HOST/BASE` + проверка
 `tls`/порт 443). Если стойка вернётся, watchdog печатает `stage=stall` со счётчиками и
@@ -152,7 +169,7 @@ QEMU/TCG). Исторически стойка наблюдалась ещё н�
 
 ## Грабли и безопасность
 
-- **TLS**: аутентификация сервера включена fail-closed (цепочка → CA-бандл, SAN-hostname, validity + clock gate, `CertificateVerify`); отказ прерывает handshake, ветка «нет верификатора ⇒ пропустить проверку» недостижима. Рукопожатие **без** `Certificate`/`CertificateVerify` — отдельный отказ: вендорный патч `embedded-tls` (латчи `certificate_received`/`certificate_verified`; PSK-рукопожатия исключены) не принимает server `Finished` без них — иначе пир мог дойти до `ApplicationData`, ни разу не вызвав верификатор, — а `https_get` независимо требует, чтобы `VERIFIED_HANDSHAKES` сдвинулся за время handshake. Доверие ограничено **четырьмя пиннутыми корнями** (`ca_bundle.rs`: ISRG Root X1/X2, GTS R1/R4), поэтому HTTPS-зеркало вне этой выдачи отвергается (`ChainError::NoAnchor`) — лечится только перегенерацией бандла `tools/gen_ca_bundle.py`; якоря парсятся лениво один раз за загрузку (кэш `ANCHORS`), пустой набор логируется `warn!`. Не проверяются на этом слое: отзыв сертификатов (CRL/OCSP). Подписи метаданных Debian (OpenPGP) и digest'ы `.deb` проверяет `pkg::apt` уже поверх транспорта (`src/pkg/README.md`), поэтому HTTP-зеркало (`apt setmirror http://…`) неаутентифицировано по построению, но целостность его метаданных даёт та же подписанная цепочка.
+- **TLS**: аутентификация сервера включена fail-closed (цепочка → CA-бандл, SAN-hostname, validity + clock gate, `CertificateVerify`); отказ прерывает handshake, ветка «нет верификатора ⇒ пропустить проверку» недостижима. Рукопожатие **без** `Certificate`/`CertificateVerify` — отдельный отказ: вендорный патч `embedded-tls` (латчи `certificate_received`/`certificate_verified`; PSK-рукопожатия исключены) не принимает server `Finished` без них — иначе пир мог дойти до `ApplicationData`, ни разу не вызвав верификатор, — а `https_get` независимо требует, чтобы `VERIFIED_HANDSHAKES` сдвинулся за время handshake. Доверие ограничено **четырьмя пиннутыми корнями** (`ca_bundle.rs`: ISRG Root X1/X2, GTS R1/R4), поэтому HTTPS-зеркало вне этой выдачи отвергается (`ChainError::NoAnchor`) — лечится только перегенерацией бандла `tools/gen_ca_bundle.py`; якоря парсятся лениво один раз за загрузку (кэш `ANCHORS`), пустой набор логируется `warn!`. Не проверяются на этом слое: отзыв сертификатов (CRL/OCSP). Подписи метаданных Debian (OpenPGP) и digest'ы `.deb` проверяет `pkg::apt` уже поверх транспорта (`src/pkg/README.md`), поэтому HTTP-зеркало (`ppkg setmirror http://…`) неаутентифицировано по построению, но целостность его метаданных даёт та же подписанная цепочка.
   RNG (`KernelRng` над RDSEED/RDRAND) fail-closed. Диагностика верификатора — только `error!`-строки `Package_Fetcher(tls): stage=verify cause=…` (`InvalidCertificate` / `InvalidSignatureScheme` / `InvalidSignature`): собственные сообщения embedded-tls идут на уровне `debug!`, а фасад по умолчанию фильтрует всё выше `Info`. Отдельный `cause=InvalidCertificate` печатает сам `https_get`, когда handshake завершился, но счётчик аутентификаций не сдвинулся.
 - ARP-обучение ограничено: unsolicited-ответы и чужие запросы кэш не наполняют.
 - DNS transaction ID из `random_u32` (не из тиков — тиковые коллидировались), ответ обязан

@@ -2,6 +2,103 @@
 
 Новое сверху, один раздел на версию `Cargo.toml`.
 
+## 2.24.0
+
+Desktop-вариант B: kernel-примитивы под userspace-композитор (`pagh-desktop`), плюс
+пакетный менеджер: производительность, переименование команды и прогресс установки.
+ABI и ограничения — `docs/desktop-b.md`.
+
+* **Ring-3 `#PF`/`#GP` убивают задачу, а не машину (S4b).** Обработчик page fault
+  завершал только `Compat_Process`: у клиента в userspace без compat-состояния
+  (нативная ring-3 задача pagh до `install_compat`, любой будущий non-Linux
+  userspace) отказ проваливался мимо проверки в `halt()` и уносил всю машину —
+  «shell alive after child: no echo». Теперь отказ ring 3 завершает виновную
+  задачу штатным путём (`exit_code = 139`, `scheduler::exit_current`) **всегда**,
+  без compat-состояния; та же чистая политика `trap_frame::{page_fault,
+  exception}_action` применена к `#GP` и остальным синхронным исключениям.
+  Отказ ring 0 остаётся фатальным (кроме прежних заслонов F-x86a-4/F-r3-arch-1),
+  доставка `SIG_DFL`/`Ignore` по тику (#117) не изменена. Host-свойства
+  `page_fault`/`exception_trap` расширены.
+
+* **Linux compat: `stat(2)` (nr 4).** Старые статические musl-бинари
+  (`pagh-desktop`/`pagh-desktop-demo`) зовут этот номер вместо `newfstatat`:
+  без него `Command::spawn`/`Path::exists()` получали `ENOSYS` (os error 38) и
+  запуск дочернего процесса (`--spawn-demo`, панель Files/Terminal) падал.
+  Обработчик переиспользует проверенную обвязку `newfstatat`: 144-байтный
+  x86_64 `struct stat`, `EFAULT` до записи, `ENOENT`/`ENOTDIR`, конечная
+  символическая ссылка разыменовывается как в Linux.
+
+* **`apt` → `ppkg`.** Пользовательская команда переименована; `apt` больше не
+  команда и алиаса не имеет. Внутренние модули (`pkg::apt*`, `apt.rs`) и
+  `pkg::apt::*` API сохранены. Обновлены `help`/usage, README/AGENTS/docs,
+  e2e-паттерны и пользовательские строки логов (`ppkg:` → `ppkg:`); тестовые
+  маркеры `LXSELFTEST apt_*` остались как идентификаторы.
+* **Прогресс `ppkg install`.** DNF-style: общий бар транзакции + бар текущего
+  пакета, фазы download/verify/unpack, известный `[====    ]` и анимированный
+  `<=>` для неизвестного объёма (`(elapsed_ms/500) % (width-4)`, `???%`),
+  percent/speed/size/ETA, перерисовка ≤10 FPS (100 мс). Интерактивный
+  framebuffer/VT: одна живая строка через `\r` + завершённые бары печатаются
+  один раз (у framebuffer нет ANSI cursor-addressing); `--progress=ansi` —
+  многострочный VT100-repaint (`ESC[?25l`/`ESC[nA\rESC[K`/`ESC[?25h`);
+  `--quiet` и неинтерактивный/serial-захват — только plain-строки. Рендерер
+  чистый и покрыт детерминированными host-тестами (t=0/250/500/750/1000 мс).
+* **Производительность (W0–W3).** Фазовые `ppkg: timings …` метрики; two-pass
+  streaming-установка `.deb` без полных `Vec` data.tar/`TarEntry` (пик кучи на
+  24 MiB payload: −76 % при 5k станз, −63 % при 50k); один `sync` на транзакцию;
+  персистентный компактный кэш индекса на ext2 с ключом по digest'у проверенного
+  Release (второй `ppkg update` при неизменном Release: 11.2 s → 5.1 s на 50k).
+  Детали и цифры — `docs/apt-performance.md`.
+
+* **`memfd` + `MAP_SHARED`.** Новый тип VFS-узла `vfs::memfd::MemFd`: страницы —
+  кадры PMM в карте `page_index -> phys`, файл держит pin-ссылку кэша, каждое
+  отображение — свою (`SHARED_BIT` листа). Повторные `mmap` одного fd и
+  fork-ребёнок видят одни байты, `read`/`write`/`pread64` согласованы с
+  отображением, `munmap`/exit/`mprotect(PROT_NONE)` отпускают только ссылку, а
+  кадр возвращается в PMM после последней. `ftruncate`/`truncate` (76/77)
+  добавлены в ABI (пустой memfd → размер SHM-буфера); `MAP_SHARED` обычного
+  файла — `EINVAL`, `PROT_NONE`/`mremap` shared — `EINVAL`.
+* **`/dev/fb0`.** Символьное устройство над Limine-фреймбуфером:
+  `FBIOGET_VSCREENINFO` (0x4600)/`FBIOGET_FSCREENINFO` (0x4602) отдают
+  минимальные `fb_var_screeninfo` (160 байт) и `fb_fix_screeninfo` (80 байт) с
+  реальными xres/yres/bpp/masks/stride/smem_start/smem_len/type/visual;
+  `mmap(MAP_SHARED)` отображает физический scanout как MMIO. Первый
+  `open`/`mmap` останавливает kernel-консольный flush (takeover; serial-логи
+  продолжают), без desktop консоль работает как раньше. fb-листья несут
+  MMIO-бит: `munmap`/exit/fork не возвращают экран в PMM. Нет фреймбуфера —
+  `open` даёт `ENODEV`.
+* **`/dev/input/event0`.** evdev-подобная очередь: `read` отдаёт 24-байтный
+  `struct input_event` (timeval, type, code, value); `EV_KEY` из PS/2 и USB HID
+  (set-1 → Linux keycodes, extended-таблица), `EV_REL` REL_X/REL_Y/REL_WHEEL из
+  PS/2 и USB HID мыши, `EV_SYN`/`SYN_REPORT` на пакет. Blocking read,
+  `O_NONBLOCK` → `EAGAIN`, `poll`/`select`/`epoll` → `POLLIN`; кольцо на 256
+  событий с вытеснением старого. Ввод дублируется из того же PS/2-потока,
+  поэтому shell-stdin и `/dev/stdin` не ломаются, если устройство не открыто.
+* **Shared VT surface (`/dev/vtconsole0` + `/dev/vtinput`).** Терминальное окно
+  desktop B получает read-only снимок видимой текстовой матрицы kernel-VT/shell:
+  128-байтный заголовок (`PGVT`, `seq`-seqlock, cursor/margins/cols/rows,
+  `write_seq`) + 16-байтные клетки, `mmap(MAP_SHARED, PROT_READ)` через
+  кадры PMM (`VT_RO_BIT`: `mprotect(PROT_WRITE)` = `EACCES`) и `read()`
+  fallback; `PGVT_IOC_INFO` (0x80205601). Первый open публикует снимок уже
+  нарисованного shell-текста, close выключает публикацию; без клиента консоль
+  работает как раньше. `/dev/vtinput` принимает VT-байты и переводит их в PS/2
+  set-1 (`printable`/Shift/Ctrl/стрелки/CSI, split между write'ами), чтобы ввод
+  терминала дошёл до shell его же line editor'ом; UTF-8 > ASCII в v1
+  отбрасывается. ABI — `docs/desktop-b.md` §5 и `TERMINAL.md`.
+* **Проверка.** Host-тесты `fb_abi`/`input_event`/`vt_abi`/`vt_keys` сверяют
+  размеры/смещения/seqlock/таблицу ввода с ABI; in-QEMU `selftest` получил
+  пять routine `desktop-b::*`: fb ioctl/mmap/пиксель (через mapping и
+  физический scanout), event0 read/poll (клавиатура + мышь), memfd coherence,
+  `MAP_SHARED` после `fork` (общий кадр, не COW) и vtconsole surface + vtinput
+  (маркер shell в снимке, read-only mmap, команда через vtinput выполняется
+  shell после selftest). Все routine выполняются в свежем пользовательском
+  PML4 и возвращают кадры в PMM. `tools/e2e.py selftest` зелёный.
+* **SCM_RIGHTS.** `sendmsg`/`recvmsg` (46/47) с `SOL_SOCKET`/`SCM_RIGHTS`
+  добавлены поверх 2.24.0 (версия в этом изменении не менялась): клиент
+  передаёт композитору memfd, получатель получает dup в свою таблицу, ABI —
+  `docs/desktop-b.md` §6.
+* **Остаток.** DMA-BUF/GPU/EGL, Wayland/xdg-shell, EV_ABS/touch, fb modeset,
+  аппаратный курсор и vt-switch — отдельные будущие PR.
+
 **Как читать этот файл.** Заголовок — это bump версии, не обязательно выпущенная сборка. Git-теги / GitHub-релизы существуют для `2.17.0` (2026-11-10), `2.18.6` (2026-11-10) и бандла `2.18.12-demo` (2026-11-11, демо-медиа снято с 2.18.12); `2.17.1`, `2.17.2` и серия исправлений по реальному железу `2.18.0`–`2.18.12` — это bump'ы версии, чьи заметки записаны здесь и в `AGENTS.md` и входят в следующий тегированный релиз (`2.18.13`, влит как PR #56). Полная техническая история каждого релиза — в release-note блоке `AGENTS.md`; разделы здесь называют видимое пользователю изменение и указывают туда, а не дублируют. Единственная статусная страница по находкам безопасности — `SECURITY.md`.
 
 ## 2.23.0

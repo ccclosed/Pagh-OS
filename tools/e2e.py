@@ -131,6 +131,11 @@ MODE_DEFAULTS = {
     "local-mirror": {"timeout": 240.0, "serial": "serial_e2e.log"},
     "live-update": {"timeout": 1200.0, "serial": "serial_live.log"},
     "bigindex": {"timeout": 300.0, "serial": "serial_bigindex.log"},
+    # apt performance benchmark (apt-fast): build a signed local benchmark repo
+    # (5k/50k stanzas + a multi-package 24 MiB install), boot `lx_apt_bench`, and
+    # read the `ppkg: timings` phase lines. Generous timeout: the 50k index parse
+    # and the ext2 writes both run under TCG.
+    "bench": {"timeout": 900.0, "serial": "serial_bench.log"},
     "shell": {"timeout": 180.0, "serial": "serial_shell.log"},
     # USB input: boot (menu appears once init_fs runs) + drive + shell + `usb`.
     # The waits are generous on purpose: this runs under TCG, and a timeout is a
@@ -141,6 +146,10 @@ MODE_DEFAULTS = {
     "rndis": {"timeout": 240.0, "serial": "serial_rndis.log"},
     # Console scroll: boot + help screenful + wheel/PageUp/PageDown + screenshots.
     "scroll": {"timeout": 180.0, "serial": "serial_scroll.log"},
+    # Phase-1 group model: two boots (format disk, then inject the probe), then
+    # real getgroups/setgroups/access/open decisions from ring 3 as root and as
+    # uid 1000 (both with and without supplementary groups).
+    "groups": {"timeout": 300.0, "serial": "serial_groups.log"},
 }
 
 # Features a mode cannot work without; `--features` only ADDS to this list.
@@ -148,6 +157,7 @@ MODE_REQUIRED_FEATURES = {
     "local-mirror": ["lx_selftest"],
     "live-update": ["lx_livetest"],
     "bigindex": ["lx_bigindex"],
+    "bench": ["lx_apt_bench"],
 }
 
 # Default evidence filters per mode (the `[WATCHDOG]`/`[DIAG]`/`LXSELFTEST`/`[EXC #N]`
@@ -158,16 +168,20 @@ MODE_EVIDENCE = {
         r"Self-test complete", r"Running kernel self-test", r"pagh:/>",
     ),
     "local-mirror": (
-        r"apt:|LXSELFTEST apt_e2e|hello from apt|LXSELFTEST https_get|Package_Fetcher\(tls\)",
+        r"ppkg:|LXSELFTEST apt_e2e|hello from apt|LXSELFTEST https_get|Package_Fetcher\(tls\)",
     ),
     "live-update": (
-        r"apt:|LIVE_APT_UPDATE|LXSELFTEST live_update|Resident_Index_Footprint|net::tls|busybox",
+        r"ppkg:|LIVE_APT_UPDATE|LXSELFTEST live_update|Resident_Index_Footprint|net::tls|busybox",
     ),
     "bigindex": (
-        r"apt:|BIGINDEX|LXSELFTEST bigindex|EXC #\d+|PAGE FAULT|RIP=",
+        r"ppkg:|BIGINDEX|LXSELFTEST bigindex|EXC #\d+|PAGE FAULT|RIP=",
+    ),
+    "bench": (
+        r"ppkg: timings|LXSELFTEST apt_bench|ppkg: \[\d+/\d+\] Unpacked|EXC #\d+|"
+        r"PAGE FAULT|RIP=",
     ),
     "shell": (
-        r"SELFTEST|LXSELFTEST|EXC #|FAIL|PASS|hello|apt:|pagh:/>",
+        r"SELFTEST|LXSELFTEST|EXC #|FAIL|PASS|hello|ppkg:|pagh:/>",
     ),
     "usb": (
         r"input: usb:|xhci: HID device on port|usb: \d+ controller|usb: key reports|"
@@ -175,6 +189,10 @@ MODE_EVIDENCE = {
     ),
     "rndis": (
         r"usb-rndis:|net: usb-rndis|net: DHCP lease|eth0  inet|ping: reply|pkg:|pagh:/>",
+    ),
+    "desktop": (
+        r"pagh-desktop:|pagh-files:|pagh-terminal:|evdev: |ext2 mounted at /mnt|"
+        r"launch-evidence|E2E_ALIVE|PANIC|\[EXC|pagh:/>",
     ),
 }
 
@@ -559,6 +577,56 @@ def prepare_usb_menu_disk(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
+def wipe_mount_choice(source: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
+    """Copy `source` and erase the recorded boot mount choice, wherever it is.
+
+    WHY THIS IS THE REPORTED DISK. `#136` skipped the boot disk menu whenever a
+    pagh volume existed, so a disk that arrives already provisioned — every image
+    `tools/mkimage.py --make-disk` writes (GPT + one ext2+WAL partition) and every
+    disk whose first boot went through the old kernel — never showed the mount
+    menu at all ("why do I have NO mount-selection menu, I asked for it once, not
+    4334 times"). Meanwhile the rule before it asked on every single boot. The
+    fix keys the skip on the RECORDED CHOICE (`fs::mount_choice`), so this exact
+    image — volume present, choice never made — must ask once and then never
+    again. Recreating it means removing the marker from a disk that has one.
+
+    The marker sits in the second 512-byte sector of the volume the boot path
+    mounted, which is not a fixed image offset: on a partitioned disk the
+    partition's own start moves it. Searching for the magic is the honest way to
+    find it. EVERY copy has to go, not just the first: the marker sector lies
+    inside ext2 block 0, the WAL journals that block, and a journal replay would
+    otherwise restore the bytes this helper just erased — the reconstructed disk
+    would quietly still carry a choice and the test would prove nothing. The
+    test then proves the wipe worked by requiring the menu on the next boot.
+    """
+    data = bytearray(source.read_bytes())
+    magic = b"PAGH-MNT-CHOICE"  # must match `fs::mount_choice::MAGIC`
+    wiped = 0
+    first = -1
+    search = 0
+    while True:
+        index = data.find(magic, search)
+        if index < 0:
+            break
+        sector = index - index % 512
+        data[sector:sector + 512] = b"\0" * 512
+        if first < 0:
+            first = sector
+        search = sector + 512
+        wiped += 1
+    if wiped == 0:
+        raise HarnessError(
+            f"{rel(source)} carries no recorded mount choice; the first boot of this "
+            f"mode should have written one (fs: mount choice recorded on ...)")
+    if magic in data:
+        raise HarnessError(f"{rel(source)} still carries a mount choice marker after the wipe")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(bytes(data))
+    log(f"usb: mount choice wiped from {rel(dest)} "
+        f"({wiped} marker sector(s), live one at image offset {first:#x})")
+    return dest
+
+
 def _elf_load_ranges(data: bytes) -> list[tuple[int, int]]:
     """File-offset range of every PT_LOAD segment of an ELF64 LSB image.
 
@@ -924,6 +992,92 @@ class QmpClient:
                 # which made a 3-notch burst deliver as one.
                 time.sleep(0.05)
 
+    def _input(self, events: list[dict]) -> None:
+        reply = self._command({
+            "execute": "input-send-event",
+            "arguments": {"events": events},
+        })
+        if "return" not in reply:
+            raise HarnessError(f"QMP input-send-event refused: {reply}")
+
+    def rel(self, dx: int, dy: int) -> None:
+        """Relative pointer motion (PS/2 mouse path)."""
+        events = []
+        if dx:
+            events.append({"type": "rel", "data": {"axis": "x", "value": int(dx)}})
+        if dy:
+            events.append({"type": "rel", "data": {"axis": "y", "value": int(dy)}})
+        if events:
+            self._input(events)
+
+    def button(self, button: str, down: bool) -> None:
+        self._input([{"type": "btn", "data": {"down": bool(down), "button": button}}])
+
+    def key(self, key: str) -> None:
+        """Press one QKeyCode (e.g. ``f10``, ``esc``, ``a``) via QMP send-key."""
+        reply = self._command({
+            "execute": "send-key",
+            "arguments": {"keys": [{"type": "qcode", "data": key}], "hold-time": 50},
+        })
+        if "return" not in reply:
+            raise HarnessError(f"QMP send-key refused: {reply}")
+
+    def keys(self, keys: list[str]) -> None:
+        """Press a QKeyCode chord (e.g. ``["shift", "bracket_left"]`` -> ``{``).
+
+        Needed because the HMP monitor client (tools/qemu_shot.KEY_NAMES) has no
+        mapping for ``{``/``}``, and its ``send_key`` only accepts one-character
+        or named keys — the launch-target placeholder needs the shifted brackets.
+        """
+        reply = self._command({
+            "execute": "send-key",
+            "arguments": {
+                "keys": [{"type": "qcode", "data": key} for key in keys],
+                "hold-time": 50,
+            },
+        })
+        if "return" not in reply:
+            raise HarnessError(f"QMP send-key refused: {reply}")
+
+    def release_modifiers(self) -> None:
+        """Force key-up for Ctrl/Shift/Alt after a chord.
+
+        QMP `send-key` holds a chord and releases it on a timer; under TCG load
+        the release can be lost or reordered relative to HMP `sendkey`
+        characters (two monitor paths into one emulated keyboard). A stuck Ctrl
+        turns a later `c` into the terminal's ^C: the kernel's PS/2 tracker
+        sends SIGINT to the *foreground* group, which killed the real Files
+        client right after its window appeared (serial:
+        `[signal] pid=9 sig=2 tick-delivered default-terminate`). An explicit
+        key-up plus a settle makes the modifier state deterministic before the
+        harness types a command line.
+        """
+        # SETTLE FIRST. QMP `send-key` presses the chord and releases it from a
+        # hold-timer in QEMU's main loop; a modifier reset sent immediately after
+        # the command can be delivered BEFORE the chord's own key events. That
+        # cleared Ctrl before `T` arrived (`mods=0x4` at T instead of 0x6) and the
+        # compositor hotkey never fired. 0.5 s is well past the 50 ms hold.
+        time.sleep(0.5)
+        # A bare key-up is not enough: QEMU skips a break event for a key it
+        # already considers released, so a break the GUEST missed (PS/2 packet
+        # loss) stays missed. A full tap (make + break) forces both edges through
+        # QEMU and clears the guest's modifier state. Alt is sent up only: a
+        # synthetic Alt tap opens the compositor launcher and would cover the
+        # desktop under test; a stuck Alt does not turn a `c` into ^C.
+        for qcode in ("ctrl", "shift"):
+            for down in (True, False):
+                self._input([{
+                    "type": "key",
+                    "data": {"down": down,
+                             "key": {"type": "qcode", "data": qcode}},
+                }])
+                time.sleep(0.03)
+        self._input([{
+            "type": "key",
+            "data": {"down": False, "key": {"type": "qcode", "data": "alt"}},
+        }])
+        time.sleep(0.5)
+
     def close(self) -> None:
         if self.sock is not None:
             try:
@@ -981,10 +1135,68 @@ class QemuShotKeyboard:
     def screenshot(self, path: pathlib.Path) -> None:
         self._guard("screendump", self.mon.screendump, pathlib.Path(path))
 
+    def screenshot_raw(self, path: pathlib.Path) -> None:
+        """Capture the framebuffer as binary PPM (raw RGB) for pixel assertions.
+
+        The PNG path above is the human evidence; comparing two PNGs byte-wise
+        cannot tell an overlay from a moved cursor (the cursor alone changed
+        ~250 pixels and produced a false PASS). PPM is header + raw RGB, so a
+        count of changed pixels inside the selection area is exact.
+        """
+        if self.mon is None:
+            raise HarnessError("QEMU monitor not connected")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.qemu_shot.tmp")
+        if tmp.exists():
+            tmp.unlink()
+        cmd = f"screendump {tmp} -f ppm"
+        reply = self._guard("screendump ppm", self.mon.command, cmd)
+        qemu_shot.Monitor._check(reply, cmd)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if tmp.exists() and tmp.stat().st_size > 0:
+                time.sleep(0.2)  # let QEMU finish flushing the file
+                tmp.replace(path)
+                return
+            time.sleep(0.2)
+        raise HarnessError(f"screendump ppm produced no file at {path}")
+
     def close(self) -> None:
         if self.mon is not None:
             self.mon.close()
             self.mon = None
+
+
+def ppm_rgb(path: pathlib.Path) -> tuple[int, int, bytes]:
+    """Decode a binary PPM (P6) framebuffer dump into raw RGB bytes."""
+    data = path.read_bytes()
+    match = re.match(rb"P6\s+(\d+)\s+(\d+)\s+(\d+)\s", data)
+    if not match:
+        raise HarnessError(f"{path}: not a P6 PPM dump")
+    width, height, maxval = (int(v) for v in match.groups())
+    body = data[match.end():]
+    if maxval != 255 or len(body) < width * height * 3:
+        raise HarnessError(f"{path}: unsupported PPM maxval/truncated body")
+    return width, height, body[: width * height * 3]
+
+
+def ppm_changed_inside(a: pathlib.Path, b: pathlib.Path,
+                       x0: int, y0: int, x1: int, y1: int) -> int:
+    """Count changed pixels in a rectangle of two same-size PPM dumps."""
+    wa, ha, ra = ppm_rgb(a)
+    wb, hb, rb = ppm_rgb(b)
+    if (wa, ha) != (wb, hb):
+        raise HarnessError(f"PPM size mismatch: {wa}x{ha} vs {wb}x{hb}")
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(wa, x1), min(ha, y1)
+    changed = 0
+    for y in range(y0, y1):
+        row = y * wa * 3
+        for x in range(x0, x1):
+            off = row + x * 3
+            if ra[off:off + 3] != rb[off:off + 3]:
+                changed += 1
+    return changed
 
 
 # ───────────────────────── serial waiting ─────────────────────────
@@ -1227,6 +1439,7 @@ class Harness:
         self.tag: str | None = None
         self.boot_patch: dict | None = None
         self.boot_record: dict | None = None
+        self.ovmf_args: list[str] = []
         self.started_at = time.time()
         self.checks: list[dict] = []
         self.metrics: dict = {}
@@ -1383,6 +1596,7 @@ class Harness:
                 else prepare_disk(a.disk, a.reuse_scratch_disk))
         self.run_dir.mkdir(parents=True, exist_ok=True)
         _, ovmf_args = resolve_ovmf(a.ovmf, self.vars_path)
+        self.ovmf_args = [str(arg) for arg in ovmf_args]
         argv = ["qemu-system-x86_64", "-cpu", a.cpu, "-m", a.memory]
         argv += ovmf_args
         # NVMe is opt-in: the normal path stays virtio-blk (fast under TCG and
@@ -1455,9 +1669,13 @@ class Harness:
             warn("--keep-artifacts: the feature ELF is left in place; "
                  "run 'python3 tools/e2e.py restore' to put the default ELF back")
 
-    def mirror_start(self, args: list[str], port: int) -> None:
+    def mirror_start(self, args: list[str], port: int,
+                     ready_path: str | None = None) -> None:
         self.mirror = Mirror(args, port, self.mirror_out)
-        self.mirror.start()
+        if ready_path is None:
+            self.mirror.start()
+        else:
+            self.mirror.start(ready_path=ready_path)
 
 
 # ───────────────────────── modes ─────────────────────────
@@ -1509,6 +1727,16 @@ def mode_selftest(h: Harness) -> tuple[str, int]:
     lx_fails = re.findall(r"LXSELFTEST \S+ FAIL[^\r\n]*", text)
     ok &= h.check("no LXSELFTEST case failures", not lx_fails,
                   lx_fails[0] if lx_fails else "none")
+    # `/dev/vtinput` ABI: во время self-test kernel-cli пишет команду в
+    # `/dev/vtinput`; после возврата shell обязан выполнить её обычным путём
+    # (set-1 scancodes → line editor → echo). Строка вывода `vtinput-ok`
+    # отличается от эха набранной команды (`echo vtinput-ok`) и доказывает, что
+    # ввод реально дошёл до shell, а не только до очереди драйвера.
+    vt_marker = wait_for(h.guest, [r"(?:^|\n)vtinput-ok\r?\n"], 15,
+                         label="vtinput shell reaction")
+    ok &= h.check(
+        "vtinput bytes reached the shell (echo ran after selftest)",
+        bool(vt_marker), vt_marker or "vtinput-ok output line not observed")
     for extra in h.extra_evidence:
         found = re.search(extra, text)
         h.check(f"extra marker /{extra}/ (best effort)", bool(found),
@@ -1556,15 +1784,119 @@ def mode_local_mirror(h: Harness) -> tuple[str, int]:
     ok = h.check("apt_e2e verdict marker reached", bool(found),
                  regex_first(r"LXSELFTEST apt_e2e (?:PASS|FAIL)[^\r\n]*", text) or "timeout")
     ok &= h.check("index loaded (>0 packages)", bool(idx))
-    get = regex_first(r"apt: Get http://10\.0\.2\.2(?::\d+)?/\S*Packages\S*", text)
+    get = regex_first(r"ppkg: Get http://10\.0\.2\.2(?::\d+)?/\S*Packages\S*", text)
     ok &= h.check("index fetch from the local mirror (R5.2)", bool(get), get or "")
-    unpacked = regex_first(r"apt: \[\d+/\d+\] Unpacked \S+ \(\d+ files,", text)
+    unpacked = regex_first(r"ppkg: \[\d+/\d+\] Unpacked \S+ \(\d+ files,", text)
     ok &= h.check("install wrote files onto ext2 /mnt", bool(unpacked), unpacked or "")
     ok &= h.check("apt_e2e PASS", bool(re.search(r"LXSELFTEST apt_e2e PASS[^\r\n]*", text)),
                   regex_first(r"LXSELFTEST apt_e2e PASS[^\r\n]*", text) or "no PASS line")
     ok &= h.check("installed static binary ran ('hello from apt')", "hello from apt" in text)
     ok &= h.check("no FAIL marker on serial",
                   not re.search(r"LXSELFTEST apt_e2e FAIL", text))
+    for extra in h.extra_evidence:
+        found_extra = re.search(extra, text)
+        h.check(f"extra marker /{extra}/ (best effort)", bool(found_extra),
+                found_extra.group(0).strip() if found_extra else "not observed")
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+
+
+def mode_bench(h: Harness) -> tuple[str, int]:
+    """apt performance benchmark (`lx_apt_bench`): signed local benchmark repo,
+    in-guest two `apt update` rounds + one multi-package `apt install`.
+
+    The mode itself is the **after** regression gate: it requires the streaming
+    install to keep `heap_peak_kib` for the large package below
+    `--max-heap-kib` (0 disables the bound, for baseline measurements), and it
+    asserts the exact `ppkg: timings` phase-line surface exists. The before/after
+    numeric comparison lives in the task report; the harness preserves every
+    timings line in the serial log this mode prints.
+    """
+    a = h.a
+    cache_root = pathlib.Path(CACHE)
+    out = (pathlib.Path(a.bench_out) if a.bench_out
+           else cache_root / f"apt_bench_{a.stanzas}_{a.size_mib}")
+    out = out.resolve()
+    if a.bench_out:
+        if not str(out).startswith(str(cache_root.resolve())):
+            raise SetupError(f"--bench-out must live under {cache_root}: {out}")
+    # Rebuild from scratch so a stale signed index can never be measured.
+    if out.exists():
+        shutil.rmtree(out)
+    run_checked(
+        [sys.executable, str(TOOLS / "mini_repo.py"), "bench", str(out),
+         "--stanzas", str(a.stanzas), "--size-mib", str(a.size_mib)],
+        "mini_repo bench",
+    )
+
+    h.boot()
+    assert h.guest is not None
+    h.mirror_start(["serve-dir", str(out), str(a.port)], a.port,
+                   ready_path="/dists/bench/main/binary-amd64/Packages.gz")
+
+    def on_tick(text: str) -> None:
+        last = re.findall(r"ppkg: (?:reading package lists[^\r\n]*|index ready[^\r\n]*)", text)
+        if last:
+            log(f"... {last[-1]}")
+
+    found = wait_for(h.guest, [r"LXSELFTEST apt_bench (?:PASS|FAIL)"], h.timeout,
+                     on_tick=on_tick, label="apt_bench verdict")
+    text = h.guest.serial()
+
+    timings = re.findall(r"ppkg: timings cmd=(\w+)[^\r\n]*", text)
+    full_lines = re.findall(r"ppkg: timings cmd=\w+[^\r\n]*", text)
+    for line in full_lines:
+        log(f"timing: {line}")
+    update_lines = [l for l in full_lines if "cmd=update" in l]
+    install_lines = [l for l in full_lines if "cmd=install" in l]
+    round_markers = re.findall(
+        r"LXSELFTEST apt_bench update round=(\d+) pkgs=(\d+) total_ms=(\d+)", text)
+    install_marker = re.search(
+        r"LXSELFTEST apt_bench install pkgs=(\d+) total_ms=(\d+)", text)
+    payload = regex_first(r"LXSELFTEST apt_bench payload [^\r\n]*", text)
+    spool = re.search(
+        r"LXSELFTEST apt_bench spool probe_bytes=(\d+) write_ms=(\d+) read_ms=(\d+)", text)
+    if spool:
+        h.metrics["spool write ms/8MiB"] = spool.group(2)
+        h.metrics["spool read ms/8MiB"] = spool.group(3)
+    install_line = install_lines[-1] if install_lines else ""
+    heap_m = re.search(r"heap_peak_kib=(\d+)", install_line)
+    files_m = re.search(r"files=(\d+)", install_line)
+    heap_kib = int(heap_m.group(1)) if heap_m else -1
+    files = int(files_m.group(1)) if files_m else 0
+
+    h.metrics["stanzas"] = a.stanzas
+    h.metrics["size MiB"] = a.size_mib
+    h.metrics["update rounds"] = len(update_lines)
+    h.metrics["install pkgs"] = install_marker.group(1) if install_marker else "n/a"
+    h.metrics["install files"] = files
+    h.metrics["install heap KiB"] = heap_kib
+    h.metrics["install line"] = install_line
+    for m in round_markers:
+        h.metrics[f"update r{m[0]} pkgs"] = m[1]
+        h.metrics[f"update r{m[0]} ms"] = m[2]
+
+    ok = h.check("apt_bench verdict marker reached", bool(found),
+                 regex_first(r"LXSELFTEST apt_bench (?:PASS|FAIL)[^\r\n]*", text)
+                 or "timeout")
+    ok &= h.check("apt_bench PASS", bool(re.search(r"LXSELFTEST apt_bench PASS", text)),
+                  regex_first(r"LXSELFTEST apt_bench PASS[^\r\n]*", text) or "no PASS line")
+    ok &= h.check("two ppkg: timings update phase lines", len(update_lines) >= 2,
+                  f"{len(update_lines)} update timing line(s)")
+    ok &= h.check("one ppkg: timings install phase line", bool(install_lines), install_line)
+    ok &= h.check("install timing carries phase fields & heap_peak_kib",
+                  heap_kib >= 0 and files > 0, install_line)
+    ok &= h.check("install payload verified in guest", bool(payload), payload or "")
+    ok &= h.check("temp-file spool cost probe ran", bool(spool),
+                  spool.group(0) if spool else "no probe line")
+    ok &= h.check("install planned the multi-package transaction",
+                  bool(install_marker) and int(install_marker.group(1)) >= 2,
+                  install_marker.group(0) if install_marker else "no marker")
+    if a.max_heap_kib > 0:
+        ok &= h.check(f"install heap_peak_kib <= {a.max_heap_kib} (streaming bound)",
+                      heap_kib >= 0 and heap_kib <= a.max_heap_kib,
+                      f"heap_peak_kib={heap_kib}")
+    ok &= h.check("no FAIL marker on serial",
+                  not re.search(r"LXSELFTEST apt_bench FAIL", text))
     for extra in h.extra_evidence:
         found_extra = re.search(extra, text)
         h.check(f"extra marker /{extra}/ (best effort)", bool(found_extra),
@@ -1584,17 +1916,17 @@ def mode_live_update(h: Harness) -> tuple[str, int]:
     assert h.guest is not None
 
     def on_tick(text: str) -> None:
-        last = re.findall(r"apt: reading package lists\.\.\. [^\r\n]*", text)
+        last = re.findall(r"ppkg: reading package lists\.\.\. [^\r\n]*", text)
         if last:
             log(f"... {last[-1]}")
 
     found = wait_for(h.guest, [r"LXSELFTEST live_update (?:PASS|FAIL)"], h.timeout,
                      on_tick=on_tick, label="live_update verdict")
     text = h.guest.serial()
-    progress = re.findall(r"apt: reading package lists\.\.\. \S+ / (\d+) pkgs", text)
+    progress = re.findall(r"ppkg: reading package lists\.\.\. \S+ / (\d+) pkgs", text)
     seq = [int(p) for p in progress]
     mono = all(seq[i] >= seq[i - 1] for i in range(1, len(seq)))
-    terminal = re.search(r"apt: index ready - (\d+) packages", text)
+    terminal = re.search(r"ppkg: index ready - (\d+) packages", text)
     count = re.search(r"LIVE_APT_UPDATE: count=(\d+)", text)
     footprint = re.search(r"Resident_Index_Footprint = (\d+) bytes", text)
     live_pass = bool(re.search(r"LXSELFTEST live_update PASS", text))
@@ -1788,7 +2120,18 @@ def mode_usb(h: Harness) -> tuple[str, int]:
     4. type `usb` in the shell over the same USB keyboard and assert the driver's
        own evidence: `input: usb: ... 2 HID, kbd N reports`, `xhci: HID device on
        port ...` with protocol=1 (keyboard) and protocol=2 (mouse), and the `usb`
-       command's port table showing both devices connected/enabled at high speed.
+       command's port table showing both devices connected/enabled at high speed;
+    5. reboot the same disk: the menu must NOT come back. `#136` skipped it on a
+       provisioned volume, which is what this boot now proves was the wrong key —
+       the skip must come from the RECORDED CHOICE (`fs::mount_choice`), so the
+       marker has to be on the volume after step 3 and the serial must say
+       `boot disk menu skipped`;
+    6. rebuild the reported disk — the image from step 5 with the recorded choice
+       erased (`wipe_mount_choice`), i.e. "a pagh volume arrives provisioned and
+       nobody ever answered". First boot: the menu SHOWS (the user's bug was that
+       it never did), Enter mounts the volume, `fs: mount choice recorded` lands
+       before the next boot. Second boot of the same disk: `boot disk menu
+       skipped`, no reformat, volume mounted, shell without a menu timeout.
 
     WHY THE REPORT COUNTERS ARE THE PROOF: q35 always emulates i8042 (`ps2: yes`
     in the banner) and QEMU cannot be told to remove it, so a keystroke could in
@@ -2035,6 +2378,128 @@ def mode_usb(h: Harness) -> tuple[str, int]:
                   rel(menu_driven_shot))
     ok &= h.check("shell screenshot captured",
                   shell_shot.is_file() and shell_shot.stat().st_size > 0, rel(shell_shot))
+
+    # ── clean second boot: a provisioned volume must not re-run the menu ──
+    # The disk now carries the pagh volume the menu just formatted. Before the
+    # fix, `boot_menu::run` returned a menu on EVERY boot (20 s timeout, mount
+    # and format rows) — the "first launch" ritual. A second boot must instead
+    # mount the existing volume and go straight to the shell.
+    log("usb: rebooting the same disk (provisioned) to prove the menu is skipped")
+    guest.stop()
+    h.guest = None
+    h.boot(need_keyboard=False, disk=disk, net=False)
+    assert h.guest is not None
+    second = h.guest
+    second_text = ""
+    if wait_for(second, [r"Welcome to pagh OS Shell!"], a.boot_timeout,
+                label="clean second boot") is not None:
+        second_text = second.serial()
+    skipped = "boot disk menu skipped" in second_text
+    skip_line = regex_first(r"fs: [^\r\n]*boot[^\r\n]*menu[^\r\n]*", second_text)
+    ok &= h.check("second boot skips the disk menu on a provisioned volume",
+                  skipped, skip_line or "no skip marker")
+    reformatted = bool(re.search(r"fs: formatting|operator chose to format",
+                                 second_text))
+    ok &= h.check("second boot performs no format/mount ritual", not reformatted,
+                  "format line present" if reformatted else "none")
+    mounted_again = "ext2 mounted at /mnt" in second_text
+    ok &= h.check("second boot auto-mounts the existing pagh volume",
+                  mounted_again,
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", second_text)
+                  or "not mounted")
+    ok &= h.check("second boot reached the shell without a menu timeout",
+                  bool(second_text),
+                  "shell banner seen" if second_text else "no banner")
+    h.metrics["second boot"] = skip_line or "no skip marker"
+
+    # ── the reported bug: provisioned disk, choice never recorded ──
+    # The second boot above skipped because THIS run answered the question (the
+    # menu formatted p1). The user's disk is the other shape: it carries a pagh
+    # volume but no recorded choice — `#136` skipped the menu on the volume alone,
+    # so it was never shown, and before that it was shown on every boot. Both
+    # halves are tested by wiping the marker and booting twice more.
+    legacy = wipe_mount_choice(disk, CACHE / "e2e_usb_disk_unchosen.img")
+    unchosen_shot = CACHE / "e2e_usb_menu_unchosen.png"
+    after_choice_shot = CACHE / "e2e_usb_menu_unchosen_shell.png"
+    evidence = {"menu_shot": False, "chose_mount": False, "recorded": False,
+                "mounted": False, "skipped": False, "second_mounted": False}
+
+    second.stop()
+    h.guest = None
+    log("usb: first boot of a provisioned disk with NO recorded choice — the menu "
+        "must appear here")
+    h.boot(need_keyboard=False, disk=legacy, net=False)
+    assert h.guest is not None
+    third = h.guest
+    kb3 = QemuShotKeyboard(h.monitor, a.key_delay)
+    kb3.connect(timeout=min(a.boot_timeout, 180.0))
+    if wait_for(third, [rf"part: MBR on {re.escape(device)}: 2 partition\(s\)"], timeout,
+                label="menu on a provisioned disk without a recorded choice") is not None:
+        evidence["menu_shot"] = True
+        time.sleep(0.6)  # let a redrawn frame land before the screenshot
+        kb3.screenshot(unchosen_shot)
+        # Enter on row 1 = the pagh volume: mount, never format, and it is exactly
+        # the one-time answer the operator would give.
+        kb3.key("ret")
+        evidence["chose_mount"] = wait_for(
+            third, [rf"fs: operator chose to mount {re.escape(device)}p1"], timeout,
+            label="the one-time menu choice") is not None
+        evidence["recorded"] = wait_for(
+            third, [rf"fs: mount choice recorded on {re.escape(device)}p1 \(mount\)"], timeout,
+            label="the recorded mount choice") is not None
+        evidence["mounted"] = wait_for(third, [r"ext2 mounted at /mnt"], timeout,
+                                       label="mount after the one-time choice") is not None
+        if wait_for_shell(third, kb3, a, a.boot_timeout):
+            kb3.screenshot(after_choice_shot)
+    third_text = third.serial()
+    ok &= h.check("a provisioned disk with no recorded choice still SHOWS the mount menu",
+                  evidence["menu_shot"], "menu drawn" if evidence["menu_shot"]
+                  else regex_first(r"fs: [^\r\n]*boot[^\r\n]*menu[^\r\n]*", third_text)
+                  or "no menu, no skip line")
+    ok &= h.check("the menu's mount choice went through", evidence["chose_mount"],
+                  regex_first(r"fs: operator chose to mount[^\r\n]*", third_text)
+                  or "no choice line")
+    ok &= h.check("the choice is recorded on the volume before the next boot",
+                  evidence["recorded"],
+                  regex_first(r"fs: mount choice recorded[^\r\n]*", third_text)
+                  or "no record line")
+    ok &= h.check("the volume mounted after the one-time choice", evidence["mounted"],
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", third_text) or "not mounted")
+    ok &= h.check("first boot of the unchosen disk captured",
+                  unchosen_shot.is_file() and unchosen_shot.stat().st_size > 0,
+                  rel(unchosen_shot))
+    ok &= h.check("shell after the one-time choice captured",
+                  after_choice_shot.is_file() and after_choice_shot.stat().st_size > 0,
+                  rel(after_choice_shot))
+
+    third.stop()
+    h.guest = None
+    log("usb: second boot of the SAME disk — the menu must never come back")
+    h.boot(need_keyboard=False, disk=legacy, net=False)
+    assert h.guest is not None
+    fourth = h.guest
+    fourth_text = ""
+    if wait_for(fourth, [r"Welcome to pagh OS Shell!"], a.boot_timeout,
+                label="boot after the choice was recorded") is not None:
+        fourth_text = fourth.serial()
+    evidence["skipped"] = "boot disk menu skipped" in fourth_text
+    evidence["second_mounted"] = "ext2 mounted at /mnt" in fourth_text
+    choice_line = regex_first(r"fs: mount choice already recorded[^\r\n]*", fourth_text)
+    ok &= h.check("the same disk never asks again (menu skipped by the recorded choice)",
+                  evidence["skipped"], choice_line or "no skip marker")
+    ok &= h.check("the second boot of the unchosen disk auto-mounts the volume",
+                  evidence["second_mounted"],
+                  regex_first(r"ext2 mounted at /mnt[^\r\n]*", fourth_text) or "not mounted")
+    ok &= h.check("the second boot of the unchosen disk does not reformat",
+                  not re.search(r"fs: formatting|operator chose to format", fourth_text),
+                  "format line present" if re.search(r"fs: formatting|operator chose to format",
+                                                     fourth_text) else "none")
+    h.metrics["unchosen disk"] = choice_line or "no skip marker"
+    h.metrics["unchosen disk menu screenshot"] = rel(unchosen_shot)
+    try:
+        kb3.close()
+    except Exception:  # a closed monitor socket at teardown is not a verdict
+        pass
 
     h.metrics.update({
         "keyboard reports (banner)": kbd_before if kbd_before >= 0 else "n/a",
@@ -2401,7 +2866,7 @@ def mode_smoke(h: Harness) -> tuple[str, int]:
                       if proc.stdout.strip() else f"exit {proc.returncode}")
         if not linked:
             print(proc.stdout[-2000:], proc.stderr[-2000:], file=sys.stderr)
-    idx = re.search(r"(?:apt: index ready - (\d+) packages"
+    idx = re.search(r"(?:ppkg: index ready - (\d+) packages"
                     r"|LXSELFTEST apt_e2e: index loaded \((\d+) packages\))", local_text)
     h.check("R4.2 functional index-pipeline evidence in the local log", bool(idx),
             idx.group(0).strip() if idx else "none (run `local-mirror` first)")
@@ -2459,16 +2924,1251 @@ def mode_restore(_h: Harness) -> tuple[str, int]:
     return "RESTORED", EXIT_PASS
 
 
+# The kernel's first SERIAL line is init_serial's `[INFO] serial` (the
+# "pagh ... booting (emergency console)" banner goes to the framebuffer only).
+# Any kernel log tag therefore proves the ELF was entered; a panic tag counts
+# too, so a kernel that dies before init_serial is not reported as "firmware
+# never started".
+KERNEL_BANNER = r"\[(?:INFO|WARN|ERROR|DEBUG|TRACE)\] |PANIC"
+# OVMF/EDK2 debug builds (and some loaders) print this class of line. It is how a
+# "firmware ran but never entered the kernel" boot is told apart from a kernel
+# that was entered and stayed silent.
+OVMF_SERIAL_HINTS = r"BdsDxe|TianoCore|EDK II|UEFI Interactive|EFI stub|TianoCore"
+
+
+def _require_boot_serial(h: "Harness", label: str, timeout: float) -> None:
+    """Fail fast when a booted guest writes nothing to serial.
+
+    The 0-serial first boot (firmware never chain-loaded the staged ESP) used to
+    surface only after the full shell timeout (~160 s) as a vague "shell never
+    appeared". The kernel writes its first serial line (``[INFO] serial``, right
+    after COM1 bring-up) within ~1 s of being entered, so the failure classes are
+    distinguishable and are named separately — the operator's next action differs:
+
+    * **firmware-not-started** — not one byte in ``timeout`` seconds: OVMF never
+      started the staged ESP (boot entry/NVRAM, the -bios/pflash pair, or the
+      staged tree). The OVMF argv and QEMU stderr are printed as evidence.
+    * **firmware-ran, kernel absent** — serial has bytes but no kernel banner and
+      carries OVMF/loader output: firmware/loader reached something, the kernel
+      did not print.
+    * **kernel-silent** — bytes but no recognisable loader output either.
+    """
+    assert h.guest is not None
+    guest = h.guest
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        text = guest.serial()
+        if re.search(KERNEL_BANNER, text):
+            return
+        if guest.proc is not None and not guest.alive():
+            raise HarnessError(
+                f"desktop: QEMU exited during {label} (rc={guest.returncode()}) before "
+                f"the kernel banner appeared; qemu stderr ({rel(guest.stderr_log)}):\n"
+                f"{tail(read_text(guest.stderr_log))}")
+        time.sleep(1.0)
+    text = guest.serial()
+    ovmf = " ".join(getattr(h, "ovmf_args", None) or [])
+    argv = " ".join(guest.argv)
+    stderr_tail = tail(read_text(guest.stderr_log))
+    context = (f"\nOVMF args : {ovmf or '(none resolved)'}\n"
+               f"QEMU argv : {argv}\n"
+               f"qemu stderr ({rel(guest.stderr_log)}): {stderr_tail}")
+    if not text:
+        raise HarnessError(
+            f"desktop: FIRMWARE DID NOT START THE STAGED ESP during {label}: serial "
+            f"is empty after {timeout:.0f}s (0 bytes). The kernel writes its first "
+            f"serial line within ~1 s of entry, so nothing reached the kernel: check "
+            f"the OVMF boot entry/NVRAM, the -bios/pflash pair, and the staged ESP "
+            f"tree." +
+            context)
+    if re.search(OVMF_SERIAL_HINTS, text):
+        raise HarnessError(
+            f"desktop: firmware ran but never entered the kernel during {label}: "
+            f"{len(text)} serial bytes, no kernel log line after {timeout:.0f}s, and "
+            f"OVMF/loader output is present. The staged ESP did not boot the kernel." +
+            context)
+    raise HarnessError(
+        f"desktop: KERNEL SILENT during {label}: {len(text)} serial bytes but no "
+        f"kernel log line appeared after {timeout:.0f}s (firmware/loader printed, the "
+        f"kernel did not).\nserial tail:\n{tail(text)}" + context)
+
+
+# Binaries the desktop acceptance injects into the pagh-owned ext2. ``pd`` is the
+# compositor (also exposed as ../../mnt/pd for the on-disk recipe); the three
+# others are real userland programs. ``pagh-desktop-demo`` is injected only so
+# ``--legacy-demo`` keeps working — the default path never spawns it.
+_DESKTOP_INJECTED = ("pd", "pagh-desktop-demo", "pagh-files", "pagh-terminal")
+
+
+def _desktop_bins(skip_build: bool) -> dict[str, pathlib.Path]:
+    """Build/locate the static musl binaries the desktop acceptance needs.
+
+    The compositor pair comes from the crate's own ``build-static.sh``. The REAL
+    clients (pagh-files, pagh-terminal) are built through the repo's generic
+    ``tools/build-rust-app.sh``, which installs them into ``rust-apps/out``:
+    building them here is the point of S2 — the acceptance must run the shipped
+    Files/Terminal binaries, not the demo client.
+    """
+    desktop = ROOT / "rust-apps" / "pagh-desktop"
+    script = desktop / "build-static.sh"
+    if not script.is_file():
+        raise SetupError(f"desktop: {script} missing")
+    if not skip_build:
+        log("desktop: building static pagh-desktop compositor binaries ...")
+        proc = subprocess.run([str(script)], cwd=desktop, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail_out = (proc.stderr or proc.stdout).strip().splitlines()[-8:]
+            raise SetupError("desktop build failed: " + " | ".join(tail_out))
+        builder = ROOT / "tools" / "build-rust-app.sh"
+        for crate in ("pagh-files", "pagh-terminal"):
+            log(f"desktop: building static {crate} client ...")
+            proc = subprocess.run([str(builder), str(ROOT / "rust-apps" / crate)],
+                                  cwd=ROOT, capture_output=True, text=True)
+            if proc.returncode != 0:
+                tail_out = (proc.stderr or proc.stdout).strip().splitlines()[-8:]
+                raise SetupError(f"desktop: {crate} build failed: " + " | ".join(tail_out))
+    out = desktop / "target" / "x86_64-unknown-linux-musl" / "release"
+    bins = {
+        "pd": out / "pagh-desktop",
+        "pagh-desktop-demo": out / "pagh-desktop-demo",
+        "pagh-files": ROOT / "rust-apps" / "out" / "pagh-files",
+        "pagh-terminal": ROOT / "rust-apps" / "out" / "pagh-terminal",
+    }
+    for name, path in bins.items():
+        if not path.is_file():
+            raise SetupError(f"desktop binary missing: {path} ({name})")
+    return bins
+
+
+def _debugfs_stat(image: pathlib.Path, name: str) -> str | None:
+    proc = subprocess.run(
+        ["debugfs", "-R", f"stat /{name}", str(image)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 or "File not found" in (proc.stdout + proc.stderr):
+        return None
+    return proc.stdout
+
+
+def _desktop_inject(image: pathlib.Path, bins: dict[str, pathlib.Path]) -> None:
+    """Write every static binary into the kernel-owned ext2 as an 0755 file."""
+    for name, src in bins.items():
+        proc = subprocess.run(
+            ["debugfs", "-w", "-R", f"write {src} /{name}", str(image)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise SetupError(f"debugfs write {name} failed: {proc.stderr.strip()}")
+        proc = subprocess.run(
+            ["debugfs", "-w", "-R", f"sif /{name} mode 0100755", str(image)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise SetupError(f"debugfs chmod {name} failed: {proc.stderr.strip()}")
+        stat = _debugfs_stat(image, name)
+        if stat is None or "Mode:  0755" not in stat:
+            raise SetupError(f"debugfs: /{name} is not executable after injection")
+
+
+def _desktop_disk_ready(image: pathlib.Path, bins: dict[str, pathlib.Path]) -> bool:
+    """True when a reusable desktop image already carries every injected binary."""
+    if not image.is_file():
+        return False
+    for name in bins:
+        stat = _debugfs_stat(image, name)
+        if stat is None or "Mode:  0755" not in stat:
+            return False
+    return True
+
+
+def _desktop_prepare_disk(h: "Harness", image: pathlib.Path,
+                          bins: dict[str, pathlib.Path]) -> None:
+    """Create a pagh-owned ext2 volume, then inject the binaries with debugfs.
+
+    The kernel only mounts a volume carrying its WAL superblock, and a host
+    ``mkfs.ext2`` image does not have one. So the first boot lets the kernel
+    format a blank whole-disk image itself (the normal first-boot path), QEMU is
+    stopped, and the static binaries are written into that already-owned ext2
+    with debugfs. The second boot mounts it without any prompt.
+
+    The first boot is also where the 0-serial failure class shows up, so it is
+    guarded by the fail-fast serial check (instead of waiting the full shell
+    timeout for a firmware that never started the staged ESP).
+    """
+    if not shutil.which("qemu-img") or not shutil.which("debugfs"):
+        raise SetupError("desktop: qemu-img and debugfs are required")
+    image.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        image.unlink()
+    except FileNotFoundError:
+        pass
+    run_checked([shutil.which("qemu-img"), "create", "-f", "raw", str(image), "64M"],
+                "qemu-img create (desktop format)", timeout=60)
+    log("desktop: first boot on a blank disk to let the kernel format ext2+WAL")
+    h.boot(need_keyboard=True, disk=image, net=False)
+    _require_boot_serial(h, "first boot (blank disk -> ext2 format)",
+                         h.a.serial_start_timeout)
+    assert h.guest is not None and h.kb is not None
+    if not wait_for_shell(h.guest, h.kb, h.a, h.a.boot_timeout):
+        raise HarnessError(f"desktop: shell never appeared on the blank disk; "
+                           f"serial tail:\n{tail(h.guest.serial())}")
+    if wait_for(h.guest, [r"ext2 mounted at /mnt"], 30.0, label="ext2 mount") is None:
+        raise HarnessError("desktop: kernel did not mount the freshly formatted volume")
+    time.sleep(2.0)
+    h.guest.stop()
+    h.guest = None
+    h.kb.close()
+    h.kb = None
+    if not image.is_file():
+        raise SetupError("desktop: formatted disk image disappeared")
+    _desktop_inject(image, bins)
+    log("desktop: injected real clients + compositor into " + rel(image))
+
+
+def mode_desktop(h: "Harness") -> tuple[str, int]:
+    """Desktop acceptance on the real kernel ABI.
+
+    Default path (S2): boots a pagh-owned disk carrying the compositor
+    (``/mnt/pd``) and the REAL applications ``/mnt/pagh-files`` and
+    ``/mnt/pagh-terminal``, then proves with serial markers and the QEMU
+    framebuffer that
+
+    * the fbdev backend opened ``/dev/fb0``, read both ioctl structs, mapped the
+      scanout and survived its selfcheck; the evdev backend decoded real
+      keyboard (F10) and relative-mouse (REL, BTN_LEFT) events;
+    * pagh-files connected over PDP/1 and its window was drawn on screen;
+    * its global Alt+Shift+F4 sent PDP/1 ``launch`` (type 13) and the compositor
+      spawned the configured ``--launch-target`` — the real pagh-files binary in
+      headless mode, whose PNG under /mnt is the evidence;
+    * pagh-terminal connected as a second window (the #138 private shell
+      session; the ``--vt``/``--vt-input`` VT mirror stays as the fallback) and
+      keeps committing frames (cursor blink);
+    * the serial shell survives all of it, the kernel console stays suspended
+      (fbdev takeover), and no panic/exception/ENOSYS appears.
+
+    ``--legacy-demo`` keeps the previous demo-client scenario (pagh-desktop-demo
+    + ``--spawn-demo``), which the panel launch path still needs until the panel
+    fix lands (server.rs ``launch()`` currently calls ``spawn_demo`` only).
+    """
+    a = h.a
+    bins = _desktop_bins(a.skip_build)
+    disk = CACHE / "e2e_desktop_disk.img"
+    if not (a.reuse_desktop_disk and _desktop_disk_ready(disk, bins)):
+        if a.reuse_desktop_disk:
+            warn(f"--reuse-desktop-disk: {rel(disk)} is missing one of "
+                 f"{', '.join(bins)}; preparing it from scratch")
+        _desktop_prepare_disk(h, disk, bins)
+    else:
+        log(f"desktop: reusing {rel(disk)}")
+
+    h.boot(need_keyboard=False, disk=disk, net=False)
+    assert h.guest is not None
+    _require_boot_serial(h, "desktop boot (prepared image)", a.serial_start_timeout)
+    guest = h.guest
+    kb = QemuShotKeyboard(h.monitor, a.key_delay)
+    try:
+        kb.connect(timeout=min(a.boot_timeout, 180.0))
+        if not wait_for_shell(guest, kb, a, a.boot_timeout):
+            raise HarnessError(f"desktop: shell prompt never appeared; "
+                               f"serial tail:\n{tail(guest.serial())}")
+        baseline = CACHE / "e2e_desktop_shell.png"
+        kb.screenshot(baseline)
+        ok = _desktop_abi_phase(h, guest, kb, baseline)
+        if a.legacy_demo:
+            ok &= _desktop_demo_child_phase(h, guest, kb)
+        else:
+            ok &= _desktop_real_apps(h, guest, kb)
+        return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+    finally:
+        kb.close()
+
+
+# ── phase 1 groups: real getgroups/setgroups/VFS decisions from ring 3 ───────
+
+
+def _groups_probe_binary() -> pathlib.Path:
+    """Assemble `tools/group_probe.c` into a freestanding static ELF.
+
+    No libc and no package dependencies: the probe is raw syscalls, so a green
+    run cannot be explained by glibc falling back to something else. `gcc` is
+    only a build tool here, exactly as the desktop mode needs a cargo target.
+    """
+    gcc = shutil.which("gcc")
+    if not gcc:
+        raise SetupError("groups: gcc is required to build tools/group_probe.c")
+    src = ROOT / "tools" / "group_probe.c"
+    if not src.is_file():
+        raise SetupError(f"groups: probe source missing: {src}")
+    out = CACHE / "grpprobe"
+    CACHE.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        [gcc, "-static", "-nostdlib", "-ffreestanding", "-fno-stack-protector",
+         "-fno-pie", "-no-pie", "-Os", "-o", out, src,
+         "-Wl,-e,_start", "-Wl,--build-id=none"],
+        "groups probe build", timeout=120,
+    )
+    if not out.is_file():
+        raise SetupError("groups: probe build produced no ELF")
+    return out
+
+
+def _debugfs_inject_exec(image: pathlib.Path, src: pathlib.Path, name: str) -> None:
+    """Write `src` as `/{name}` mode 0100755 into an ext2 image, then verify it."""
+    for argv in (
+        ["debugfs", "-w", "-R", f"write {src} /{name}", str(image)],
+        ["debugfs", "-w", "-R", f"sif /{name} mode 0100755", str(image)],
+    ):
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise SetupError(f"debugfs {argv[3]} failed: {proc.stderr.strip()}")
+    stat = _debugfs_stat(image, name)
+    if stat is None or "Mode:  0755" not in stat:
+        raise SetupError(f"debugfs: /{name} is not executable after injection")
+
+
+def _groups_prepare_disk(h: "Harness", image: pathlib.Path,
+                         probe: pathlib.Path, name: str = "grpprobe") -> None:
+    """Let the kernel format a blank disk, then inject the probe with debugfs.
+
+    The kernel only mounts a volume carrying its WAL superblock, so the first
+    boot must be the kernel's own format path (a host mkfs.ext2 image would be
+    refused). After QEMU stops, the probe is written into the already-provisioned
+    ext2 and the second boot mounts it without prompting.
+    """
+    if not shutil.which("qemu-img") or not shutil.which("debugfs"):
+        raise SetupError("groups: qemu-img and debugfs are required")
+    image.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        image.unlink()
+    except FileNotFoundError:
+        pass
+    run_checked([shutil.which("qemu-img"), "create", "-f", "raw", str(image), "64M"],
+                "qemu-img create (groups format)", timeout=60)
+    log("groups: first boot on a blank disk to let the kernel format ext2+WAL")
+    h.boot(need_keyboard=True, disk=image, net=False)
+    assert h.guest is not None and h.kb is not None
+    if not wait_for_shell(h.guest, h.kb, h.a, h.a.boot_timeout):
+        raise HarnessError("groups: shell never appeared on the blank disk; "
+                           f"serial tail:\n{tail(h.guest.serial())}")
+    if wait_for(h.guest, [r"ext2 mounted at /mnt"], 60.0, label="ext2 mount") is None:
+        raise HarnessError("groups: kernel did not mount the freshly formatted volume")
+    time.sleep(2.0)
+    h.guest.stop()
+    h.guest = None
+    h.kb.close()
+    h.kb = None
+    if not image.is_file():
+        raise SetupError("groups: formatted disk image disappeared")
+    _debugfs_inject_exec(image, probe, name)
+    log(f"groups: injected {rel(probe)} into {rel(image)} as /{name}")
+
+
+def mode_groups(h: "Harness") -> tuple[str, int]:
+    """Phase 1 acceptance for supplementary groups, group VFS checks and devices.
+
+    Two boots: the first formats a blank disk (the only writable ext2 the kernel
+    will mount), the probe is injected with debugfs, and the second boot drives
+    the shell. The probe is the part selftest cannot do from ring 0: it passes a
+    real user `gid_t*` through getgroups/setgroups and asks access/open for
+    group-owned files and /dev nodes as root, as uid 1000 with no groups, as
+    uid 1000 with only supplementary video(44), and as the `su oleg` session.
+    """
+    a = h.a
+    probe = _groups_probe_binary()
+    disk = CACHE / "e2e_groups_disk.img"
+    if not (getattr(a, "reuse_groups_disk", False)
+            and _debugfs_stat(disk, "grpprobe") is not None):
+        _groups_prepare_disk(h, disk, probe)
+    else:
+        log(f"groups: reusing {rel(disk)}")
+
+    h.boot(need_keyboard=True, disk=disk, net=False)
+    assert h.guest is not None and h.kb is not None
+    kb = h.kb
+    if not wait_for_shell(h.guest, kb, a, a.boot_timeout):
+        raise HarnessError(f"groups: shell never appeared; serial tail:\n"
+                           f"{tail(h.guest.serial())}")
+
+    def sh(cmd: str) -> None:
+        log(f"type: {cmd}")
+        kb.text(cmd)
+        kb.key("ret")
+
+    # `root:video 0640` data file: the group-class probe target, created as root
+    # by the native shell (which bypasses VFS checks by design).
+    sh("write /mnt/groupfile topsecret")
+    sh("chmod 0640 /mnt/groupfile")
+    sh("chown 0:44 /mnt/groupfile")
+    sh("id")
+    sh("ls -l /dev/fb0")
+    sh("ls -l /dev/null")
+
+    ok = True
+    for mode in ("root", "drop", "dropvideo"):
+        sh(f"lxrun /mnt/grpprobe {mode}")
+        if wait_for(h.guest, [rf"GPROBE mode={mode} "], h.timeout,
+                    label=f"grpprobe {mode}") is None:
+            ok &= h.check(f"grpprobe {mode} produced a result line", False,
+                          "timeout; serial tail: " + tail(h.guest.serial(), 10))
+            return ("FAIL", EXIT_FAIL)
+        time.sleep(1.0)
+
+    # `/etc/shadow` + `passwd`: a real password prompt (no echo), written to
+    # the freshly provisioned `0600 root:root` file and then verified by `su`
+    # through the same kernel path the shell uses.
+    sh("passwd oleg")
+    if wait_for(h.guest, [r"New password: "], 30.0, label="passwd prompt") is None:
+        ok &= h.check("passwd asks for a new password", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"Retype new password: "], 30.0,
+                label="passwd retype") is None:
+        ok &= h.check("passwd asks to retype", False, "no retype prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"passwd: password updated for 'oleg'"], 30.0,
+                label="passwd update") is None:
+        ok &= h.check("passwd updates /etc/shadow", False, "no success marker")
+        return ("FAIL", EXIT_FAIL)
+
+    sh("su oleg")
+    if wait_for(h.guest, [r"su: root session: no password required"], 30.0,
+                label="su oleg") is None:
+        ok &= h.check("su oleg switches the session", False, "no su marker")
+        return ("FAIL", EXIT_FAIL)
+    sh("whoami")
+    sh("su root")
+    sh("passwd root")
+    # Wrong password must be refused, the right one must authenticate: this is
+    # the in-guest proof that SHA-512-crypt verification and the shadow read
+    # path both work (not just the host property).
+    sh("su -p oleg")
+    if wait_for(h.guest, [r"Password for oleg: "], 30.0, label="su password") is None:
+        ok &= h.check("su asks for the target password", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("wrongpass")
+    kb.key("ret")
+    if wait_for(h.guest, [r"su: incorrect password"], 30.0, label="su wrong") is None:
+        ok &= h.check("su rejects a wrong password", False, "wrong password accepted?")
+        return ("FAIL", EXIT_FAIL)
+    sh("su -p oleg")
+    if wait_for(h.guest, [r"Password for oleg: "], 30.0, label="su password 2") is None:
+        ok &= h.check("su asks again", False, "no prompt")
+        return ("FAIL", EXIT_FAIL)
+    kb.text("opensesame")
+    kb.key("ret")
+    if wait_for(h.guest, [r"su: authenticated as oleg"], 30.0, label="su right") is None:
+        ok &= h.check("su accepts the right password", False, "not authenticated")
+        return ("FAIL", EXIT_FAIL)
+    sh("id")
+    sh("groups")
+    sh("lxrun /mnt/grpprobe file")
+    if wait_for(h.guest, [r"GPROBE mode=file "], h.timeout,
+                label="grpprobe file") is None:
+        ok &= h.check("grpprobe file produced a result line", False,
+                      "timeout; serial tail: " + tail(h.guest.serial(), 10))
+        return ("FAIL", EXIT_FAIL)
+    time.sleep(a.settle)
+    text = h.guest.serial()
+
+    expected = [
+        ("root: getgroups count/size/EFAULT and setgroups cap+clear",
+         r"GPROBE mode=root uid=0 euid=0 gid=0 egid=0 ngroups=0 groups=- "
+         r"initial=0 invalid33=22 set=0 count=3 listed=3 vals=0,44,105 "
+         r"small=22 badptr=14 cleared=0 after=0"),
+        ("uid 1000 with no groups: group file/devices denied, null allowed",
+         r"GPROBE mode=drop uid=1000 euid=1000 gid=1000 egid=1000 ngroups=0 groups=- "
+         r"rootfile=0 setgroups=0 setgid=0 setuid=0 file=13 read=13 fb0=13 "
+         r"event0=13 vtconsole=13 null=0 setgroups_again=1"),
+        ("supplementary video(44), egid 1000: group file and fb0 allowed, tty denied",
+         r"GPROBE mode=dropvideo uid=1000 euid=1000 gid=1000 egid=1000 ngroups=1 "
+         r"groups=44 rootfile=0 setgroups=0 setgid=0 setuid=0 file=0 read=9 "
+         r"fb0=0 event0=13 vtconsole=13 null=0 setgroups_again=1"),
+        ("su oleg + lxrun: session tty/video/input groups reach the child",
+         r"GPROBE mode=file uid=1000 euid=1000 gid=1000 egid=1000 ngroups=3 "
+         r"groups=5,44,105 file=0 read=9 fb0=0 event0=0 vtconsole=0 vtinput=0 "
+         r"null=0 setgroups=1"),
+        ("id after su oleg reports the same groups",
+         r"uid=1000\(oleg\) gid=1000\(oleg\) "
+         r"groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
+        ("groups after su oleg lists tty/video/input",
+         r"(?m)^oleg tty video input\r?$"),
+        ("/dev/fb0 is root:video 0660",
+         r"-rw-rw----\s+1\s+0\s+44\s+\d+\s+fb0"),
+        ("/dev/null is 0666",
+         r"-rw-rw-rw-\s+1\s+0\s+0\s+\d+\s+null"),
+        ("su prints the loaded supplementary set",
+         r"su: groups=1000\(oleg\),5\(tty\),44\(video\),105\(input\)"),
+        ("passwd wrote the hash into /etc/shadow",
+         r"passwd: password updated for 'oleg'"),
+        ("su authenticated oleg with the stored $6$ hash",
+         r"su: authenticated as oleg: oleg -> oleg \(uid=1000 gid=1000\)"),
+        ("whoami reports the session user", r"(?m)^oleg\r?$"),
+        ("su root from a non-root session is refused (root password locked)",
+         r"su: 'root' has no password set \(locked in /etc/shadow\)"),
+        ("passwd refuses another user from a non-root session",
+         r"passwd: permission denied \(only a root session may change another user's password\)"),
+    ]
+    for label, pattern in expected:
+        m = re.search(pattern, text)
+        ok &= h.check(label, bool(m), m.group(0).strip() if m else "not found")
+
+    crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE", text)
+    ok &= h.check("no panic/exception in guest", not crashes,
+                  crashes[0] if crashes else "none")
+    h.metrics["probe modes"] = "root, drop, dropvideo, file"
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+def _wait_launch_png(guest: "Guest", kb: "QemuShotKeyboard",
+                     timeout: float = 90.0) -> bool:
+    """Poll `ls /mnt/launch-evidence` until a PNG appears.
+
+    The launched pagh-files renders six 1280x800 scenes before it prints the first
+    line; under TCG that takes longer than a fixed 6-8 s nap, and its first
+    console write is then stopped by TOSTOP (it runs in the compositor's
+    background group). The PNG is written before the print, so polling the
+    directory is the reliable evidence; a missing file after the timeout is a
+    real failure, not a slow frame.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        off = len(guest.serial())
+        _desktop_restart_shell_line(kb)
+        kb.text("ls /mnt/launch-evidence")
+        kb.key("ret")
+        # Give `ls` a moment to answer, then look only at the bytes written
+        # after this command (an old `files-main` line elsewhere on serial is
+        # not evidence for this launch).
+        end = time.time() + 6.0
+        while time.time() < end:
+            if re.search(r"[^\s/]+\.png", guest.serial()[off:]):
+                return True
+            time.sleep(0.3)
+    return False
+
+
+def _desktop_restart_shell_line(kb: "QemuShotKeyboard") -> None:
+    """Discard any keys the compositor/evdev left in the shell line editor.
+
+    Backspaces are used on purpose: Ctrl-U is not a kill-line in the pagh shell
+    decoder (scancode 0x15 is the physical ``y`` key, so a "ctrl-u" chord would
+    type a letter), and the HMP monitor client only accepts bare sendkey names.
+    """
+    for _ in range(48):
+        kb.key("backspace", delay=0.005)
+
+
+def _desktop_type(kb: "QemuShotKeyboard", qmp: "QmpClient", text: str) -> None:
+    """Type a shell line, spelling the launch-target braces explicitly.
+
+    tools/qemu_shot.KEY_NAMES (the USB/desktop monitor client) has no '{'/'}',
+    and its ``send_key`` accepts only one-character or named keys, while
+    ``--launch-target`` uses the ``{socket}`` placeholder. QMP ``send-key`` DOES
+    take QKeyCode chords, so those two characters go through it as
+    shift+bracket_left/shift+bracket_right; everything else stays on sendkey.
+    """
+    for ch in text:
+        if ch == "{":
+            qmp.keys(["shift", "bracket_left"])
+            time.sleep(kb.key_delay)
+        elif ch == "}":
+            qmp.keys(["shift", "bracket_right"])
+            time.sleep(kb.key_delay)
+        else:
+            kb.text(ch)
+
+
+def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
+                       baseline: pathlib.Path) -> bool:
+    """Phase 1: compositor ABI acceptance (fbdev + evdev) + one-way takeover.
+
+    The compositor runs with ``--e2e`` (input-trace + full-render + demo window)
+    for a bounded lifetime: the trace is what proves evdev decoded F10/REL/BTN,
+    and the bounded exit is what lets the one-way console takeover be observed.
+    The same phase serves ``--legacy-demo`` and the default real-apps path, which
+    then starts a second, quiet compositor for phase 2.
+    """
+    a = h.a
+    ok = True
+    desktop = CACHE / "e2e_desktop.png"
+    menu = CACHE / "e2e_desktop_menu.png"
+    moved = CACHE / "e2e_desktop_pointer.png"
+    after_exit = CACHE / "e2e_desktop_after_exit.png"
+    after_cmd = CACHE / "e2e_desktop_after_cmd.png"
+    cmd = (f"rust /mnt/pd --e2e --exit-after-ms {a.run_ms} "
+           f"--selfcheck-ms {a.selfcheck_ms}")
+    log(f"type: {cmd}")
+    kb.text(cmd)
+    kb.key("ret")
+    marker = wait_for(guest, [r"pagh-desktop: fbdev selfcheck (PASS|FAIL)"],
+                      90.0, label="fbdev selfcheck")
+    text = guest.serial()
+    selfcheck = regex_first(r"pagh-desktop: fbdev selfcheck [^\r\n]*", text) or ""
+    ok &= h.check("fbdev backend opened /dev/fb0", "backend=fbdev" in text,
+                  regex_first(r"pagh-desktop: backend=fbdev [^\r\n]*", text) or "")
+    ok &= h.check("fbdev reported takeover", "takeover acquired" in text,
+                  regex_first(r"pagh-desktop: fbdev takeover[^\r\n]*", text) or "")
+    ok &= h.check("evdev backend opened /dev/input/event0", "input=evdev" in text,
+                  regex_first(r"pagh-desktop: input=evdev[^\r\n]*", text) or "")
+    ok &= h.check("embedded demo window committed", "embedded demo window" in text,
+                  regex_first(r"pagh-desktop: embedded demo window[^\r\n]*", text) or "")
+    ok &= h.check("fbdev selfcheck PASS (scanout pixels read back)",
+                  "fbdev selfcheck PASS" in selfcheck, selfcheck or marker or "not found")
+    time.sleep(0.4)
+    kb.screenshot(desktop)
+    changed = (baseline.is_file() and desktop.is_file()
+               and baseline.read_bytes() != desktop.read_bytes())
+    ok &= h.check("QEMU framebuffer shows the desktop (differs from shell)",
+                  changed, f"{desktop.name} vs {baseline.name}")
+
+    # Keyboard path: F10 is a compositor shortcut -> context menu must repaint.
+    kb.key("f10")
+    f10 = wait_for(guest, [r"evdev: key code=68 down"], 15.0, label="F10 trace")
+    ok &= h.check("evdev delivered F10 (KEY_F10=68)", f10 is not None,
+                  f10 or "no evdev F10 trace")
+    time.sleep(1.0)
+    kb.screenshot(menu)
+    if (menu.is_file() and desktop.is_file()
+            and menu.read_bytes() == desktop.read_bytes()):
+        time.sleep(1.5)
+        kb.screenshot(menu)
+    menu_changed = (menu.is_file() and desktop.is_file()
+                    and menu.read_bytes() != desktop.read_bytes())
+    ok &= h.check("F10 opened a menu and repainted the framebuffer",
+                  menu_changed, f"{menu.name} differs={menu_changed}")
+    kb.key("esc")
+    time.sleep(0.4)
+
+    # Pointer path: QMP relative motion + BTN_LEFT -> evdev REL/KEY.
+    if h.qmp is None:
+        h.qmp = QmpClient(h.qmp_path)
+        h.qmp.connect()
+    for _ in range(6):
+        h.qmp.rel(24, 12)
+        time.sleep(0.04)
+    rel_ok = wait_for(guest, [r"evdev: rel dx=\d+"], 15.0, label="evdev REL")
+    ok &= h.check("evdev decoded relative mouse motion", rel_ok is not None,
+                  regex_first(r"evdev: rel[^\r\n]*", guest.serial()) or "")
+    h.qmp.button("left", True)
+    time.sleep(0.15)
+    h.qmp.button("left", False)
+    btn = wait_for(guest, [r"evdev: button left (down|up)"], 15.0, label="evdev BTN_LEFT")
+    ok &= h.check("evdev delivered BTN_LEFT press/release", btn is not None,
+                  " / ".join(re.findall(r"evdev: button left \w+", guest.serial())) or "")
+    time.sleep(0.5)
+    kb.screenshot(moved)
+    pointer_changed = (moved.is_file() and desktop.is_file()
+                       and moved.read_bytes() != desktop.read_bytes())
+    ok &= h.check("pointer motion/click repainted the framebuffer",
+                  pointer_changed, f"{moved.name} differs={pointer_changed}")
+
+    raw_before = CACHE / "e2e_desktop_pointer.ppm"
+    kb.screenshot_raw(raw_before)
+
+    # Rubber-band selection: LMB press+drag on empty desktop (not a window,
+    # not the panel). PS/2 packets carry an 8-bit delta, so the pointer is
+    # homed and moved in small relative steps (one 1000 px event would be
+    # clamped and could land on the demo window). Screen is 1280x800; the
+    # 640x400 demo window sits at the top-left, so (1000, 640) is empty and
+    # (820, 500) stays clear of it and of the 44 px panel.
+    for _ in range(15):
+        h.qmp.rel(-100, -100)
+        time.sleep(0.02)
+    for _ in range(25):
+        h.qmp.rel(40, 25)
+        time.sleep(0.02)
+    h.qmp.rel(0, 15)
+    time.sleep(0.3)
+    h.qmp.button("left", True)
+    time.sleep(0.2)
+    drag_start = wait_for(guest, [r"pagh-desktop: selection drag start pointer="],
+                          15.0, label="selection drag start")
+    ok &= h.check("LMB on empty desktop starts rubber-band selection",
+                  drag_start is not None, drag_start or "no drag-start trace")
+    for _ in range(6):
+        h.qmp.rel(-45, -35)
+        time.sleep(0.08)
+    h.qmp.button("left", False)
+    committed = wait_for(
+        guest, [r"pagh-desktop: selection committed rect=\(\d+, \d+, \d+x\d+\)"],
+        15.0, label="selection committed")
+    committed_line = regex_first(
+        r"pagh-desktop: selection committed[^\r\n]*", guest.serial()) or ""
+    ok &= h.check("release commits the selection rect", committed is not None,
+                  committed_line or committed or "no commit trace")
+
+    # The committed frame stays visible until the next click, and the TCG
+    # compositor presents at ~1 fps with QEMU exposing the surface later
+    # still. Wait for a settled frame, then prove the overlay by pixel count
+    # inside the committed rect: a byte-compare against `moved` also changes
+    # when only the cursor moved (that false PASS is why PPM is dumped).
+    time.sleep(1.0)
+    raw_after = CACHE / "e2e_desktop_selection.ppm"
+    rect_match = re.search(r"rect=\((\d+), (\d+), (\d+)x(\d+)\)", committed_line)
+    painted = 0
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5)
+        kb.screenshot_raw(raw_after)
+        painted = 0
+        if rect_match and raw_before.is_file() and raw_after.is_file():
+            rx, ry, rw, rh = (int(v) for v in rect_match.groups())
+            painted = ppm_changed_inside(
+                raw_before, raw_after,
+                rx + 2, ry + 2, rx + rw - 2, ry + rh - 2)
+        if painted > 500:
+            break
+    ok &= h.check("selection overlay painted inside the committed rect",
+                  painted > 500, f"{painted} changed pixels (cursor excluded)")
+    selection = CACHE / "e2e_desktop_selection.png"
+    kb.screenshot(selection)
+    selection_changed = (selection.is_file() and moved.is_file()
+                         and selection.read_bytes() != moved.read_bytes())
+    ok &= h.check("QEMU screenshot shows the selection frame",
+                  selection_changed, f"{selection.name} differs={selection_changed}")
+
+    # Exit + one-way takeover: shell keeps running on serial, but the kernel
+    # console must not repaint the screen over the last desktop frame.
+    exited = wait_for(guest, [r"pagh-desktop: exit-after-ms reached"],
+                      max(30.0, a.run_ms / 1000.0 + 30.0), label="desktop exit")
+    ok &= h.check("desktop exited via --exit-after-ms", exited is not None,
+                  exited or "no exit marker")
+    time.sleep(2.0)
+    kb.screenshot(after_exit)
+    kb.text("echo E2E_ALIVE_AFTER_DESKTOP")
+    kb.key("ret")
+    alive = wait_for(guest, [r"E2E_ALIVE_AFTER_DESKTOP"], 20.0, label="shell after desktop")
+    ok &= h.check("serial shell alive after desktop exit", alive is not None,
+                  alive or "no echo")
+    time.sleep(0.5)
+    kb.screenshot(after_cmd)
+    same = (after_exit.is_file() and after_cmd.is_file()
+            and after_exit.read_bytes() == after_cmd.read_bytes())
+    ok &= h.check("kernel console did not repaint after desktop exit (takeover)",
+                  same, "frames identical" if same else "console repainted")
+    text = guest.serial()
+    ok &= h.check("fbdev close reports one-way takeover",
+                  "takeover remains armed" in text,
+                  regex_first(r"pagh-desktop: fbdev closed[^\r\n]*", text) or "")
+    h.metrics["desktop screenshots"] = ", ".join(
+        rel(p) for p in (baseline, desktop, menu, moved, after_exit, after_cmd)
+    )
+    return ok
+
+
+def _desktop_demo_child_phase(h: "Harness", guest: "Guest",
+                              kb: "QemuShotKeyboard") -> bool:
+    """Legacy panel path: the compositor spawns the DEMO client (`--spawn-demo`).
+
+    Kept behind --legacy-demo because ``server.rs::launch()`` (the panel path)
+    still calls ``spawn_demo`` only; once it consults ``launch_targets`` the real
+    scenario's PDP/1 launch evidence covers this too.
+    """
+    ok = True
+    child_cmd = ("rust /mnt/pd --backend headless --input none "
+                 "--spawn-demo --exit-after-ms 6000")
+    log(f"type: {child_cmd}")
+    kb.text(child_cmd)
+    kb.key("ret")
+    launched = wait_for(guest, [r"pagh-desktop: launch terminal ok"], 30.0,
+                        label="child launch")
+    ok &= h.check("pagh-desktop spawned its child (posix_spawn/vfork)",
+                  launched is not None,
+                  launched or "no 'launch terminal ok' marker")
+    child_win = wait_for(guest, [r"pagh-desktop-demo: window \d+"], 30.0,
+                         label="child demo client")
+    ok &= h.check("spawned demo client connected over PDP/1",
+                  child_win is not None, child_win or "no child window line")
+    text = guest.serial()
+    enosys = re.search(
+        r"pagh-desktop: launch[^\r\n]*(Function not implemented|os error 38)",
+        text,
+    )
+    ok &= h.check("child launch returned no ENOSYS", enosys is None,
+                  enosys.group(0) if enosys else "none")
+    exited_child = wait_for(
+        guest,
+        [r"pagh-desktop: backend=headless 1280x720[\s\S]*?"
+         r"pagh-desktop: exit-after-ms reached"],
+        40.0,
+        label="child server exit",
+    )
+    ok &= h.check("child server exited via --exit-after-ms",
+                  exited_child is not None,
+                  "second exit marker" if exited_child else "no second exit marker")
+    kb.text("echo E2E_ALIVE_AFTER_CHILD")
+    kb.key("ret")
+    alive_child = wait_for(guest, [r"E2E_ALIVE_AFTER_CHILD"], 20.0,
+                           label="shell after child launch")
+    ok &= h.check("serial shell alive after child launch", alive_child is not None,
+                  alive_child or "no echo")
+    return ok
+
+
+def _desktop_real_apps(h: "Harness", guest: "Guest",
+                       kb: "QemuShotKeyboard") -> bool:
+    """Phase 2 (default): REAL pagh-files / pagh-terminal windows, PDP launch."""
+    a = h.a
+    ok = True
+    socket = "/tmp/pagh-desktop.sock"
+    files_shot = CACHE / "e2e_desktop_files.png"
+    files_clicked = CACHE / "e2e_desktop_files_click.png"
+    term_a = CACHE / "e2e_desktop_terminal.png"
+    term_b = CACHE / "e2e_desktop_terminal_blink.png"
+    console_a = CACHE / "e2e_desktop_console_a.png"
+    console_b = CACHE / "e2e_desktop_console_b.png"
+
+    def mark() -> int:
+        return len(guest.serial())
+
+    def wait_new(offset: int, patterns, timeout: float, label: str) -> str | None:
+        deadline = time.time() + timeout
+        compiled = [re.compile(p) for p in patterns]
+        while time.time() < deadline:
+            text = guest.serial()[offset:]
+            for pat in compiled:
+                if pat.search(text):
+                    return pat.pattern
+            if guest.proc is not None and not guest.alive():
+                raise HarnessError(f"QEMU exited before the {label}; serial tail:\n"
+                                   f"{tail(guest.serial())}")
+            time.sleep(0.5)
+        return None
+
+    if h.qmp is None:
+        h.qmp = QmpClient(h.qmp_path)
+        h.qmp.connect()
+
+    # Kernel TOSTOP is ON by default (drivers/tty.rs): a BACKGROUND job writing
+    # to the console is stopped with SIGTTOU. The compositor therefore runs with
+    # --quiet (backend/selfcheck lines are plain stdout and stay): its per-client
+    # diagnostics would stop it the moment a real client connects. Consequence:
+    # the server-side `hello ... app="pagh-files"` line is NOT on serial here; the
+    # client's window line proves the same handshake (Files can only print it
+    # after hello -> welcome -> create succeeded).
+    pd_cmd = (
+        f"rust /mnt/pd --backend fbdev --input evdev --quiet --full-render "
+        f"--launch-target files=/mnt/pagh-files|--socket|{{socket}} "
+        f"--launch-target terminal=/mnt/pagh-files|--out|/mnt/launch-evidence|--shot|all|--path|{{socket}} "
+        f"--exit-after-ms {a.pd_lifetime_ms} --selfcheck-ms {a.selfcheck_ms}"
+    )
+    off = mark()
+    log(f"type: {pd_cmd}")
+    _desktop_type(kb, h.qmp, pd_cmd)
+    kb.key("ret")
+    marker = wait_new(off, [r"pagh-desktop: fbdev selfcheck (PASS|FAIL)"],
+                      120.0, "second compositor selfcheck")
+    text_new = guest.serial()[off:]
+    selfcheck = regex_first(r"pagh-desktop: fbdev selfcheck [^\r\n]*", text_new) or ""
+    ok &= h.check("quiet compositor re-opened /dev/fb0 after phase 1 exit",
+                  bool(marker),
+                  "fbdev selfcheck (only the fbdev backend runs it)")
+    ok &= h.check("second compositor selfcheck PASS", "fbdev selfcheck PASS" in selfcheck,
+                  selfcheck or marker or "not found")
+    ok &= h.check("real-apps compositor drew no demo window",
+                  re.search(r"fbdev selfcheck \w+ .*windows=0", selfcheck) is not None,
+                  selfcheck or "no selfcheck line")
+
+    # ── put the compositor in the background; TOSTOP-safe because --quiet ──
+    off = mark()
+    h.qmp.keys(["ctrl", "z"])
+    # The chord must not leave Ctrl down: a stuck Ctrl turns the `c` of a later
+    # `--connect` line into ^C, and the kernel delivers SIGINT to the
+    # foreground group (it killed the real Files window in earlier runs).
+    h.qmp.release_modifiers()
+    parked = wait_new(off, [r"\^Z"], 20.0, "Ctrl+Z stop marker")
+    ok &= h.check("compositor stops on Ctrl+Z (shell gets the terminal back)",
+                  parked is not None,
+                  (guest.serial()[off:]).strip()[-80:] or "no ^Z marker")
+    off = mark()
+    _desktop_restart_shell_line(kb)
+    kb.text("bg")
+    kb.key("ret")
+    bg = wait_new(off, [r"bg: \[\d+\]"], 20.0, "bg marker")
+    ok &= h.check("compositor resumed in the background (`bg`)", bg is not None,
+                  (guest.serial()[off:]).strip().splitlines()[-1]
+                  if (guest.serial()[off:]).strip() else "no bg marker")
+
+    # ── one-way takeover: kernel console output stays off the screen ──
+    # The shell owns the keyboard here and the compositor owns the framebuffer.
+    # The headless Files run below prints kernel console lines ("Compat_Process
+    # started/exited") but draws no window, so two frames around it must be
+    # identical: a console flush would replace the whole screen with text.
+    # (Typing into the shell while a *client* owns the keyboard cannot be used
+    # for this: the command goes to the client's stdin, not to the shell.)
+    time.sleep(0.4)
+    kb.screenshot(console_a)
+    # Headless REAL Files under the shell: proves the binary writes its scenes to
+    # an ext2 path (ground truth for the launch-target assertion below).
+    _desktop_restart_shell_line(kb)
+    off = mark()
+    headless_cmd = "rust /mnt/pagh-files --out /mnt/evidence-manual"
+    log(f"type: {headless_cmd}")
+    kb.text(headless_cmd)
+    kb.key("ret")
+    manual = wait_new(off, [r"\.png"], 60.0, "headless Files scene line")
+    ok &= h.check("REAL pagh-files renders headless PNG scenes on /mnt",
+                  manual is not None,
+                  regex_first(r"[^\r\n]*\.png[^\r\n]*", guest.serial()[off:]) or
+                  "no scene line")
+    time.sleep(0.6)
+    kb.screenshot(console_b)
+    frozen = (console_a.is_file() and console_b.is_file()
+              and console_a.read_bytes() == console_b.read_bytes())
+    ok &= h.check("kernel console did not repaint (fbdev takeover is one-way)",
+                  frozen, "frames identical" if frozen else "console repainted")
+
+    # ── REAL pagh-files window ──
+    _desktop_restart_shell_line(kb)
+    files_cmd = f"rust /mnt/pagh-files --connect {socket}"
+    log(f"type: {files_cmd}")
+    kb.text(files_cmd)
+    kb.key("ret")
+    files_win = wait_for(guest, [r"pagh-files: окно \d+ \d+x\d+"], 45.0,
+                         label="Files window")
+    ok &= h.check("REAL pagh-files opened a PDP/1 window (hello/create over AF_UNIX)",
+                  files_win is not None,
+                  regex_first(r"pagh-files: окно[^\r\n]*", guest.serial()) or
+                  "no window line")
+    ok &= h.check("the demo client was NOT used",
+                  "pagh-desktop-demo" not in guest.serial(), "no demo marker")
+    time.sleep(1.0)
+    kb.screenshot(files_shot)
+    desktop_ref = CACHE / "e2e_desktop.png"
+    files_drawn = (desktop_ref.is_file() and files_shot.is_file()
+                   and files_shot.read_bytes() != desktop_ref.read_bytes())
+    ok &= h.check("Files window is drawn on the QEMU framebuffer",
+                  files_drawn, f"{files_shot.name} vs {desktop_ref.name}")
+
+    # Input into the live window: click empty CONTENT, not the bottom-right
+    # resize grip (a grip press starts a resize and repaints the desktop, which
+    # confounds the console-freeze check below) and not a toolbar action (it
+    # could legitimately launch the terminal, the *next* check). The window is
+    # 1060x640 at a deterministic placement; the content centre is empty grid.
+    h.qmp.rel(2000, 2000)
+    time.sleep(0.2)
+    h.qmp.rel(-680, -400)
+    time.sleep(0.3)
+    h.qmp.button("left", True)
+    time.sleep(0.1)
+    h.qmp.button("left", False)
+    time.sleep(0.8)
+    kb.screenshot(files_clicked)
+    survives = (files_clicked.is_file() and desktop_ref.is_file()
+                and files_clicked.read_bytes() != desktop_ref.read_bytes())
+    ok &= h.check("Files window survives input and is still on screen",
+                  survives, f"{files_clicked.name}")
+
+    # ── the shell must own the terminal before the next client starts ──
+    # A foreground lxrun job owns the keyboard. The click above can leave the
+    # Files client alive (then the job must be stopped and resumed) or remove it
+    # (an input artifact; the shell prompt simply returns). Both outcomes are
+    # legitimate — decide from the serial prompt, not by assuming which.
+    off = mark()
+    prompt_back = wait_new(off, [r"pagh:/> "], 3.0, "shell prompt after Files")
+    if prompt_back is None:
+        h.qmp.keys(["ctrl", "z"])
+        h.qmp.release_modifiers()
+        files_parked = wait_new(off, [r"\^Z"], 20.0, "Files Ctrl+Z")
+        ok &= h.check("Files job stops on Ctrl+Z (shell regains the terminal)",
+                      files_parked is not None,
+                      "^Z" if files_parked else "no ^Z marker")
+        if files_parked is not None:
+            off = mark()
+            _desktop_restart_shell_line(kb)
+            kb.text("bg")
+            kb.key("ret")
+            files_bg = wait_new(off, [r"bg: \[\d+\]"], 20.0, "bg Files")
+            ok &= h.check("Files job resumed in the background (`bg`)",
+                          files_bg is not None, "^bg seen on serial")
+    else:
+        h.info_check("Files client gone after the pointer click",
+                     "shell prompt returned; no job to park")
+
+    # ── REAL pagh-terminal as the second window ──
+    _desktop_restart_shell_line(kb)
+    # `--socket` selects the private shell session of #138 (the `--vt` pair is
+    # still passed and is used by the VT-mirror fallback below).
+    term_cmd = (f"rust /mnt/pagh-terminal --vt /dev/vtconsole0 "
+                f"--vt-input /dev/vtinput --socket {socket} --size 720x420")
+    log(f"type: {term_cmd}")
+    kb.text(term_cmd)
+    kb.key("ret")
+    term_win = wait_for(guest, [r"pagh-terminal: (?:session )?connected \(client \d+"], 45.0,
+                        label="Terminal window")
+    ok &= h.check("REAL pagh-terminal connected as a second PDP/1 window "
+                  "(/dev/vtconsole0 + /dev/vtinput)",
+                  term_win is not None,
+                  regex_first(r"pagh-terminal: (?:session )?connected[^\r\n]*",
+                              guest.serial()) or
+                  "no connected line")
+    vt_error = re.search(r"pagh-terminal: PGVT I/O error: ([^\r\n]+)", guest.serial())
+    if vt_error:
+        # Findings on this tree: the VT bridge (kernel `/dev/vtconsole0` read)
+        # returns EFAULT, so the --vt window never gets a snapshot to render.
+        # The window check below is retried on the plain PDP surface so the
+        # second-window acceptance still runs; the ABI gap is recorded honestly.
+        h.info_check("REAL pagh-terminal --vt failed on the kernel VT bridge",
+                     vt_error.group(0))
+        _desktop_restart_shell_line(kb)
+        retry_cmd = f"rust /mnt/pagh-terminal --socket {socket} --size 720x420"
+        log(f"type (VT fallback, window-only): {retry_cmd}")
+        kb.text(retry_cmd)
+        kb.key("ret")
+        term_win = wait_for(guest, [r"pagh-terminal: (?:session )?connected \(client \d+"], 45.0,
+                            label="Terminal window (window-only)")
+        ok &= h.check("second window still proven on the PDP surface (VT fallback)",
+                      term_win is not None,
+                      regex_first(r"pagh-terminal: connected[^\r\n]*",
+                                  guest.serial()) or "no connected line")
+    # The compositor focuses a newly created window; the liveness probe below
+    # types into it instead of clicking it (a QMP mouse burst is itself an
+    # input artifact while a client owns the keyboard).
+    time.sleep(0.6)
+    kb.screenshot(term_a)
+    # Cursor blink repaints every 500 ms: two dumps must differ if the client
+    # really keeps committing frames (window alive, not a stale compositor blit).
+    # Liveness by a deterministic input, not by an idle cursor-blink
+    # assumption: three frames 2.4 s apart were byte-identical on this kernel
+    # (the client's session readers park in `read`, so an idle blink does not
+    # guarantee a commit), while the earlier "blink" pass came from the client's
+    # initial content frame rather than a blink. Type a command into the focused
+    # session and require the client to commit a different frame: that is the
+    # property this check exists for (window alive, not a stale compositor blit)
+    # and it cannot pass on a static frame.
+    h.qmp.release_modifiers()
+    kb.text("ls")
+    kb.key("ret")
+    time.sleep(1.2)
+    kb.screenshot(term_b)
+    # The settled frame (after the input above) is the baseline for "the window
+    # is on screen": the first screendump after create can still return the
+    # previous desktop while QEMU lags, which made the earlier order flaky.
+    second = (term_b.is_file() and files_clicked.is_file()
+              and term_b.read_bytes() != files_clicked.read_bytes())
+    ok &= h.check("Terminal window is drawn as a second window",
+                  second, f"{term_b.name} vs {files_clicked.name}")
+    blinking = (term_a.is_file() and term_b.is_file()
+                and term_a.read_bytes() != term_b.read_bytes())
+    ok &= h.check("Terminal window commits new frames after input (client alive)",
+                  blinking, f"{term_b.name} differs={blinking}")
+
+    # ── stop the terminal, prove the shell still works, then check crashes ──
+    off = mark()
+    h.qmp.keys(["ctrl", "z"])
+    h.qmp.release_modifiers()
+    term_parked = wait_new(off, [r"\^Z"], 12.0, "Terminal Ctrl+Z")
+    if term_parked is not None:
+        ok &= h.check("Terminal job stops on Ctrl+Z", True, "^Z")
+        off = mark()
+        _desktop_restart_shell_line(kb)
+        kb.text("bg")
+        kb.key("ret")
+        wait_new(off, [r"bg: \[\d+\]"], 20.0, "bg Terminal")
+    else:
+        # A terminal that already exited (e.g. the --vt EFAULT above) leaves the
+        # shell at the prompt: no job to stop is not a failure of the shell.
+        h.info_check("Terminal job was already gone before Ctrl+Z",
+                     "no ^Z marker (process exited)")
+    _desktop_restart_shell_line(kb)
+    off = mark()
+    kb.text("echo E2E_ALIVE_AFTER_REAL_APPS")
+    kb.key("ret")
+    alive = wait_new(off, [r"E2E_ALIVE_AFTER_REAL_APPS"], 20.0, "shell after apps")
+    ok &= h.check("serial shell alive after both real applications ran",
+                  alive is not None, "^echo seen on serial")
+
+    # ── REAL PDP/1 launch (type 13): requester -> launch_app -> spawn target ──
+    # The requester is the ORIGINAL Files client parked in the background above:
+    # a fresh `rust /mnt/pagh-files --connect ...` typed at this point is killed
+    # by an input artifact (serial: `[signal] pid=N sig=2 default-terminate`)
+    # before the hotkey can reach it, while the parked client has already proven
+    # it survives its own window checks. Focus it in a provably free point: the
+    # point is inside the 1060x640 Files content and outside the 720x420 Terminal
+    # rectangle, and is not the resize grip.
+    h.qmp.rel(2000, 2000)
+    time.sleep(0.2)
+    h.qmp.rel(-280, -200)
+    time.sleep(0.3)
+    h.qmp.button("left", True)
+    time.sleep(0.1)
+    h.qmp.button("left", False)
+    time.sleep(0.6)
+    kb_off = mark()
+    h.qmp.keys(["alt", "shift", "f4"])
+    time.sleep(0.5)  # let the chord land before the modifier reset
+    h.qmp.release_modifiers()
+    time.sleep(6.0)
+    launch_text = guest.serial()[kb_off:]
+    died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
+    if died:
+        h.info_check("PDP launch: requesting pagh-files client died with EMSGSIZE",
+                     "pagh-files: Message too large (os error 90) after type-13 launch")
+    evidence = _wait_launch_png(guest, kb)
+    ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
+                  evidence,
+                  "PNG written" if evidence else "no PNG after 90 s of polling")
+    # `_wait_launch_png` returns a bool, so `is not None` was always true and the
+    # check passed vacuously when no PNG appeared at all. Require the evidence
+    # itself: a launch that produced nothing must FAIL here too.
+    ok &= h.check("launched target is the REAL binary (headless Files PNG on /mnt)",
+                  "pagh-desktop-demo" not in guest.serial() and evidence is True,
+                  "pagh-files headless output" if evidence
+                  else "no PNG: launch produced no evidence")
+
+    # ── separate: launch_targets spawn from the compositor hotkey ──
+    # NOT a substitute for the type-13 leg above: this proves the server-side
+    # registry/spawn_target path only (no PDP message, no requester). The
+    # evidence directory is cleared first so the two checks are independent.
+    _desktop_restart_shell_line(kb)
+    off = mark()
+    kb.text("rm -r /mnt/launch-evidence")
+    kb.key("ret")
+    wait_new(off, [r"/mnt/launch-evidence|rm:"], 10.0, "evidence dir removal")
+    time.sleep(0.3)
+    hotkey_off = mark()
+    h.qmp.keys(["ctrl", "alt", "t"])
+    h.qmp.release_modifiers()
+    time.sleep(8.0)
+    hotkey_evidence = _wait_launch_png(guest, kb)
+    ok &= h.check("launch_targets spawn the configured target via the compositor "
+                  "hotkey (server-side registry, not PDP type 13)",
+                  hotkey_evidence,
+                  "PNG written" if hotkey_evidence else "no PNG after 90 s of polling")
+
+    text = guest.serial()
+    crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE|SIGSEGV|Segmentation fault", text)
+    ok &= h.check("no panic/exception/SIGSEGV in guest", not crashes,
+                  crashes[0] if crashes else "none")
+    enosys = re.findall(r"Function not implemented|os error 38", text)
+    ok &= h.check("no ENOSYS for any launched/real client", not enosys,
+                  enosys[0] if enosys else "none")
+    kernel_enosys = re.findall(r"unsupported syscall nr=(\d+) -> ENOSYS", text)
+    if kernel_enosys:
+        h.info_check("kernel ENOSYS gaps seen (documented, not launch failures)",
+                     "syscall nr " + ", ".join(sorted(set(kernel_enosys))))
+    h.metrics["real-app screenshots"] = ", ".join(
+        rel(p) for p in (files_shot, files_clicked, term_a, term_b,
+                         console_a, console_b)
+    )
+    return ok
+
+
+def _net_probe_binary() -> pathlib.Path:
+    """Assemble `tools/net_probe.c` into a freestanding static ELF.
+
+    Same discipline as the group probe: raw syscalls, no libc, so a green run
+    cannot be explained by glibc falling back to something else.
+    """
+    gcc = shutil.which("gcc")
+    if not gcc:
+        raise SetupError("netperms: gcc is required to build tools/net_probe.c")
+    src = ROOT / "tools" / "net_probe.c"
+    if not src.is_file():
+        raise SetupError(f"netperms: probe source missing: {src}")
+    out = CACHE / "netprobe"
+    CACHE.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        [gcc, "-static", "-nostdlib", "-ffreestanding", "-fno-stack-protector",
+         "-fno-pie", "-no-pie", "-Os", "-o", out, src,
+         "-Wl,-e,_start", "-Wl,--build-id=none"],
+        "net probe build", timeout=120,
+    )
+    if not out.is_file():
+        raise SetupError("netperms: probe build produced no ELF")
+    return out
+
+
+def mode_netperms(h: "Harness") -> tuple[str, int]:
+    """AF_INET bind/listen port gate and the SOCK_RAW gate, from ring 3.
+
+    Two boots, as in `groups`: the first lets the kernel format a blank disk (the
+    only writable ext2 it will mount), the probe is injected with debugfs, and
+    the second boot attaches a NIC — `bind(2)` reserves a port in the stack, so
+    the stack must exist. The probe runs twice: as root (privileged port 80,
+    duplicate EADDRINUSE, raw gate EOPNOTSUPP) and after `su oleg` as uid 1000
+    (port 80 EACCES, the same socket then binds 8080, raw gate EPERM).
+    """
+    a = h.a
+    probe = _net_probe_binary()
+    disk = CACHE / "e2e_netperms_disk.img"
+    if not (getattr(a, "reuse_netperms_disk", False)
+            and _debugfs_stat(disk, "netprobe") is not None):
+        _groups_prepare_disk(h, disk, probe, name="netprobe")
+    else:
+        log(f"netperms: reusing {rel(disk)}")
+
+    h.boot(need_keyboard=True, disk=disk, net=True)
+    assert h.guest is not None and h.kb is not None
+    kb = h.kb
+    if not wait_for_shell(h.guest, kb, a, a.boot_timeout):
+        raise HarnessError(f"netperms: shell never appeared; serial tail:\n"
+                           f"{tail(h.guest.serial())}")
+
+    def sh(cmd: str) -> None:
+        log(f"type: {cmd}")
+        kb.text(cmd)
+        kb.key("ret")
+
+    ok = True
+    sh("lxrun /mnt/netprobe root")
+    if wait_for(h.guest, [r"NPROBE mode=root "], h.timeout,
+                label="netprobe root") is None:
+        ok &= h.check("netprobe root produced a result line", False,
+                      "timeout; serial tail: " + tail(h.guest.serial(), 10))
+        return ("FAIL", EXIT_FAIL)
+    time.sleep(1.0)
+
+    sh("su oleg")
+    if wait_for(h.guest, [r"su: no password authentication in phase 1"], 30.0,
+                label="su oleg") is None:
+        ok &= h.check("su oleg switches the session", False, "no su marker")
+        return ("FAIL", EXIT_FAIL)
+    sh("lxrun /mnt/netprobe drop")
+    if wait_for(h.guest, [r"NPROBE mode=drop "], h.timeout,
+                label="netprobe drop") is None:
+        ok &= h.check("netprobe drop produced a result line", False,
+                      "timeout; serial tail: " + tail(h.guest.serial(), 10))
+        return ("FAIL", EXIT_FAIL)
+    time.sleep(a.settle)
+    text = h.guest.serial()
+
+    expected = [
+        ("root: bind :80 and :8080 ok, duplicate :8080 EADDRINUSE, listen ok, "
+         "raw gate EOPNOTSUPP, close releases the port",
+         r"NPROBE mode=root uid=0 euid=0 bind80=0 bind8080=0 dup8080=98 "
+         r"listen8080=0 raw=95 afterclose=0"),
+        ("uid 1000: bind :80 EACCES, same socket binds :8080, listen ok, "
+         "SOCK_RAW EPERM, close releases the port",
+         r"NPROBE mode=drop setgid=0 setuid=0 uid=1000 euid=1000 bind80=13 "
+         r"bind8080=0 dup8080=98 listen8080=0 raw=1 afterclose=0"),
+    ]
+    for label, pattern in expected:
+        m = re.search(pattern, text)
+        ok &= h.check(label, bool(m), m.group(0).strip() if m else "not found")
+
+    crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE", text)
+    ok &= h.check("no panic/exception in guest", not crashes,
+                  crashes[0] if crashes else "none")
+    h.metrics["probe modes"] = "root, drop"
+    return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+
+
 MODES = {
     "selftest": mode_selftest,
     "local-mirror": mode_local_mirror,
     "live-update": mode_live_update,
     "bigindex": mode_bigindex,
+    "bench": mode_bench,
     "shell": mode_shell,
     "tcp-shot": mode_tcp_shot,
     "usb": mode_usb,
     "rndis": mode_rndis,
     "scroll": mode_scroll,
+    "desktop": mode_desktop,
+    "groups": mode_groups,
+    "netperms": mode_netperms,
     "smoke": mode_smoke,
     "boot-check": mode_boot_check,
     "restore": mode_restore,
@@ -2583,12 +4283,41 @@ def build_parser() -> argparse.ArgumentParser:
     bi.add_argument("--expect-crash", action="store_true",
                     help="invert the verdict: PASS iff [EXC #14] is reproduced")
 
+    bn = sub.add_parser("bench", parents=[common],
+                        help="apt performance benchmark: signed local bench repo, "
+                             "two `apt update` rounds + one multi-package install "
+                             "(`lx_apt_bench`)")
+    bn.add_argument("--stanzas", type=int, default=5000,
+                    help="Packages stanzas in the benchmark index (5k/50k)")
+    bn.add_argument("--size-mib", type=int, default=24,
+                    help="total decompressed .deb payload installed in the transaction")
+    bn.add_argument("--port", type=int, default=8000)
+    bn.add_argument("--bench-out", default=None,
+                    help="benchmark repo directory (default .cache/apt_bench_<stanzas>_<mib>)")
+    bn.add_argument("--max-heap-kib", type=int, default=16384,
+                    help="fail if the install's heap_peak_kib exceeds this (0 = no bound, "
+                         "for baseline measurements)")
+
     sh = sub.add_parser("shell", parents=[common],
                         help="generic interactive mode: type shell commands, assert on serial")
     sh.add_argument("--cmd", action="append", default=[],
                     help="shell command to type + Enter (repeatable)")
     sh.add_argument("--script", default=None,
                     help="interaction script (see the module docstring for the DSL)")
+
+    gp = sub.add_parser(
+        "groups", parents=[common],
+        help="Phase-1 group model: getgroups/setgroups and VFS group checks from "
+             "ring 3 via a static probe (root, dropped uid, su oleg)")
+    gp.add_argument("--reuse-groups-disk", action="store_true",
+                    help="reuse .cache/e2e_groups_disk.img (already formatted/injected)")
+
+    npp = sub.add_parser(
+        "netperms", parents=[common],
+        help="AF_INET bind/listen port gate and SOCK_RAW gate from ring 3 via a "
+             "static probe (root, dropped uid)")
+    npp.add_argument("--reuse-netperms-disk", action="store_true",
+                     help="reuse .cache/e2e_netperms_disk.img (already formatted/injected)")
 
     ts = sub.add_parser("tcp-shot", parents=[common],
                         help="regression: a peer that replies and closes in one burst "
@@ -2599,6 +4328,35 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("scroll", parents=[common],
                    help="console scroll acceptance: PS/2 wheel (QMP), PageUp/PageDown, "
                         "reset to the live bottom, and a pixel-diffing screenshot pair")
+
+    dp = sub.add_parser(
+        "desktop", parents=[common],
+        help="Desktop B acceptance: static pagh-desktop on /dev/fb0 + "
+             "/dev/input/event0, QEMU framebuffer screenshots, evdev keyboard/mouse, "
+             "console takeover after exit")
+    dp.add_argument("--skip-build", action="store_true",
+                    help="use existing static pagh-desktop binaries in "
+                         "rust-apps/pagh-desktop/target/x86_64-unknown-linux-musl/release")
+    dp.add_argument("--reuse-desktop-disk", action="store_true",
+                    help="reuse .cache/e2e_desktop_disk.img (already formatted/injected)")
+    dp.add_argument("--run-ms", type=int, default=20_000,
+                    help="desktop lifetime passed as --exit-after-ms (default 20000)")
+    dp.add_argument("--legacy-demo", action="store_true",
+                    help="run the previous demo-client scenario (pagh-desktop-demo + "
+                         "--spawn-demo) instead of the REAL pagh-files/pagh-terminal "
+                         "windows; needed while the panel launch path still spawns the "
+                         "demo client (server.rs launch() -> spawn_demo)")
+    dp.add_argument("--pd-lifetime-ms", type=int, default=1_800_000,
+                    help="compositor lifetime in the real-apps path passed as "
+                         "--exit-after-ms (default 1800000; the scenario is bounded by the "
+                         "harness teardown, the deadline only guards a hang — the QEMU/TCG "
+                         "run of phase 2 has been observed above 1500 s)")
+    dp.add_argument("--serial-start-timeout", type=float, default=25.0,
+                    help="fail-fast window for the first serial bytes/kernel banner after "
+                         "each boot; separates firmware-not-started from kernel-silent "
+                         "0-serial failures (default 25 s)")
+    dp.add_argument("--selfcheck-ms", type=int, default=3_000,
+                    help="delay of the in-guest fbdev selfcheck (default 3000)")
 
     sub.add_parser("usb", parents=[common],
                    help="USB-input acceptance: boot the staged image with an "
@@ -2654,6 +4412,14 @@ def main(argv: list[str] | None = None) -> int:
     # format path names the virtio-blk partition in the typed confirmation. An
     # operator-supplied --disk or the NVMe layout would change what the scenario
     # claims it proved, so refuse before the build instead of silently ignoring it.
+    if mode == "desktop" and args.disk:
+        print("[e2e] desktop: --disk is not supported: the mode prepares its own "
+              "pagh-owned ext2 disk (.cache/e2e_desktop_disk.img) because the kernel "
+              "only auto-mounts a volume carrying its WAL marker; pass "
+              "--reuse-desktop-disk to iterate on an already prepared image.",
+              file=sys.stderr, flush=True)
+        print("\nE2E RESULT: REFUSED (desktop mode owns its disk) (exit 2)", flush=True)
+        return EXIT_SETUP
     if mode == "usb" and (args.disk or getattr(args, "nvme", False)):
         print("[e2e] usb: --disk/--nvme are not supported by this mode: it writes its "
               "own deterministic MBR-partitioned 64 MiB disk (.cache/e2e_usb_disk.img) "

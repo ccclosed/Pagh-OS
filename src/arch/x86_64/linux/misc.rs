@@ -499,6 +499,66 @@ pub fn sys_setresgid(gid: u64, egid: u64, sgid: u64) -> Result<u64, Errno> {
     }
 }
 
+/// `getgroups` (115): записать дополнительные группы в пользовательский массив.
+///
+/// Контракт Linux: `size == 0` — вернуть число групп и не трогать `list`;
+/// `size < ngroups` — `EINVAL`; иначе записать ровно `ngroups` gid'ов (не `size`)
+/// и вернуть их число. `list` проверяется на запись до первой записи, поэтому
+/// частичный результат при плохом указателе ненаблюдаем.
+pub fn sys_getgroups(size: u64, list: u64) -> Result<u64, Errno> {
+    let creds = compat::current_creds();
+    let groups = creds.groups();
+    let n = groups.len() as u64;
+    if size == 0 {
+        return Ok(n);
+    }
+    if size < n {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr_writable(list, n * 4)?;
+    for (i, gid) in groups.iter().enumerate() {
+        let ptr = list + (i as u64) * 4;
+        // SAFETY: весь диапазон `[list, list + n*4)` проверен на запись выше;
+        // `write_unaligned` допускает невыровненный `gid_t*`, как и Linux.
+        unsafe {
+            core::ptr::write_unaligned(ptr as *mut u32, *gid);
+        }
+    }
+    Ok(n)
+}
+
+/// `setgroups` (116): заменить дополнительные группы процесса.
+///
+/// Порядок проверок как в Linux: сначала привилегия (`CAP_SETGID` сведён к
+/// `euid == 0`) → `EPERM`, затем предел `NGROUPS_MAX` (pagh:
+/// [`super::cred::GROUPS_CAP`] = 32) → `EINVAL`, затем чтение массива
+/// (`EFAULT`). `size == 0` разрешён и очищает набор, `list` при этом не читается.
+/// Число gid'а не ограничивается: gid 0 разрешён, как и в Linux с `CAP_SETGID`.
+pub fn sys_setgroups(size: u64, list: u64) -> Result<u64, Errno> {
+    let creds = compat::current_creds();
+    if !creds.is_root() {
+        return Err(Errno::EPERM);
+    }
+    if size > super::cred::GROUPS_CAP as u64 {
+        return Err(Errno::EINVAL);
+    }
+    let mut groups = [0u32; super::cred::GROUPS_CAP];
+    if size > 0 {
+        check_user_ptr(list, size * 4)?;
+        for (i, slot) in groups.iter_mut().take(size as usize).enumerate() {
+            let ptr = list + (i as u64) * 4;
+            // SAFETY: диапазон `[list, list + size*4)` проверен на чтение выше;
+            // `read_unaligned` допускает невыровненный `const gid_t*`.
+            *slot = unsafe { core::ptr::read_unaligned(ptr as *const u32) };
+        }
+    }
+    match creds.setgroups(&groups[..size as usize]) {
+        Some(next) => commit_creds(next),
+        // Недостижимо: euid и size проверены выше; страхует от дрейфа правил.
+        None => Err(Errno::EINVAL),
+    }
+}
+
 /// `getppid` (110): вернуть отслеживаемый pid родителя.
 pub fn sys_getppid() -> Result<u64, Errno> {
     Ok(compat::current_ppid())

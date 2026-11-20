@@ -1,0 +1,23 @@
+Pagh Desktop headless scenario (PDP/1)
+screen: 1280x720, panel 44 px, clock 23:38 / 15.11.2026
+
+- два окна, фокус на Terminal, панель 44px с часами 23:38 / 15.11.2026 и Wi-Fi
+- клик по содержимому Files: raise + focus, заголовок подсвечен
+- drag заголовка Terminal: окно следует за указателем, damage по старой/новой рамке
+- правый клик по рабочему столу: контекстное меню Open Terminal/Files/Paint…
+- Open Terminal: сервер отдал Launch(Terminal), появилось третье окно
+- клик по иконке сети: флайаут «Сети» — статус и карточка проводного подключения; IP и скорости не рисуются, пока ядро их не отдаёт
+- клик по часам: календарь November 2026, 15-е выделено
+- кнопка ^: окно развёрнуто над панелью, клиент прислал кадр под configure
+- повторный клик ^: окно восстановлено в прежнюю геометрию
+
+screenshots:
+- 01-desktop.png
+- 02-focus-files.png
+- 03-drag-window.png
+- 04-context-menu.png
+- 05-launched-terminal.png
+- 06-network-flyout.png
+- 07-calendar.png
+- 08-maximized.png
+- 09-restored.png
