@@ -370,7 +370,9 @@ fn run_compositor(
             app.draw(canvas);
             client.commit(window, canvas)?;
             app.take_damage();
-            force_full = false;
+            // `force_full` остаётся включённым: legacy-путь всё равно рисует
+            // полный кадр, но если композитор снова предложит shm-поверхность,
+            // первый кадр на ней обязан быть полным.
         }
     }
 }
