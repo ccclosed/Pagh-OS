@@ -354,3 +354,87 @@ fn resize_event_requests_full_frame() {
     let damage = app.take_damage();
     assert!(damage.is_full(), "resize обязан требовать полный кадр");
 }
+
+/// Честная цена события: полный кадр + хеши тайлов против виджетного damage.
+///
+/// Время печатается (запускайте с `--nocapture`), а проверяется только объём
+/// работы: полный кадр — площадь окна, инкрементальный — площадь damage.
+#[test]
+fn event_cost_full_frame_vs_widget_damage() {
+    use pagh_ui::damage::{DamageTracker, DEFAULT_TILE};
+    use std::time::Instant;
+
+    let (mut app, mut frame, layer) = prepared();
+    app.set_view(ViewMode::List);
+    frame = render_window(&app);
+    app.take_damage();
+    let row = list_row(&app, 1);
+    let event = Event::MouseMove {
+        pos: Point::new(row.x + row.w / 2, row.y + row.h / 2),
+    };
+
+    // ДО: полный кадр + хеши всех тайлов 16x16 по всему канвасу.
+    let window = WINDOW.w as i64 * WINDOW.h as i64;
+    let mut tracker = DamageTracker::new(Rect::new(0, 0, WINDOW.w, WINDOW.h), DEFAULT_TILE);
+    let _ = tracker.update(&frame);
+    let iters = 40;
+    let start = Instant::now();
+    for _ in 0..iters {
+        app.draw(&mut frame);
+        let damage = tracker.update(&frame).clone();
+        std::hint::black_box(&damage);
+    }
+    let full_ns = start.elapsed().as_nanos() / iters as u128;
+
+    // ПОСЛЕ: только виджетный damage, без чтения кадра.
+    app.handle_event(&event);
+    let damage = app.take_damage();
+    let start = Instant::now();
+    for _ in 0..iters {
+        app.draw_incremental(&mut frame, &layer, damage.rects());
+    }
+    let incremental_ns = start.elapsed().as_nanos() / iters as u128;
+
+    eprintln!(
+        "files event (hover строки): full frame {} px + {} KiB hash = {full_ns} ns/event; \
+         widget damage {} px = {incremental_ns} ns/event",
+        window,
+        (WINDOW.w as usize * WINDOW.h as usize * 4) / 1024,
+        damage.area()
+    );
+    assert!(
+        damage.area() * 10 < window,
+        "виджетный damage должен быть на порядок меньше окна"
+    );
+    // Отношение времени не проверяем (таймеры шумят на CI), но оно печатается.
+    assert!(incremental_ns > 0 && full_ns > 0);
+}
+
+/// Проверка арифметики: damage клика не может быть больше площади окна.
+#[test]
+fn damage_never_exceeds_window() {
+    let (mut app, _frame, _layer) = prepared();
+    let events = [
+        key(Key::Down),
+        key(Key::Up),
+        Event::Wheel {
+            pos: Point::new(400, 300),
+            delta: 1,
+        },
+        Event::Text {
+            text: "x".to_string(),
+        },
+    ];
+    for event in events {
+        app.handle_event(&event);
+        let damage = app.take_damage();
+        if damage.is_full() {
+            continue;
+        }
+        assert!(
+            damage.area() <= WINDOW.w as i64 * WINDOW.h as i64,
+            "damage {event:?} больше окна: {}",
+            damage.area()
+        );
+    }
+}
