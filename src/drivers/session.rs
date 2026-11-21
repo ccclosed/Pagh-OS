@@ -132,6 +132,24 @@ pub fn bind(pid: u64, session: usize) {
     BIND_COUNT.store(binds.len() as u32, Ordering::Relaxed);
 }
 
+/// Сессия, к которой привязана задача (`0` — boot-сессия или нет привязки).
+///
+/// Нужна маршрутизации ввода: глобальный `ps2_kbd::FG_PID` помнит последнюю
+/// foreground-программу, но не то, из какого окна её запустили. Без этой сверки
+/// окно отдавало бы ввод чужой программе: клиент окна — foreground-задача
+/// boot-shell'а, поэтому его `write` в `/dev/vtinput1` уходил бы в глобальный
+/// `STDIN_PENDING`, и session-shell не видел бы ни одной клавиши.
+pub fn bound_session(pid: u64) -> usize {
+    if pid == 0 || BIND_COUNT.load(Ordering::Relaxed) == 0 {
+        return session_route::BOOT_SESSION;
+    }
+    BINDS
+        .lock()
+        .get(&pid)
+        .map(|s| *s as usize)
+        .unwrap_or(session_route::BOOT_SESSION)
+}
+
 /// Снять привязку задачи (вызывается на её выходе, чтобы таблица не росла).
 pub fn unbind(pid: u64) {
     let mut binds = BINDS.lock();

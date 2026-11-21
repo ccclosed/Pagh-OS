@@ -187,6 +187,33 @@ fn execute_command(cmd: &str) {
     let name = parts[0];
     let args = &parts[1..];
 
+    // Serial-след для E2E: win-shell печатает только в пиксели, поэтому без
+    // этой пары строк стенд не может отличить «команда дошла до shell'а окна и
+    // вернулась» от «экран просто перерисовался». Имя команды, без аргументов и
+    // вывода; boot-сессия этих строк не печатает вообще.
+    let session = crate::drivers::session::current();
+    let window = session != crate::drivers::session_route::BOOT_SESSION;
+    if window {
+        crate::drivers::serial::diag_line(&format!(
+            "[DIAG] window session={} command={}",
+            session, name
+        ));
+    }
+    dispatch_command(name, args, &parts);
+    if window {
+        crate::drivers::serial::diag_line(&format!(
+            "[DIAG] window session={} done={}",
+            session, name
+        ));
+    }
+}
+
+/// Выполнить одну уже токенизированную строку через реестр/PATH-поиск.
+///
+/// Отделена от [`execute_command`] ради serial-следа: `[DIAG] … done=` должен
+/// печататься и на пути PATH-fallback'а, который раньше возвращался из середины
+/// диспетчера.
+fn dispatch_command(name: &str, args: &[&str], parts: &[&str]) {
     match registry::lookup(name) {
         Some(spec) => {
             let mut ctx = registry::ShellCtx::new();
@@ -202,7 +229,7 @@ fn execute_command(cmd: &str) {
             if lxpath::is_bare_name(name) {
                 let dirs = lxpath::search_dirs(None);
                 if let Some(path) = commands::find_path_program(name, &dirs) {
-                    commands::run_lxrun(&path, &parts);
+                    commands::run_lxrun(&path, parts);
                     return;
                 }
                 // Не нашли: назвать токен, сказать ГДЕ искали и не запускать

@@ -301,9 +301,22 @@ pub fn irq_handler() {
             (false, 0x2E) if make && DRV_CTRL.load(Ordering::Relaxed) => {
                 CTRL_C.store(true, Ordering::Relaxed);
                 let fg = FG_PID.load(Ordering::Relaxed);
+                // Клавиатурой владеет клиент окна, а foreground-группа этой
+                // ветки — он сам (клиент запущен из boot-shell): ^C, набранный
+                // В окне, пришёл сюда как физический scancode, но адресован он
+                // session-shell'у окна (его байты уже идут через
+                // `/dev/vtinput1`). Убить здесь клиента — значит закрыть всё
+                // окно по ^C, набранному внутри него. Программа, запущенная
+                // `lxrun` В окне, привязана к сессии 1 и защиту не получает:
+                // её ^C по-прежнему доставляется ниже, foreground-группе.
+                let window_owns_keys = fg != 0
+                    && crate::drivers::vtinput::client_active()
+                    && crate::drivers::session::bound_session(fg)
+                        == crate::drivers::session_route::BOOT_SESSION;
                 if fg != 0
                     && crate::task::compat::compat_exists(fg)
                     && !crate::task::compat::compat_is_raw(fg)
+                    && !window_owns_keys
                 {
                     // Phase-2 signals: ^C delivers a real SIGINT to the
                     // terminal's FOREGROUND PROCESS GROUP — a job that forked

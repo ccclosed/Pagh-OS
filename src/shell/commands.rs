@@ -2207,6 +2207,21 @@ fn foreground_wait(pid: u64, pgid: u64, command: &str) {
     crate::drivers::tty::set_foreground_pgid(pgid);
     let mut parked = false;
     while crate::task::compat::compat_exists(pid) && !parked {
+        // Клавиатура, которую держит клиент окна, адресована ОКНУ, а не этой
+        // boot-сессии: её ^C/^Z не должны останавливать задание boot-shell'а.
+        // Живой симптом: `^C`, набранный в окне (в т.ч. из-за потерянного break
+        // модификатора под TCG), приходил сюда как защёлка декодера и убивал
+        // compositor вместе с окном. Защёлки дренируются, а не копятся.
+        let foreign_keys = crate::drivers::vtinput::client_active()
+            && crate::drivers::session::current() == crate::drivers::session_route::BOOT_SESSION;
+        if foreign_keys {
+            let _ = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed);
+            let _ = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed);
+            let _ = crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
+            let _ = crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
+            crate::task::scheduler::yield_current();
+            continue;
+        }
         let stopped = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed)
             | crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
         if stopped {
@@ -2310,9 +2325,14 @@ pub(super) fn cmd_fg(_ctx: &mut ShellCtx, _args: &[&str]) {
 /// `PATH` здесь — ещё и источник для поиска голого имени (см.
 /// [`lxrun_search_dirs`]); жёсткое `/mnt/usr/bin` — подмножество
 /// [`super::lxpath::DEFAULT_PATH`], так что поиск не сужается.
-fn lxrun_env() -> [&'static [u8]; 12] {
+fn lxrun_env() -> [&'static [u8]; 13] {
     [
         b"TERM=xterm",
+        // Terminfo-база Debian (`ncurses-base`) живёт под /mnt, а ncurses ищет
+        // её по вкомпилированному /usr/share/terminfo: без явного TERMINFO
+        // ncurses-программы в этой ОС падают на старте («Error opening
+        // terminal: xterm.»), хотя сам бинарь и libtinfo загружены.
+        b"TERMINFO=/mnt/usr/share/terminfo",
         b"PYTHON_BASIC_REPL=1",
         b"PATH=/mnt/usr/bin",
         b"LD_LIBRARY_PATH=/mnt/usr/lib/x86_64-linux-gnu:/mnt/usr/lib:/mnt/usr/lib64:/mnt/lib64",

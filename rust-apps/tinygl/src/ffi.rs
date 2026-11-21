@@ -23,6 +23,14 @@
 //!   внешнего символа нет; не биндим.
 //! * `glDepthFunc`/`glDepthMask` — отсутствуют; Z пишется всегда, сравнение
 //!   фиксированное (`ZCMP` в `ztriangle.c`).
+//! * `glDeleteLists` — **пустой `inline` в `gl.h`**, внешнего символа нет;
+//!   освобождения списка в 0.4.1 нет (`delete_list` в `list.c` — `static`).
+//!   Наш слой эмулирует удаление имён, но C-слот освобождается только при
+//!   переопределении имени или закрытии контекста (см. `Context::delete_lists`).
+//! * `glTexImage2D` принимает одно сочетание параметров (RGB/UNSIGNED_BYTE/
+//!   level 0/border 0/components 3); всё остальное — `exit(1)`. Фильтры
+//!   текстур (`GL_TEXTURE_MIN_FILTER`/`MAG_FILTER`) не сохраняются вообще:
+//!   растеризатор всегда берёт `GL_NEAREST`, wrap всегда `GL_REPEAT`.
 //!
 //! ## Порядок аргументов, который легко перепутать
 //!
@@ -142,6 +150,86 @@ extern "C" {
     pub fn glTexCoord4f(s: f32, t: f32, r: f32, q: f32);
 }
 
+// --- texture.c / api.c: textures (PR3) ------------------------------------
+
+extern "C" {
+    /// `glGenTextures(n, textures)` — пишет `n` имён. Имя — **не объект**:
+    /// `GLTexture` создаётся только в `glBindTexture` (`find_texture` →
+    /// `alloc_texture`), поэтому имена, которые никто не биндил, в таблице
+    /// текстур отсутствуют. Upstream берёт `max(handle) + i + 1`, то есть при
+    /// `max` у `i32::MAX` переполнение `int`; наш слой такой `max` не допускает.
+    pub fn glGenTextures(n: c_int, textures: *mut u32);
+
+    /// `glDeleteTextures(n, textures)`. Для текущей текстуры upstream вызывает
+    /// `glBindTexture(GL_TEXTURE_2D, 0)` (создавая объект 0) и лишь затем
+    /// освобождает удаляемую; для имени `0` это оставляет `current_texture`
+    /// висячим указателем (upstream-баг) — наш слой имя `0` не передаёт.
+    pub fn glDeleteTextures(n: c_int, textures: *const u32);
+
+    /// `glBindTexture(target, texture)`: `assert(target == GL_TEXTURE_2D &&
+    /// texture >= 0)`; при отсутствии объекта upstream его создаёт.
+    pub fn glBindTexture(target: c_int, texture: c_int);
+
+    /// `glTexImage2D(...)`. Сочетание параметров жёстко зашито в
+    /// `glopTexImage2D`: только `GL_TEXTURE_2D`, `level == 0`,
+    /// `components == 3`, `border == 0`, `GL_RGB`, `GL_UNSIGNED_BYTE`; любое
+    /// другое — `gl_fatal_error` → `exit(1)`. Размер, отличный от 256×256,
+    /// upstream **ресемплит без интерполяции** в 256×256; mipmap-уровней нет.
+    /// `pixels` читается целиком как `width * height * 3` байт с плотными
+    /// строками (`glPixelStorei` поддерживает только `UNPACK_ALIGNMENT 1`).
+    pub fn glTexImage2D(
+        target: c_int,
+        level: c_int,
+        components: c_int,
+        width: c_int,
+        height: c_int,
+        border: c_int,
+        format: c_int,
+        type_: c_int,
+        pixels: *mut c_void,
+    );
+
+    /// `glTexEnvi`: `glopTexEnv` принимает только `GL_TEXTURE_ENV` /
+    /// `GL_TEXTURE_ENV_MODE` / `GL_DECAL`, иначе `exit(1)`.
+    pub fn glTexEnvi(target: c_int, pname: c_int, param: c_int);
+
+    /// `glTexParameteri`: `glopTexParameter` принимает только
+    /// `GL_TEXTURE_2D` и `GL_TEXTURE_WRAP_S`/`GL_TEXTURE_WRAP_T` со значением
+    /// `GL_REPEAT`; фильтры (`GL_TEXTURE_MIN_FILTER`/`GL_TEXTURE_MAG_FILTER`)
+    /// **молча игнорируются** — растеризатор всегда берёт один тексель
+    /// (`GL_NEAREST`), и wrap всегда повторяет (маска координат на 256).
+    pub fn glTexParameteri(target: c_int, pname: c_int, param: c_int);
+}
+
+// --- list.c: display lists (PR3) ------------------------------------------
+
+extern "C" {
+    /// `glGenLists(range)` возвращает первое имя диапазона **или 0**. Внимание:
+    /// upstream возвращает `0` и при успехе, если диапазон начинается с нуля
+    /// (`list = i - range + 1`), поэтому отличить успех от отказа по
+    /// возвращённому значению нельзя — наш слой считает занятость сам (см.
+    /// `lists.rs`) и сверяет предсказанное имя с возвращённым.
+    pub fn glGenLists(range: c_int) -> u32;
+
+    /// `glNewList(list, mode)`: `assert(mode == GL_COMPILE ||
+    /// mode == GL_COMPILE_AND_EXECUTE)` и `assert(compile_flag == 0)`;
+    /// список записывает все последующие операции через `gl_add_op`.
+    pub fn glNewList(list: u32, mode: c_int);
+
+    /// `glEndList`: `assert(compile_flag == 1)`.
+    pub fn glEndList();
+
+    /// `glCallList(list)`: на неизвестном имени — `gl_fatal_error` → `exit(1)`;
+    /// на списке, вызов которого уходит в рекурсию, — переполнение C-стека.
+    pub fn glCallList(list: u32);
+
+    /// `glIsList(list)`: 1, если слот занят (`glGenLists`/`glNewList` создают
+    /// слот сразу, даже пустой). В upstream `glDeleteLists` — **пустой
+    /// `inline` в `gl.h`**, внешнего символа нет; освобождения списка в 0.4.1
+    /// не существует вообще (`delete_list` в `list.c` — `static`).
+    pub fn glIsList(list: u32) -> c_int;
+}
+
 /// `zbuffer.h`: `ZB_MODE_RGBA` (32 bit rgba mode). Внутренний формат задан
 /// `TGL_FEATURE_RENDER_BITS 32` (см. `c_src/PATCHES.md`), внешний — `PIXEL` =
 /// `u32 0x00RRGGBB` (little-endian) = XRGB8888 композитора.
@@ -187,3 +275,46 @@ pub const GL_FRONT_AND_BACK: c_int = 0x0408;
 pub const GL_CCW: c_int = 0x0901;
 /// `GL_CW`.
 pub const GL_CW: c_int = 0x0900;
+
+/// `GL_TEXTURE` — третий режим матричного стека (`glMatrixMode`).
+pub const GL_TEXTURE: c_int = 0x1702;
+/// `GL_TEXTURE_MATRIX` — 16 float, column-major.
+pub const GL_TEXTURE_MATRIX: c_int = 0x0BA8;
+/// `GL_MAX_TEXTURE_STACK_DEPTH` (upstream `zgl.h`: 8).
+pub const GL_MAX_TEXTURE_STACK_DEPTH: c_int = 0x0D39;
+
+/// `GL_TEXTURE_2D` — единственная текстурная цель upstream.
+pub const GL_TEXTURE_2D: c_int = 0x0DE1;
+/// `GL_RGB` — единственный внешний формат `glTexImage2D`.
+pub const GL_RGB: c_int = 0x1907;
+/// `GL_UNSIGNED_BYTE` — единственный тип пикселей `glTexImage2D`.
+pub const GL_UNSIGNED_BYTE: c_int = 0x1401;
+/// `GL_TEXTURE_ENV` — target `glTexEnvi`.
+pub const GL_TEXTURE_ENV: c_int = 0x2300;
+/// `GL_TEXTURE_ENV_MODE` — единственный pname `glTexEnvi`.
+pub const GL_TEXTURE_ENV_MODE: c_int = 0x2200;
+/// `GL_DECAL` — единственный режим `glTexEnvi` (и единственное, что умеет
+/// 32-битный растеризатор: тексель заменяет цвет вершины).
+pub const GL_DECAL: c_int = 0x2101;
+/// `GL_TEXTURE_WRAP_S`.
+pub const GL_TEXTURE_WRAP_S: c_int = 0x2802;
+/// `GL_TEXTURE_WRAP_T`.
+pub const GL_TEXTURE_WRAP_T: c_int = 0x2803;
+/// `GL_TEXTURE_MIN_FILTER` — upstream молча игнорирует (всегда NEAREST).
+pub const GL_TEXTURE_MIN_FILTER: c_int = 0x2801;
+/// `GL_TEXTURE_MAG_FILTER` — upstream молча игнорирует (всегда NEAREST).
+pub const GL_TEXTURE_MAG_FILTER: c_int = 0x2800;
+/// `GL_NEAREST` — фильтр, который фактически всегда используется.
+pub const GL_NEAREST: c_int = 0x2600;
+/// `GL_REPEAT` — единственный допустимый wrap.
+pub const GL_REPEAT: c_int = 0x2901;
+
+/// `GL_COMPILE` — режим `glNewList`: только запись, без исполнения.
+pub const GL_COMPILE: c_int = 0x1300;
+/// `GL_COMPILE_AND_EXECUTE` — запись и немедленное исполнение.
+pub const GL_COMPILE_AND_EXECUTE: c_int = 0x1301;
+
+/// `zgl.h: MAX_DISPLAY_LISTS` — размер массива слотов списков. Upstream
+/// индексирует его **без проверки границ**, поэтому имена `>= 1024` не должны
+/// доходить до C: наш слой допускает только имена, выданные `glGenLists`.
+pub const MAX_DISPLAY_LISTS: u32 = 1024;
