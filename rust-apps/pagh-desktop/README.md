@@ -22,7 +22,9 @@ pagh-desktop server ──► Compositor ──► damage-регионы ──�
 * Расширение **`launch` (type 13)**: клиент просит композитор открыть приложение
   (`app` + подсказка `cwd`) — так работают «Открыть терминал…» в Files и меню
   лаунчера. Цели запуска задаются `ServerOptions.launch_targets`/`--launch-target`
-  (`{socket}` подставляется), иначе используется демо-клиент (`--spawn-demo`).
+  (`{socket}` подставляется). Без цели сервер честно сообщает «приложение не
+  настроено» (лог/`ERR_UNSUPPORTED`) и подсказывает `--launch-target`; демо-клиент
+  `pagh-desktop-demo` — только тестовый фолбэк под `--spawn-demo`.
   `--autostart APP` открывает приложение из этого реестра сразу после старта.
 * Шрифт интерфейса — 8×16 ASCII + **кириллица** и типографские знаки
   (`tools/gen_cyrillic_font.py`), поэтому заголовки русских приложений читаемы.
@@ -80,16 +82,19 @@ cargo run --bin pagh-desktop-demo -- --help  # клиент/скриншоты
 Запуск сервера и клиента в двух терминалах:
 
 ```bash
-# терминал 1: сервер
-cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock --spawn-demo
+# терминал 1: сервер с реальной целью запуска (обычный путь)
+cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock \
+    --launch-target 'files=pagh-files|--socket|{socket}'
 
-# терминал 2: ещё один клиент (или клик по иконке панели при --spawn-demo)
+# терминал 2: клиент (для ручной проверки подойдёт тестовый pagh-desktop-demo)
 cargo run --bin pagh-desktop-demo -- --connect /tmp/pagh-desktop.sock --app files
 ```
 
 Сервер сам запускает приложение по запросам панели/меню/хоткея и по `launch`:
-сначала цель `--launch-target`, иначе демо-клиент `pagh-desktop-demo`, если рядом
-лежит бинарник (`--demo-binary PATH` задаёт явно):
+ищет цель `--launch-target`; если её нет, без `--spawn-demo` пишет в лог
+«приложение не настроено» и подсказывает флаг. Демо-клиент
+`pagh-desktop-demo` — тестовый фолбэк (см. «Обычный образ» ниже), включается
+явно `--spawn-demo` (`--demo-binary PATH` задаёт путь):
 
 ```bash
 # настоящий терминал: {socket} подставится путём сокета сервера
@@ -101,6 +106,32 @@ cargo run --bin pagh-desktop -- --socket /tmp/pagh-desktop.sock \
     --launch-target 'terminal=pagh-terminal|--socket|{socket}' \
     --autostart terminal
 ```
+
+### Обычный образ: рецепт `/mnt/etc/autorun`
+
+Media стартует desktop не флагами QEMU, а файлом `/mnt/etc/autorun` внутри
+`disk.img`: kernel shell исполняет его до интерактивного промпта
+(`src/shell/mod.rs::run_autorun`, лимит 512 байт). Канонический рецепт лежит в
+файле [`desktop-autorun`](desktop-autorun) этого крейта — только реальные
+приложения, без демо-флагов:
+
+```text
+lxrun /mnt/pd --backend fbdev --input evdev \
+  --launch-target files=/mnt/pagh-files|--socket|{socket} \
+  --launch-target terminal=/mnt/pagh-terminal|--vt|/dev/vtconsole0|--vt-input|/dev/vtinput|--socket|{socket} \
+  --autostart files
+```
+
+Установка в образ (правится КОПИЯ `disk.img`, оригинал не меняется):
+
+```bash
+python3 tools/mkimage.py --iso dist/pagh.iso --disk demo-disk.img \
+    --autorun rust-apps/pagh-desktop/desktop-autorun
+```
+
+`--demo-window`/`--spawn-demo`/`--demo-binary` — тестовые (QEMU e2e,
+`tools/e2e.py desktop --legacy-demo`) и в обычный рецепт не попадают; демо-бинарник
+`pagh-desktop-demo` обычному образу не нужен.
 
 Headless-кадры: `--screenshot-dir DIR` (каждый presented-кадр →
 `frame_NNNNN.png`), `--max-frames N` — выйти после N кадров.
@@ -144,10 +175,10 @@ cargo run --bin pagh-desktop -- --backend fbdev --fbdev /dev/fb0 \
   EV_REL/EV_KEY/EV_SYN, накопление REL_X/REL_Y до SYN, BTN_LEFT/MIDDLE/RIGHT,
   REL_WHEEL → axis, модификаторы для `Input`-сообщений. Устаревшие события,
   накопившиеся до `open` (строка запуска из shell), отбрасываются.
-* `--e2e` — короткий режим для QEMU: `backend=auto`, `input=auto`, одно демо-окно
-  вместо AF_UNIX-клиента, `--exit-after-ms 15000`, selfcheck через 3 с,
-  `--input-trace` и полный кадр на каждый present (иначе QEMU screendump может
-  отдать устаревшую surface).
+* `--e2e` — короткий тестовый режим для QEMU: `backend=auto`, `input=auto`, одно
+  demo-окно вместо AF_UNIX-клиента (только для теста), `--exit-after-ms 15000`,
+  selfcheck через 3 с, `--input-trace` и полный кадр на каждый present (иначе
+  QEMU screendump может отдать устаревшую surface).
 * Runtime выбор: `--backend auto|headless|fbdev`, `--input auto|none|evdev`;
   headless-путь и его PIL/PNG-тесты не меняются.
 
@@ -183,8 +214,9 @@ rust /mnt/pd --bench --bench-frames 120 --bench-label qemu
 
 * `render_ms` — `Compositor::render` целиком (paint_scene);
 * `blend_ms` — операции холста (заливки, текст, блиты слоёв);
-* `shadow_ms` — попиксельный проход тени окна (отдельная стадия, потому что это
-  доминирующая стоимость кадра; измеряется отдельно от `blend`);
+* `shadow_ms` — проход тени окна (отдельная стадия: в P0 она была доминирующей
+  стоимостью кадра, сейчас это предкомпонованное кольцо; измеряется отдельно от
+  `blend`);
 * `copy_ms` — `FbLayout::blit_damage` (canvas → scanout);
 * `present_ms` — `Backend::present` целиком (включает `copy`);
 * `damage_rects`, `opaque_pct` — ректов damage на кадр и доля пикселей, записанных
@@ -198,7 +230,8 @@ rust /mnt/pd --bench --bench-frames 120 --bench-label qemu
 гостевой ФС). В живом сервере `--frame-log-every N` печатает ту же сводку
 каждые N presented-кадров.
 
-Измеренный baseline (host, release, 1280×800, 120 кадров, i5-12400F):
+Измеренный P0-baseline (host, release, 1280×800, 120 кадров, i5-12400F) —
+точка отсчёта плана frame time:
 
 | сценарий | frame avg | p50 | p95 | render | из него shadow | blend | copy |
 |---|---|---|---|---|---|---|---|
@@ -207,11 +240,36 @@ rust /mnt/pd --bench --bench-frames 120 --bench-label qemu
 | cursor | 20.10 | 17.48 | 23.63 | 20.10 | 18.30 | 1.79 | 0.001 |
 | files-scroll | 23.40 | 23.40 | 23.51 | 23.30 | 21.24 | 2.04 | 0.10 |
 
-Вывод baseline: ~91 % времени кадра — попиксельный проход тени окна
+Вывод P0-baseline: ~91 % времени кадра — попиксельный проход тени окна
 (`paint_window_cached`), который не режется damage-отсечением (при крошечном
 damage курсора он всё равно идёт по всей площади окна), а `copy` в scanout —
-0.1–0.4 мс. Корректность рендера держит `tests/render_goldens.rs`: FNV-1a
-дайджесты кадра для четырёх состояний сцены, попиксельно.
+0.1–0.4 мс.
+
+Текущий профиль после P1–P3 и переноса тени на видимое кольцо (тот же хост и
+метод, 120 кадров, медиана трёх прогонов; сравнение — с P3-базой той же машины
+перед последним шагом):
+
+| сценарий | frame avg | p50 | render | из него shadow | blend | copy | было frame / shadow |
+|---|---|---|---|---|---|---|---|
+| idle-full | 0.78 | 0.77 | 0.61 | 0.086 | 0.52 | 0.17 | 5.06 / 4.32 |
+| drag | 0.37 | 0.37 | 0.31 | 0.048 | 0.26 | 0.07 | 2.98 / 2.63 |
+| cursor | 0.004 | 0.005 | 0.004 | 0.002 | 0.001 | 0.000 | 0.021 / 0.019 |
+| files-scroll | 0.22 | 0.22 | 0.18 | 0.009 | 0.17 | 0.04 | 1.72 / 1.51 |
+
+`painted_px` упал с 7.0 млн до 2.5 млн на idle-кадре: тень больше не смешивает
+~2.4 млн пикселей под непрозрачным chrome. Механика (`src/shadow.rs`): видимая
+часть тени — кольцо `shadow_box \ frame` плюс четыре угловых квадрата, где
+chrome скруглён, — предкомпонуется в **один** слой один раз на геометрию окна
+(кэш `Compositor::shadow_cache`, ключ — размер окна, поэтому движение курсора
+и позиция окна его не перестраивают), и в кадре остаётся один
+`Canvas::blit_shadow`. Слой хранит не RGBA-цвет, а профиль каскада (число
+чёрных слоёв над точкой): девять последовательных `blend(BLACK, alpha)` — это
+девять округлений, и одно 8-битное смешение не воспроизводит их ни для одного
+профиля из 2+ слоёв (`shadow::tests::single_blend_cannot_replace_cascade`),
+поэтому точный результат даёт таблица 256→256 на профиль. Корректность рендера
+держит `tests/render_goldens.rs`: FNV-1a дайджесты кадра для четырёх основных
+сценариев и шести граничных (hover на кнопке, окно у края экрана, перекрытие
+окон, минимальное окно, смена фокуса, кадр по damage через кольцо), попиксельно.
 
 QEMU-приёмка (сама собирает static musl бинарники, готовит pagh-ext2 диск,
 запускает desktop и проверяет framebuffer/serial):
@@ -273,8 +331,10 @@ python3 tools/e2e.py desktop --reuse-desktop-disk --skip-build
   kernel-примитивами (`desktop-kernel`); headless-путь полностью автономен.
 * `ShmSurface`/`SCM_RIGHTS`, частичный commit, клиентские popup/курсоры, outputs/scale,
   анимации, PTY/kernel-console bridge — не в этом срезе.
-* `--spawn-demo` — фолбэк для панели/меню/хоткея, если приложения нет в
-  `--launch-target`; реестр приложений/`.desktop`-файлы — следующий шаг.
+* `--spawn-demo`/`--demo-window` — тестовый фолбэк (демо-клиент/встроенное окно);
+  обычный образ задаёт реальные `--launch-target` в `/mnt/etc/autorun`
+  ([`desktop-autorun`](desktop-autorun)); реестр приложений/`.desktop`-файлы —
+  следующий шаг.
 * Скриншоты намеренно детерминированы (часы 23:38 / 15.11.2026), чтобы diff картинок
   был осмысленным.
 

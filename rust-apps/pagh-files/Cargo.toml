@@ -27,7 +27,11 @@ pagh-desktop = { path = "../pagh-desktop" }
 
 [profile.release]
 panic = "abort"
-opt-level = "s"
+# opt-level=3 для собственного кода крейта: блиты иконок (icons.rs::blit_tinted
+# — по-пиксельный blend) стоят 0.088 мс на "s" против 0.078 мс на 3 (34 блита,
+# release+lto). Полный кадр приложения (1060×640, ~9 мс) этим не двигается: его
+# горячий путь — pagh_ui::canvas::Canvas::fill/blend_pixel в pagh-ui.
+opt-level = 3
 lto = true
 strip = true
 

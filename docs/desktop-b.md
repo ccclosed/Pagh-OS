@@ -43,9 +43,14 @@ glibc `fork()` идёт через `clone(SIGCHLD)`, и этот путь раб
 Rust-std `Command::spawn`) поддержана как COW-fork с явным `child_stack` и
 остановкой родителя до `execve`/выхода ребёнка: совместный стек vfork не
 нужен `posix_spawn` (статус идёт через pipe), а копия безопаснее. Поэтому
-`pagh-desktop --spawn-demo` и кнопки панели Files/Terminal запускают
-дочерний процесс (реальное приложение из `--launch-target`, иначе демо-клиент),
-а не падают с `Function not implemented (os error 38)`.
+Кнопки панели Files/Terminal и Ctrl+Alt+T запускают дочерний процесс —
+реальное приложение из `--launch-target`; демо-клиент `pagh-desktop-demo`
+остаётся только тестовым фолбэком (`--spawn-demo`, `--legacy-demo` в e2e) и в
+обычном рецепте образа не участвует. Так `posix_spawn`-путь композитора не
+падает с `Function not implemented (os error 38)`. Рецепт автозапуска обычного
+образа — `/mnt/etc/autorun` из `rust-apps/pagh-desktop/desktop-autorun`
+(ставится в образ `tools/mkimage.py --autorun`, см. README крейта); он задаёт
+`--launch-target files=`/`terminal=` и `--autostart files`, без demo-флагов.
 
 ---
 

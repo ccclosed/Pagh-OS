@@ -22,9 +22,13 @@ Wayland в Pagh-OS пока отсутствует (нет `wl_display`, xdg-she
 
 Запуск приложений из клиентов — расширение **`launch` (type 13)**: клиент присылает
 `app` (например `terminal`) и подсказку `cwd`, а композитор запускает настроенную
-команду (`ServerOptions.launch_targets`, CLI `--launch-target`) или демо-клиент при
-`--spawn-demo`. Иконки панели, меню и Ctrl+Alt+T используют тот же реестр: цель
-`launch_targets` ищется по `AppKind::id()`, демо-клиент — только фолбэк. Оформление окна, кнопки `v/^/x`, панель и фокус принадлежат
+команду (`ServerOptions.launch_targets`, CLI `--launch-target`). Обычный образ
+задаёт эти цели в `/mnt/etc/autorun` (`rust-apps/pagh-desktop/desktop-autorun`);
+если цели нет, сервер пишет «приложение не настроено» (лог/`ERR_UNSUPPORTED`) и
+подсказывает `--launch-target`. Демо-клиент `pagh-desktop-demo` включается только
+тестовым `--spawn-demo` (e2e `--legacy-demo`) и фолбэком обычного пути не является.
+Иконки панели, меню и Ctrl+Alt+T используют тот же реестр: цель
+`launch_targets` ищется по `AppKind::id()`. Оформление окна, кнопки `v/^/x`, панель и фокус принадлежат
 композитору: клиенты (`pagh-files`, `pagh-terminal`) рисуют только клиентскую
 область. Шрифт интерфейса композитора покрывает ASCII и кириллицу, поэтому
 русские заголовки читаемы.
@@ -201,9 +205,9 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
   **firmware-not-started** (печатаются OVMF/QEMU argv и stderr), байты без
   kernel-лога — **kernel-silent**; вместо прежнего 160-секундного ожидания.
   Сценарий с демо-клиентом (`pagh-desktop-demo`, `--spawn-demo`, маркер
-  `launch terminal ok`) остался под флагом `--legacy-demo` — панельный путь
-  `server.rs::launch()` пока зовёт только `spawn_demo`; PDP/`--launch-target`
-  путь проверяется в дефолтном сценарии. `--reuse-desktop-disk` переиспользует
+  `launch terminal ok`) остался под флагом `--legacy-demo` как регрессия
+  тестового фолбэка; дефолтный сценарий доказывает реальный PDP/`--launch-target`
+  путь и НЕ инжектит демо-бинарник в диск (он нужен только `--legacy-demo`). `--reuse-desktop-disk` переиспользует
   уже подготовленный `.cache/e2e_desktop_disk.img`, пропуская первый boot.
   Скриншоты: `screenshots/11-fbdev-qemu.png` (desktop на реальном scanout) и
   `screenshots/12-fbdev-context-menu.png` (меню).
@@ -245,7 +249,8 @@ value }` (24 байта) → EV_KEY/EV_REL/EV_SYN → те же `Compositor::poi
 
 1. `ShmSurface` (`SCM_RIGHTS`, memfd) и частичный commit; frame upload остаётся fallback.
 2. Реестр приложений и `.desktop`-подобные записи для `launch` (сейчас — явные
-   `launch_targets`/`--spawn-demo`); управление дочерними процессами и перезапуск.
+   `launch_targets`; demo-флаги — только тесты); управление дочерними процессами
+   и перезапуск.
 3. Клиентские popup/меню, курсоры, DnD, outputs/scale/rotation, анимации.
 4. Kernel-console/VT bridge: общий текстовый surface, чтобы shell стал окном Terminal.
 5. Ввод с реального железа уже идёт через `/dev/input/event0` (PS/2/USB HID), но
