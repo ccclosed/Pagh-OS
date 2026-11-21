@@ -16,7 +16,7 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 | `net/` | Собственный TCP/IP-стек, DNS, HTTP/HTTPS(TLS) | [net/README.md](net/README.md) |
 | `pkg/` | apt-style пакетный менеджер (.deb, индексы, tar) | [pkg/README.md](pkg/README.md) |
 | `security/` | Аппаратная энтропия (fail-closed) | [security/README.md](security/README.md) |
-| `shell/` | Интерактивный shell, paint, nano, мини-Rust toolchain | [shell/README.md](shell/README.md) |
+| `shell/` | Интерактивный shell, `paint`, `nano+`, `settings` (мини-Rust интерпретатор удалён — `.rs`/`.pbc` не исполняются) | [shell/README.md](shell/README.md) |
 | `sync/` | Спинлок с маскированием IF | [sync/README.md](sync/README.md) |
 | `task/` | Планировщик RR, процессы, fd-таблица, Linux compat-состояние | [task/README.md](task/README.md) |
 | `vfs/` | VFS-трейт, ramfs, синтетический `/proc`, ELF-загрузчик | [vfs/README.md](vfs/README.md) |
@@ -80,10 +80,12 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
 физического ввода), `net::net_thread` (`netd`), `drivers::xhci::usb_thread` и
 `logfile::flush_thread`; feature-гейтнутые selftest-хуки; `enable_interrupts()`; main-поток —
 `halt_loop()`. `shell_thread` после стабилизации запускает shell (никаких вопросов на
-консоли: юзерленд ставится из shell через `apt`).
+консоли: юзерленд ставится из shell через `ppkg`).
 
 Грабли: `create_user_process` обязан идти с выключенными прерываниями (тик, увидев чужой CR3,
-ломает планирование); отсутствие диска/NIC — warn, не fatal; ext2-маунт до включения прерываний.
+ломает планирование); отсутствие диска/NIC — warn, не fatal; ext2-маунт до включения прерываний;
+`activate_task` пишет `FS.base` при **каждом** переключении (значение compat-состояния или 0 —
+иначе задача без compat-состояния наследует чужой `%fs`, см. `task/README.md`).
 `linux_dispatch(regs, reentry_allowed)` размаскирует IF только при ненулевом втором аргументе:
 оба входных стаба передают 1 (настоящий syscall на планируемой задаче), а boot-selftest —
 0, потому что загрузочный поток ещё не планируемая задача и размаскировка там паркует его
@@ -134,7 +136,7 @@ Sinks: serial всегда, framebuffer условно. Гейты fb-зерка
 
 ### `selftest_lx.rs` — Linux-совместимость selftests (feature-gated)
 Компилируется только под `lx_selftest`/`lx_livetest`/`lx_bigindex`/`lx_tlsbig`.
-- `run()` — 13 проверок до включения прерываний: end-to-end запуск hand-assembled Linux ELF
+- `run()` — 22 проверки до включения прерываний: end-to-end запуск hand-assembled Linux ELF
   (write + exit_group), изоляция exit, ENOENT, arch_prctl/uname/tid, сохранность регистров
   через `linux_dispatch` (прямой вызов с `reentry_allowed = 0` — см. «Грабли» ниже),
   OOM-rollback brk/mmap, fetch без сети, ext2 install roundtrip,

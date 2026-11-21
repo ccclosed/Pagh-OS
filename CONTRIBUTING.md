@@ -68,7 +68,7 @@ cargo build --release  # release
    Полный список — `all_tests()` в `src/test.rs`. Запуск из шелла командой `selftest`;
    результаты идут в serial как `ok`/`FAIL`.
 2. **Host property-tests** (`host-tests/`) — `proptest` для логики, выносимой на хост.
-   Числовые модули — `p01`–`p56` (по файлу на свойство в `host-tests/src/properties/`),
+   Числовые модули — `p01`–`p67` (по файлу на свойство в `host-tests/src/properties/`),
    плюс именованные (`tty_job`, `kill_target`, `ext2_links`, `procfs_*`, …): ядро плюс
    Linux-ABI совместимости и конвейер `apt`/`deb`/`tar`. Это отдельный, исключённый из
    workspace крейт, собирающийся под хост-таргет:
