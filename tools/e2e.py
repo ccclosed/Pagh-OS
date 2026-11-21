@@ -3261,14 +3261,18 @@ class TermuxPointer:
                 off = row + x * 3
                 if ra[off:off + 3] != rb[off:off + 3]:
                     changed.append((x, y))
-        far = [(x, y) for (x, y) in changed if abs(x - ox) + abs(y - oy) > 24]
+        # Only the NEW sprite: the old one sits at the centre. Keep changed
+        # pixels in the moved quadrant, then take the arrow's top-left tip as
+        # the hotspot (a centroid would be biased by the sprite's own shape).
+        far = [(x, y) for (x, y) in changed
+               if x > ox + 30 and y > oy + 18]
         if not far:
             raise HarnessError("termux: pointer calibration found no cursor in the dump")
-        nx = sum(x for x, _ in far) / len(far)
-        ny = sum(y for _, y in far) / len(far)
-        self.scale_x = max(0.25, min(4.0, (nx - ox) / 60.0))
-        self.scale_y = max(0.25, min(4.0, (ny - oy) / 40.0))
-        self.x, self.y = int(round(nx)), int(round(ny))
+        tip_x = min(x for x, _ in far)
+        tip_y = min(y for _, y in far)
+        self.scale_x = max(0.25, min(4.0, (tip_x - ox) / 60.0))
+        self.scale_y = max(0.25, min(4.0, (tip_y - oy) / 40.0))
+        self.x, self.y = tip_x, tip_y
         return self.scale_x, self.scale_y
 
     def move_to(self, x: int, y: int) -> None:
@@ -3433,7 +3437,7 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
                 pointer.click(978, 80)
             else:
                 pointer.click(1020, 116)
-            time.sleep(1.6)
+            time.sleep(2.2)
 
         # Window 1: history, editing, scrollback, selection, nano, exit/restart.
         open_terminal("03-terminal-open")
@@ -3479,7 +3483,9 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         _termux_line(kb, h.qmp, "echo SEL >> /mnt/q4")
         pointer.move_to(5, 5)
         _termux_shot(kb, ev / "12-before-selection.png")
-        row0_y = 95 + 19 + 9  # content origin + letterbox + half an 18 px cell
+        # content origin (window y + border + title) + letterbox (600-562)/2 +
+        # half a scaled cell: row 0 of the session surface.
+        row0_y = 64 + 1 + 30 + (600 - 562) // 2 + 6
         pointer.drag(110, row0_y, 430, row0_y)
         _termux_shot(kb, ev / "13-selection.png")
         h.qmp.keys(["ctrl", "y"])
@@ -3491,12 +3497,16 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         _termux_shot(kb, ev / "15-paste-executed.png")
 
         # nano: full-screen (kernel) editor, cursor keys + typing, Esc back.
-        _termux_line(kb, h.qmp, "nano", settle=2.0)
+        _termux_line(kb, h.qmp, "nano /tmp/qterm-nano.txt", settle=2.0)
         _termux_shot(kb, ev / "16-nano.png")
         for name in ("down", "down", "right", "right"):
             kb.key(name)
         _desktop_type(kb, h.qmp, "XYZ")
         _termux_shot(kb, ev / "17-nano-cursor-keys.png")
+        # nano arms the first Esc when the buffer is dirty ("press ^Q again"),
+        # so the second Esc leaves; the next shell command proves the return.
+        kb.key("esc")
+        time.sleep(0.4)
         kb.key("esc")
         time.sleep(1.0)
         _termux_shot(kb, ev / "18-nano-exit.png")
@@ -3519,12 +3529,16 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
             open_terminal(f"22-reopened-{cycle:02d}", wait=6.0)
             _termux_line(kb, h.qmp, f"echo C{cycle}>>/mnt/r", settle=1.2)
         _termux_shot(kb, ev / "23-after-20-reopens.png")
+        time.sleep(0.5)
 
         # Two windows: each must get its own session; typing in one must not
-        # reach the other nor the boot shell (serial check below).
-        h.qmp.keys(["ctrl", "alt", "t"])
-        h.qmp.release_modifiers()
-        time.sleep(7.0)
+        # reach the other nor the boot shell (serial check below). Start from a
+        # clean slate so the slots are deterministic: close the last cycle
+        # window, let its session reap, then open slot 1 and slot 2.
+        close_window(1)
+        time.sleep(2.5)
+        open_terminal("23b-window1", wait=6.5)
+        open_terminal("23c-window2", wait=7.0)
         focus_window(2)
         _termux_line(kb, h.qmp, "echo two > /mnt/q9two")
         _termux_shot(kb, ev / "24-two-windows-window2.png")
@@ -4794,6 +4808,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="use existing static pagh-desktop/pagh-terminal binaries")
     tx.add_argument("--reuse-desktop-disk", action="store_true",
                     help="reuse .cache/e2e_termux_disk.img (already formatted/injected)")
+    tx.add_argument("--serial-start-timeout", type=float, default=25.0,
+                    help="fail-fast window for the first serial bytes/kernel banner "
+                         "after each boot (default 25 s)")
 
     sub.add_parser("usb", parents=[common],
                    help="USB-input acceptance: boot the staged image with an "

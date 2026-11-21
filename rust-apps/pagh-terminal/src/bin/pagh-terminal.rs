@@ -1590,6 +1590,10 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     let mut input_error_reported = false;
     let mut mouse_error_reported = false;
     let mut focus_reported = false;
+    // Последний известный фокус клавиатуры: после перезапуска сессии
+    // композитор не присылает `Focus` повторно (окно и так сфокусировано),
+    // поэтому клиент обязан восстановить состояние сам.
+    let mut keyboard_focus = false;
     // `--vt-trace` (или переменная окружения) печатает каждый отрисованный
     // кадр: в гостевой консоли это serial-доказательство того, что generation
     // растёт с выводом сессии, а не «кадр застыл».
@@ -1650,6 +1654,14 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                             input_error_reported = false;
                             mouse_error_reported = false;
                             focus_reported = false;
+                            // Новая сессия — новое устройство ввода: вернуть ему
+                            // фокус, который композитор уже не переотправит.
+                            set_keyboard_focus(
+                                &keys,
+                                &mut diag,
+                                &mut focus_reported,
+                                keyboard_focus,
+                            );
                             continue;
                         }
                         Err(error) => {
@@ -1831,6 +1843,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     // Курсор рисует ядро в пикселях: подсветка фокуса здесь не наша.
                     // А вот клавиатурный фокус — наша: он решает, дублируются ли
                     // нажатия в boot-shell.
+                    keyboard_focus = focused;
                     set_keyboard_focus(&keys, &mut diag, &mut focus_reported, focused);
                 }
                 Event::Input(InputEvent::Axis {
