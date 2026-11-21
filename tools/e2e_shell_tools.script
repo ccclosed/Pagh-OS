@@ -75,5 +75,76 @@ expect 0\s+0\s+\d+ hosts
 # Diagnostics: a missing file and an unsupported target.
 cmd head -n 1 /mnt/definitely-missing
 expect head: /mnt/definitely-missing: not found
-cmd chmod 600 /tmp
-expect chmod: /tmp: operation not supported
+# An unsupported target is a synthetic node (/proc has no on-disk mode).
+# This used to be /tmp, but since ramfs stores mode/owner per node (1777 /tmp
+# for the sticky rule) that chmod now succeeds; the diagnostic needs a node
+# that genuinely cannot store it.
+cmd chmod 600 /proc
+expect chmod: /proc: operation not supported
+# ── CLI-волна: POSIX-формы опций (getopt) ────────────────────────────────────
+# Grouped short flags and `--`: `ls -la` == `-l -a`; `--` ends the option scan.
+cmd ls -la /mnt/etc/hosts
+expect -rw-r--r--\s+1\s+0\s+0\s+\d+ hosts
+cmd ls -- /mnt/etc/hosts
+expect (?m)^hosts\r?$
+# Unknown option is an error with usage, not a path that silently opens nothing.
+cmd ls -q
+expect ls: unknown option: -q
+expect ls: usage: ls \[-l\] \[-a\] \[path\]
+
+# id: selectors -u/-g/-G and -n names; unknown option is not a user name.
+cmd id -u
+expect (?m)^0\r?$
+cmd id -un
+expect (?m)^root\r?$
+cmd id -x
+expect id: unknown option: -x
+expect id: usage: id \[-u\|-g\|-G\] \[-n\] \[user\]
+cmd groups -x
+expect groups: unknown option: -x
+
+# df -H: SI units on top of the existing -h; unknown options keep diagnostics.
+cmd df -H
+expect Filesystem\s+Size\s+Used\s+Avail
+expect \d+\.\d (K|M|G|T)
+cmd df -q
+expect df: unknown option: -q
+expect df: usage: df \[-h\] \[-H\]
+
+# ps -ef: full format (UID column + full command line); unknown option.
+cmd ps -ef
+expect UID\s+PID\s+PPID\s+STAT\s+COMMAND
+expect \s+R\s+\[
+cmd ps -q
+expect ps: unknown option: -q
+expect ps: usage: ps \[-e\] \[-f\]
+
+# nano: the built-in editor keeps priority; unknown option is not a path.
+cmd nano
+expect nano: usage:
+cmd nano -q
+expect nano: unknown option: -q
+cmd nano --settings show
+expect nano config: /mnt/\.nanorc
+
+# ── PATH-поиск (execvp) без префикса lxrun ──────────────────────────────────
+# Nothing is installed in /mnt/usr/bin on the e2e scratch disk, so a bare name
+# must name the directories it searched and never run a different binary.
+cmd fastfetch
+expect fastfetch: command not found in PATH \(searched: /mnt/usr/bin:/usr/bin:/bin\)
+cmd lxrun nano
+expect lxrun: nano: not found in PATH \(searched: /mnt/usr/bin:/usr/bin:/bin\)
+# A relative path is a path, not a name: no PATH search, no substitution.
+cmd ./fastfetch
+expect Unknown command: '\./fastfetch'
+# Full paths keep the pre-existing lxrun behaviour (and the rust alias still works).
+cmd lxrun /mnt/definitely-missing
+expect lxrun: /mnt/definitely-missing: file not found or unreadable
+cmd rust /mnt/definitely-missing
+expect lxrun: /mnt/definitely-missing: file not found or unreadable
+
+# mount/umount: honest placeholders until kernel mount(2)/umount2 (USB S1).
+cmd mount -t ext2 /dev/vda /mnt
+expect mount: not implemented
+cmd umount /mnt
+expect umount: not implemented
