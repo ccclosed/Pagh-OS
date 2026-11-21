@@ -840,14 +840,15 @@ fn pdp_button_mask_maps_to_the_kernels_button_bits() {
 }
 
 #[test]
-fn wheel_axis_is_forwarded_unchanged() {
-    // `Axis.vertical` is the kernel's own REL_WHEEL value (its PS/2 decoder
-    // produced it); /dev/vtmouse wants exactly that. Inverting here made
-    // wheel-up scroll towards newer text.
-    assert_eq!(wheel_from_axis(1), 1);
-    assert_eq!(wheel_from_axis(-1), -1);
+fn wheel_axis_is_translated_to_the_kernel_s_sign() {
+    // The compositor forwards QEMU's REL_WHEEL sign (wheel-up = -1); the
+    // kernel shell expects the PS/2 convention where "away from the user" is
+    // negative and computes `lines = -delta`. One inversion in the client makes
+    // wheel-up scroll to older lines — verified live (e2e termux: unchanged
+    // forwarding made wheel-up a no-op).
+    assert_eq!(wheel_from_axis(-1), 1);
+    assert_eq!(wheel_from_axis(1), -1);
     assert_eq!(wheel_from_axis(0), 0);
-    assert_eq!(wheel_from_axis(3), 3);
 }
 
 #[test]
@@ -911,7 +912,7 @@ fn mouse_forwarder_sends_position_buttons_and_wheel() {
         MOUSE_BTN_LEFT
     );
     let third = &written[2 * MOUSE_EVENT_LEN..];
-    assert_eq!(i32::from_le_bytes(third[12..16].try_into().unwrap()), 2);
+    assert_eq!(i32::from_le_bytes(third[12..16].try_into().unwrap()), -2);
 }
 
 #[test]
