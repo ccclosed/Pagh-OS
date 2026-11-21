@@ -51,6 +51,95 @@ pub static CTRL_C_LATCH: core::sync::atomic::AtomicBool =
 pub static CTRL_Z_LATCH: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Защёлки ^C/^Z по консольным сессиям (индекс 0 — публичные статики выше).
+///
+/// Каретка/редактор/`nano` одного окна не должны видеть Ctrl+C, набранный в
+/// другом: защёлка — свойство ТЕРМИНАЛА, как и foreground-группа. Декодер
+/// ставит её для сессии текущей задачи ([`crate::drivers::session::current`]),
+/// `foreground_wait` забирает для своей сессии.
+static SESSION_CTRL_C_LATCH: [core::sync::atomic::AtomicBool;
+    crate::drivers::session_route::MAX_SESSIONS] = [const { core::sync::atomic::AtomicBool::new(false) };
+    crate::drivers::session_route::MAX_SESSIONS];
+static SESSION_CTRL_Z_LATCH: [core::sync::atomic::AtomicBool;
+    crate::drivers::session_route::MAX_SESSIONS] = [const { core::sync::atomic::AtomicBool::new(false) };
+    crate::drivers::session_route::MAX_SESSIONS];
+
+fn latch_slot(session: usize) -> Option<usize> {
+    if session != crate::drivers::session_route::BOOT_SESSION
+        && session < crate::drivers::session_route::MAX_SESSIONS
+    {
+        Some(session)
+    } else {
+        None
+    }
+}
+
+/// Забрать (и сбросить) защёлку Ctrl+C текущей консольной сессии.
+pub fn take_ctrl_c_latch() -> bool {
+    let session = crate::drivers::session::current();
+    match latch_slot(session) {
+        Some(s) => SESSION_CTRL_C_LATCH[s].swap(false, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_C_LATCH.swap(false, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Забрать (и сбросить) защёлку Ctrl+Z текущей консольной сессии.
+pub fn take_ctrl_z_latch() -> bool {
+    let session = crate::drivers::session::current();
+    match latch_slot(session) {
+        Some(s) => SESSION_CTRL_Z_LATCH[s].swap(false, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_Z_LATCH.swap(false, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Сбросить обе защёлки текущей консольной сессии (перед передачей терминала
+/// заданию).
+pub fn clear_ctrl_latches() {
+    let session = crate::drivers::session::current();
+    match latch_slot(session) {
+        Some(s) => {
+            SESSION_CTRL_C_LATCH[s].store(false, core::sync::atomic::Ordering::Relaxed);
+            SESSION_CTRL_Z_LATCH[s].store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+        None => {
+            CTRL_C_LATCH.store(false, core::sync::atomic::Ordering::Relaxed);
+            CTRL_Z_LATCH.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Сбросить обе защёлки указанной сессии (выход/переоткрытие окна).
+pub fn clear_latches_for_session(session: usize) {
+    match latch_slot(session) {
+        Some(s) => {
+            SESSION_CTRL_C_LATCH[s].store(false, core::sync::atomic::Ordering::Relaxed);
+            SESSION_CTRL_Z_LATCH[s].store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+        None => {
+            CTRL_C_LATCH.store(false, core::sync::atomic::Ordering::Relaxed);
+            CTRL_Z_LATCH.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Поставить защёлку Ctrl+C текущей сессии (декодер сканкодов).
+fn store_ctrl_c_latch() {
+    let session = crate::drivers::session::current();
+    match latch_slot(session) {
+        Some(s) => SESSION_CTRL_C_LATCH[s].store(true, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_C_LATCH.store(true, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Поставить защёлку Ctrl+Z текущей сессии (декодер сканкодов).
+fn store_ctrl_z_latch() {
+    let session = crate::drivers::session::current();
+    match latch_slot(session) {
+        Some(s) => SESSION_CTRL_Z_LATCH[s].store(true, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_Z_LATCH.store(true, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 /// Постоянное состояние CapsLock. Декодеры создаются на каждый вызов чтения на
 /// пути stdin, так что переключатель должен жить дольше любого экземпляра.
 static CAPS_LOCK_STATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -173,10 +262,10 @@ impl Decoder {
                 match scancode_to_ascii(scancode, self.shift) {
                     Some(ch) if ch != '\n' && ch != '\t' && self.ctrl => {
                         if ch.to_ascii_lowercase() == 'c' {
-                            CTRL_C_LATCH.store(true, core::sync::atomic::Ordering::Relaxed);
+                            store_ctrl_c_latch();
                         }
                         if ch.to_ascii_lowercase() == 'z' {
-                            CTRL_Z_LATCH.store(true, core::sync::atomic::Ordering::Relaxed);
+                            store_ctrl_z_latch();
                         }
                         Some(KeyEvent::Ctrl(ch.to_ascii_lowercase()))
                     }

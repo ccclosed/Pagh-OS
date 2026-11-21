@@ -6298,6 +6298,216 @@ mod linux_tty_tests {
             "synthetic compat states were removed"
         );
     }
+
+    /// Per-session tty: у boot-консоли (0) и окна (1) РАЗНЫЕ foreground-группы,
+    /// `TOSTOP`, `winsize`, foreground-pid, защёлки и очереди stdin; `SIGWINCH`
+    /// от `TIOCSWINSZ` идёт foreground-группе ТОЛЬКО своей сессии.
+    ///
+    /// НЕРАЗРУШАЮЩАЯ: сохраняет состояние обеих сессий (fg, tostop, winsize,
+    /// fg-pid) и восстанавливает его; синтетические `CompatState` удаляются,
+    /// `SIGWINCH` им блокируется (иначе тик-consumer съел бы pending-бит до
+    /// проверки). Пользовательская scratch-страница возвращается в PMM.
+    pub fn per_session_terminals_and_winsize() {
+        use crate::arch::x86_64::linux::signal_frame::SIGWINCH;
+        use crate::arch::x86_64::linux::tty::{decode_winsize, encode_winsize, Winsize};
+
+        let me = scheduler::current_pid();
+        // ── Save ────────────────────────────────────────────────────────────
+        let fg0 = ktty::foreground_pgid_for(0);
+        let fg1 = ktty::foreground_pgid_for(1);
+        let tostop0 = ktty::tostop_for(0);
+        let tostop1 = ktty::tostop_for(1);
+        let ws0 = ktty::winsize_for(0);
+        let ws1 = ktty::winsize_for(1);
+        let fgpid0 = crate::drivers::ps2_kbd::fg_pid(0);
+        let fgpid1 = crate::drivers::ps2_kbd::fg_pid(1);
+
+        // ── Synthetic groups in two SESSIONS ────────────────────────────────
+        let win_group = JOB_A;
+        let boot_group = JOB_C;
+        let mut a = synth(JOB_A, JOB_A, win_group);
+        a.sig_blocked |= sigbit(SIGWINCH);
+        let mut b = synth(JOB_B, JOB_B, win_group);
+        b.sig_blocked |= sigbit(SIGWINCH);
+        let mut c = synth(JOB_C, JOB_C, boot_group);
+        c.sig_blocked |= sigbit(SIGWINCH);
+        compat::install_compat(JOB_A, a);
+        compat::install_compat(JOB_B, b);
+        compat::install_compat(JOB_C, c);
+        // The ioctls need a compat caller (fd resolution goes through it).
+        let frame = map_scratch();
+        assert_kernel!(frame.is_some(), "winsize scratch page mapped");
+        compat::install_compat(me, synth(me, me, boot_group));
+
+        // ── A. Foreground groups are per session ────────────────────────────
+        ktty::set_foreground_pgid_for(0, boot_group);
+        ktty::set_foreground_pgid_for(1, win_group);
+        assert_eq_kernel!(
+            ktty::foreground_pgid_for(0),
+            boot_group,
+            "session 0 kept its own foreground group"
+        );
+        assert_eq_kernel!(
+            ktty::foreground_pgid_for(1),
+            win_group,
+            "session 1 owns a DIFFERENT foreground group (not one global tty)"
+        );
+        ktty::set_foreground_pgid_for(0, fg0);
+        assert_eq_kernel!(
+            ktty::foreground_pgid_for(1),
+            win_group,
+            "moving boot's foreground group left the window's alone"
+        );
+
+        // ── B. TOSTOP is per session ────────────────────────────────────────
+        ktty::set_tostop_for(1, true);
+        assert_kernel!(
+            ktty::tostop_for(1),
+            "session 1 can enable TOSTOP for its own background writes"
+        );
+        assert_kernel!(
+            !ktty::tostop_for(0),
+            "enabling TOSTOP in the window did not leak to the boot terminal"
+        );
+        ktty::set_tostop_for(1, tostop1);
+
+        // ── C. Winsize per session + SIGWINCH to that session's fg ─────────
+        let new_ws = Winsize {
+            rows: ws1.rows.wrapping_add(3),
+            cols: ws1.cols.wrapping_add(5),
+            xpixel: 1000,
+            ypixel: 700,
+        };
+        assert_kernel!(
+            ktty::set_winsize_for(1, new_ws),
+            "a changed window winsize reports a change (SIGWINCH is armed)"
+        );
+        assert_eq_kernel!(
+            ktty::winsize_for(1),
+            new_ws,
+            "session 1 stores the new winsize"
+        );
+        assert_eq_kernel!(
+            ktty::winsize_for(0),
+            ws0,
+            "boot winsize did not move with the window's"
+        );
+        assert_kernel!(
+            compat::pending_of(JOB_A) & sigbit(SIGWINCH) != 0,
+            "SIGWINCH was queued to session 1's foreground group"
+        );
+        assert_kernel!(
+            compat::pending_of(JOB_C) & sigbit(SIGWINCH) == 0,
+            "a process in session 0's foreground group received no SIGWINCH"
+        );
+        // Idempotent TIOCSWINSZ: same size, no second SIGWINCH.
+        if let Some(mut st) = compat::remove_compat(JOB_A) {
+            st.sig_pending = 0;
+            compat::install_compat(JOB_A, st);
+        }
+        assert_kernel!(
+            !ktty::set_winsize_for(1, new_ws),
+            "setting the SAME winsize again is not a resize (no SIGWINCH)"
+        );
+        assert_kernel!(
+            compat::pending_of(JOB_A) & sigbit(SIGWINCH) == 0,
+            "an unchanged TIOCSWINSZ queued no SIGWINCH"
+        );
+
+        // ── D. TIOCGWINSZ on fd 0 reflects the CALLER's session ────────────
+        let boot_ws = Winsize {
+            rows: ws0.rows.max(30).wrapping_add(1),
+            cols: ws0.cols.max(90).wrapping_add(1),
+            xpixel: 0,
+            ypixel: 0,
+        };
+        ktty::set_winsize_for(0, boot_ws);
+        assert_eq_kernel!(
+            sys_ioctl(0, crate::arch::x86_64::linux::tty::TIOCGWINSZ, SCRATCH_VA),
+            Ok(0),
+            "TIOCGWINSZ answers on the boot terminal"
+        );
+        // SAFETY: SCRATCH_VA mapped USER_ACCESSIBLE writable; kernel reads it.
+        let raw = unsafe {
+            core::slice::from_raw_parts(
+                SCRATCH_VA as *const u8,
+                crate::arch::x86_64::linux::tty::WINSIZE_SIZE,
+            )
+        };
+        assert_eq_kernel!(
+            decode_winsize(raw),
+            Some(boot_ws),
+            "TIOCGWINSZ reported the boot terminal's own winsize"
+        );
+        assert_eq_kernel!(
+            encode_winsize(&new_ws)[0..2],
+            new_ws.rows.to_le_bytes(),
+            "winsize wire layout is Linux struct winsize"
+        );
+
+        // ── E. fg-pid, Ctrl-latches and stdin queues are per session ───────
+        crate::drivers::ps2_kbd::set_fg_pid(1, JOB_A);
+        assert_eq_kernel!(
+            crate::drivers::ps2_kbd::fg_pid(1),
+            JOB_A,
+            "session 1 has its own foreground pid"
+        );
+        assert_eq_kernel!(
+            crate::drivers::ps2_kbd::fg_pid(0),
+            fgpid0,
+            "the boot terminal's foreground pid did not change"
+        );
+        crate::drivers::ps2_kbd::set_fg_pid(1, fgpid1);
+        crate::drivers::ps2_kbd::set_ctrl_c(1, true);
+        crate::drivers::ps2_kbd::set_ctrl_z(1, true);
+        assert_kernel!(
+            crate::drivers::ps2_kbd::take_ctrl_c(1) && crate::drivers::ps2_kbd::take_ctrl_z(1),
+            "session 1's ^C/^Z latches are readable for session 1"
+        );
+        assert_kernel!(
+            !crate::drivers::ps2_kbd::take_ctrl_c(0) && !crate::drivers::ps2_kbd::take_ctrl_z(0),
+            "session 1's ^C/^Z did not arm the boot latches"
+        );
+        crate::arch::x86_64::linux::io_sys::push_stdin_bytes_for(1, b"win");
+        assert_eq_kernel!(
+            crate::arch::x86_64::linux::io_sys::stdin_pending_len_for(1),
+            3,
+            "the window's stdin queue received its bytes"
+        );
+        assert_eq_kernel!(
+            crate::arch::x86_64::linux::io_sys::stdin_pending_len_for(0),
+            0,
+            "boot stdin queue stayed empty"
+        );
+        assert_eq_kernel!(
+            crate::arch::x86_64::linux::io_sys::take_stdin_pending_for(1, 16),
+            b"win".to_vec(),
+            "draining the window queue returns exactly its bytes"
+        );
+
+        // ── Cleanup ─────────────────────────────────────────────────────────
+        ktty::set_winsize_for(0, ws0);
+        ktty::set_winsize_for(1, ws1);
+        ktty::set_tostop_for(0, tostop0);
+        ktty::set_tostop_for(1, tostop1);
+        ktty::set_foreground_pgid_for(0, fg0);
+        ktty::set_foreground_pgid_for(1, fg1);
+        crate::drivers::ps2_kbd::set_fg_pid(1, fgpid1);
+        crate::drivers::ps2_kbd::set_ctrl_c(1, false);
+        crate::drivers::ps2_kbd::set_ctrl_z(1, false);
+        unmap_scratch(frame);
+        compat::remove_compat(me);
+        compat::remove_compat(JOB_A);
+        compat::remove_compat(JOB_B);
+        compat::remove_compat(JOB_C);
+        assert_kernel!(
+            !compat::compat_exists(JOB_A)
+                && !compat::compat_exists(JOB_B)
+                && !compat::compat_exists(JOB_C)
+                && !compat::compat_exists(me),
+            "per-session winsize: synthetic compat states were removed"
+        );
+    }
 }
 
 // ─── Сетевые данные для userspace (этап K), в госте ─────────────────────────
@@ -11801,6 +12011,12 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "terminal-session::nano draws in the session surface and exits on Esc",
             terminal_session_tests::nano_draws_in_session
+        ),
+        // Per-session tty: foreground-группа, TOSTOP, winsize, SIGWINCH,
+        // fg-pid, защёлки и очередь stdin окна независимы от boot-консоли.
+        (
+            "linux-tty::per-session foreground groups + winsize + SIGWINCH",
+            linux_tty_tests::per_session_terminals_and_winsize
         ),
         (
             "terminal-session::registry commands route into the window session",
