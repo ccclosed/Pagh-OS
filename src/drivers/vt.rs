@@ -756,14 +756,25 @@ pub fn dimensions() -> (u16, u16) {
 }
 
 /// Feed a byte slice from a compat process stdout/stderr into the VT.
+///
+/// Завершается явным `framebuffer::flush()`: `feed` рисует в shadow-буфер
+/// писателя, и без публикации кадра вывод программы не появляется ни на
+/// boot-экране (его досылал следующий проход shell'а), ни — что критично —
+/// в окне: задача session-shell'а в это время блокирована в
+/// `foreground_wait`/`read`, поэтому «следующий flush» не наступит, и
+/// ncurses/TUI-программа (nano, nvim) оставалась невидимой, хотя работала.
+/// Flush — после отпускания лока VT: он берёт лок framebuffer'а, и вложенность
+/// здесь не нужна.
 pub fn write(bytes: &[u8]) {
-    let mut g = VT.lock();
-    if let Some(vt) = g.as_mut() {
-        for &b in bytes {
-            vt.feed(b);
+    {
+        let mut g = VT.lock();
+        if let Some(vt) = g.as_mut() {
+            for &b in bytes {
+                vt.feed(b);
+            }
         }
-    } else {
-        drop(g);
+    }
+    if VT.lock().is_none() {
         match core::str::from_utf8(bytes) {
             Ok(s) => {
                 crate::fb_print!("{}", s);
@@ -775,4 +786,5 @@ pub fn write(bytes: &[u8]) {
             }
         }
     }
+    crate::drivers::framebuffer::flush();
 }

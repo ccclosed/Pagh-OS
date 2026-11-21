@@ -66,6 +66,67 @@ pub enum FbError {
     OpenFailed,
     /// В процессе уже живёт `Context`: `gl_ctx` у TinyGL глобальный.
     ContextAlreadyLive,
+
+    // --- текстуры (PR3) ---------------------------------------------------
+    /// `glGenTextures(0)` или запрос больше нашего sanity-предела.
+    BadTextureCount { count: usize },
+    /// Имя текстуры не влезает в C-`int` (upstream хранит handle как `int` и
+    /// делает `assert(texture >= 0)`; отрицательный handle — OOB в хэш-таблице).
+    BadTextureName { name: u32 },
+    /// Сторона текстуры `0` или больше нашего предела (всё равно ресемплится
+    /// в 256×256; предел не даёт integer overflow в C-ресемплере).
+    BadTextureSize { width: u32, height: u32 },
+    /// `rgb.len() != width * height * 3` — строки `GL_RGB` обязаны быть плотными.
+    TextureDataLenMismatch { expected: usize, actual: usize },
+    /// `glTexImage2D` без предварительного `glBindTexture`: C-`current_texture`
+    /// ещё `NULL`, и upstream разыменовал бы его.
+    TextureNotBound,
+    /// У текстуры нет загруженной картинки: включённый `GL_TEXTURE_2D` или
+    /// `glTexImage2D` на ней привёл бы к разыменованию `pixmap == NULL`.
+    TextureHasNoImage { texture: u32 },
+    /// Попытка удалить текущую текстуру при включённом `GL_TEXTURE_2D`: C
+    /// перебиндил бы `0` без картинки, и следующий треугольник упал бы.
+    TextureBoundAndEnabled { texture: u32 },
+    /// `glGenTextures` переполнил бы C-`int` (`max(handle) + i + 1`).
+    TextureNameExhausted,
+    /// Пара `glTexParameteri`, которую upstream либо отверг бы (`exit(1)`),
+    /// либо молча проигнорировал (фильтры всегда NEAREST, wrap всегда REPEAT).
+    UnsupportedTextureParameter {
+        pname: &'static str,
+        param: &'static str,
+    },
+
+    // --- display lists (PR3) ---------------------------------------------
+    /// `range == 0` или больше `MAX_DISPLAY_LISTS` (1024 слота upstream).
+    BadListRange { range: u32 },
+    /// В `shared_state.lists` upstream-размера (1024) нет непрерывного
+    /// диапазона нужной длины.
+    ListSpaceExhausted,
+    /// Наше зеркало занятости слотов разошлось с C. Должно быть невозможно;
+    /// если случилось — дальше звать `glGenLists`/`glCallList` нельзя.
+    ListStateDiverged { expected: u32, actual: u32 },
+    /// Имя не выдавалось `glGenLists` (upstream `glCallList` → `exit(1)`,
+    /// а `glCallList`/`glNewList` с именем `>= 1024` — OOB-запись).
+    ListUndefined { list: u32 },
+    /// `glNewList` при уже открытой компиляции (upstream — `assert`).
+    ListAlreadyCompiling,
+    /// `glEndList` без `glNewList` (upstream — `assert`).
+    ListNotCompiling,
+    /// `glEndList` при незакрытом `glBegin` внутри списка: сначала `end()`.
+    ListBeginOpen { list: u32 },
+    /// В списке осталось то, что на реплее упало бы (вершина вне `glBegin`,
+    /// несбалансированный begin): список определён, но не вызываем.
+    ListMalformed { list: u32 },
+    /// Вызов списка при открытом `glBegin` живого контекста начал бы
+    /// компиляцию/вызов с чужим `in_begin` — отвергаем.
+    ListDuringBegin,
+    /// Операция с клиентским указателем (`glTexImage2D`, `glGenTextures`,
+    /// `glDeleteTextures`, `glGenLists`) внутри компиляции списка: C записал
+    /// бы сырой указатель и на реплее прочитал освобождённую память.
+    ListClientPointer,
+    /// Список (прямо или через вложенные) вызывает сам себя: upstream
+    /// переполнил бы C-стек.
+    ListCycle { list: u32 },
 }
 
 impl fmt::Display for FbError {
@@ -112,6 +173,86 @@ impl fmt::Display for FbError {
             FbError::ContextAlreadyLive => write!(
                 f,
                 "another TinyGL Context is alive in this process (gl_ctx is global, no Send/Sync)"
+            ),
+            FbError::BadTextureCount { count } => write!(
+                f,
+                "texture count {count} must be in 1..=1024 (glGenTextures(0) does nothing)"
+            ),
+            FbError::BadTextureName { name } => write!(
+                f,
+                "texture name {name} does not fit TinyGL's signed int handle"
+            ),
+            FbError::BadTextureSize { width, height } => write!(
+                f,
+                "texture size {width}x{height} must be in 1..=4096 (upstream resamples to 256x256)"
+            ),
+            FbError::TextureDataLenMismatch { expected, actual } => write!(
+                f,
+                "RGB texture data has {actual} bytes, expected exactly {expected} (dense w*h*3 rows)"
+            ),
+            FbError::TextureNotBound => write!(
+                f,
+                "no texture is bound; call bind_texture first (upstream current_texture is NULL)"
+            ),
+            FbError::TextureHasNoImage { texture } => write!(
+                f,
+                "texture {texture} has no uploaded image; call tex_image_2d before enabling GL_TEXTURE_2D"
+            ),
+            FbError::TextureBoundAndEnabled { texture } => write!(
+                f,
+                "texture {texture} is bound and GL_TEXTURE_2D is enabled; \
+                 disable the texture or bind another one before deleting it"
+            ),
+            FbError::TextureNameExhausted => write!(
+                f,
+                "generating more texture names would overflow TinyGL's int handle space"
+            ),
+            FbError::UnsupportedTextureParameter { pname, param } => write!(
+                f,
+                "glTexParameteri({pname}, {param}) is not supported upstream \
+                 (wrap is always REPEAT, filtering is always NEAREST)"
+            ),
+            FbError::BadListRange { range } => write!(
+                f,
+                "display-list range {range} must be in 1..=1024 (upstream has 1024 slots)"
+            ),
+            FbError::ListSpaceExhausted => write!(
+                f,
+                "no run of free display-list names of the requested length remains"
+            ),
+            FbError::ListStateDiverged { expected, actual } => write!(
+                f,
+                "display-list occupancy mirror diverged from C (expected name {expected}, C returned {actual})"
+            ),
+            FbError::ListUndefined { list } => write!(
+                f,
+                "display list {list} is not defined (upstream glCallList would exit(1))"
+            ),
+            FbError::ListAlreadyCompiling => {
+                write!(f, "a display list is already being compiled; call end_list first")
+            }
+            FbError::ListNotCompiling => write!(f, "glEndList without an open glNewList"),
+            FbError::ListBeginOpen { list } => write!(
+                f,
+                "display list {list} still has an open glBegin; call end before end_list"
+            ),
+            FbError::ListMalformed { list } => write!(
+                f,
+                "display list {list} contains an operation that would abort upstream on replay \
+                 (stray vertex or unbalanced begin); redefine or delete the list"
+            ),
+            FbError::ListDuringBegin => write!(
+                f,
+                "cannot open a display list while glBegin is open (upstream in_begin state)"
+            ),
+            FbError::ListClientPointer => write!(
+                f,
+                "client-pointer operation is not allowed during display-list compilation \
+                 (C would replay a stale Rust pointer); do it outside glNewList/glEndList"
+            ),
+            FbError::ListCycle { list } => write!(
+                f,
+                "display list {list} is called recursively; upstream would overflow the C stack"
             ),
         }
     }
