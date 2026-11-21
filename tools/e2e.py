@@ -137,6 +137,10 @@ MODE_DEFAULTS = {
     # and the ext2 writes both run under TCG.
     "bench": {"timeout": 900.0, "serial": "serial_bench.log"},
     "shell": {"timeout": 180.0, "serial": "serial_shell.log"},
+    # Stage 2: a real desktop window whose pixels are a kernel-shell session.
+    # Long by design: TCG compositing plus ppkg update/install for the distro
+    # userland (`nano`, `fastfetch`) that the bare-name commands need.
+    "termwindow": {"timeout": 4200.0, "serial": "serial_termwindow.log"},
     # USB input: boot (menu appears once init_fs runs) + drive + shell + `usb`.
     # The waits are generous on purpose: this runs under TCG, and a timeout is a
     # verdict, not a retry knob.
@@ -189,6 +193,10 @@ MODE_EVIDENCE = {
     ),
     "rndis": (
         r"usb-rndis:|net: usb-rndis|net: DHCP lease|eth0  inet|ping: reply|pkg:|pagh:/>",
+    ),
+    "termwindow": (
+        r"\[DIAG\] window session=|pagh-terminal:|pagh-desktop:|fastfetch|"
+        r"nano|PANIC|\[EXC|pagh:/>",
     ),
     "desktop": (
         r"pagh-desktop:|pagh-files:|pagh-terminal:|evdev: |ext2 mounted at /mnt|"
@@ -3098,7 +3106,8 @@ def _desktop_disk_ready(image: pathlib.Path, bins: dict[str, pathlib.Path]) -> b
 
 
 def _desktop_prepare_disk(h: "Harness", image: pathlib.Path,
-                          bins: dict[str, pathlib.Path]) -> None:
+                          bins: dict[str, pathlib.Path],
+                          size_mb: int = 64) -> None:
     """Create a pagh-owned ext2 volume, then inject the binaries with debugfs.
 
     The kernel only mounts a volume carrying its WAL superblock, and a host
@@ -3118,7 +3127,7 @@ def _desktop_prepare_disk(h: "Harness", image: pathlib.Path,
         image.unlink()
     except FileNotFoundError:
         pass
-    run_checked([shutil.which("qemu-img"), "create", "-f", "raw", str(image), "64M"],
+    run_checked([shutil.which("qemu-img"), "create", "-f", "raw", str(image), f"{size_mb}M"],
                 "qemu-img create (desktop format)", timeout=60)
     log("desktop: first boot on a blank disk to let the kernel format ext2+WAL")
     h.boot(need_keyboard=True, disk=image, net=False)
@@ -4073,6 +4082,351 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     return ok
 
 
+
+# ── stage 2: the desktop terminal window IS a full kernel-shell session ──────
+#
+# THE CLAIM THIS MODE PINS DOWN: the window pagh-terminal opens is not a mirror
+# and not a userspace shell — it is a second kernel console (session 1, #148)
+# whose REPL, command registry, PATH fallback (#158), editor and job handoff are
+# the boot shell's own code. So every command in `src/shell/registry.rs` must
+# work *in the window*, and `nano`/`fastfetch`/`lxrun nano` must run from a bare
+# name because the shell does the PATH search.
+#
+# Two evidence channels, because one alone cannot falsify a routing bug:
+#   * the QEMU framebuffer (one PNG per command) shows the command's OUTPUT in
+#     the window, which is what a human sees;
+#   * serial carries `[DIAG] window session=1 command=…/done=…` (kernel half in
+#     this branch) — the machine-readable proof that the line reached the
+#     window's session shell and returned, NOT the boot shell. Kernel-shell
+#     commands print nothing on serial, so any of their output appearing there
+#     is exactly the leak this mode fails on.
+#
+# The window API used here is the shipped one: PDP/1 over AF_UNIX for the
+# window, `/dev/vtfb1` (+ `mmap`) for pixels and `/dev/vtinput1` for keys.
+
+_TERMWINDOW_INJECTED = ("pd", "pagh-terminal")
+
+
+def _termwindow_bins(skip_build: bool) -> dict[str, pathlib.Path]:
+    """Build/locate the compositor and the kernel-session terminal client.
+
+    No Files client: the acceptance is about ONE window whose pixels are the
+    kernel shell's own console, and every extra binary only lengthens the
+    TCG boot.
+    """
+    desktop = ROOT / "rust-apps" / "pagh-desktop"
+    out = desktop / "target" / "x86_64-unknown-linux-musl" / "release"
+    bins = {
+        "pd": out / "pagh-desktop",
+        "pagh-terminal": ROOT / "rust-apps" / "out" / "pagh-terminal",
+    }
+    if not skip_build:
+        log("termwindow: building static pagh-desktop compositor ...")
+        proc = subprocess.run([str(desktop / "build-static.sh")], cwd=desktop,
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise SetupError("termwindow: desktop build failed: "
+                             + " | ".join((proc.stderr or proc.stdout).strip().splitlines()[-6:]))
+        log("termwindow: building static pagh-terminal client ...")
+        proc = subprocess.run([str(ROOT / "tools" / "build-rust-app.sh"),
+                               str(ROOT / "rust-apps" / "pagh-terminal")],
+                              cwd=ROOT, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise SetupError("termwindow: pagh-terminal build failed: "
+                             + " | ".join((proc.stderr or proc.stdout).strip().splitlines()[-6:]))
+    for name, path in bins.items():
+        if not path.is_file():
+            raise SetupError(f"termwindow binary missing: {path} ({name})")
+    return bins
+
+
+def _debugfs_write_text(image: pathlib.Path, guest_path: str, text: str) -> None:
+    """Write a small text file into the ext2 image the guest mounts at /mnt."""
+    host_tmp = CACHE / ("debugfs-" + guest_path.strip("/").replace("/", "-"))
+    host_tmp.write_text(text, encoding="utf-8")
+    # A reused image already carries the previous run's copy; debugfs refuses to
+    # overwrite, so drop it first (missing file is fine).
+    subprocess.run(["debugfs", "-w", "-R", f"rm {guest_path}", str(image)],
+                   capture_output=True, text=True)
+    proc = subprocess.run(["debugfs", "-w", "-R",
+                           f"write {host_tmp} {guest_path}", str(image)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0 or "File exists" in (proc.stdout + proc.stderr):
+        raise SetupError(f"debugfs write {guest_path} failed: "
+                         f"{(proc.stdout or '') + (proc.stderr or '')}")
+
+
+def _debugfs_cat(image: pathlib.Path, path: str) -> str | None:
+    """Read one file straight out of the ext2 image the guest just wrote.
+
+    `/mnt` in the guest IS this image, so this is the ground truth for "nano
+    saved the file" — stronger than reading pixels, and it needs no guest tool.
+    """
+    proc = subprocess.run(["debugfs", "-R", f"cat {path}", str(image)],
+                          capture_output=True, text=True)
+    blob = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0 or "File not found" in blob:
+        return None
+    return proc.stdout
+
+
+def mode_termwindow(h: "Harness") -> tuple[str, int]:
+    """Stage-2 acceptance: a full kernel shell, with its output, inside a window.
+
+    Flow: the compositor runs on the real fbdev/evdev ABI (parked in the
+    background so the boot shell is not its foreground), then the shipped
+    `pagh-terminal` attaches to `/dev/vtfb1` + `/dev/vtinput1`. Everything typed
+    afterwards goes through evdev -> PDP/1 -> the client -> `/dev/vtinput1` ->
+    the session ring, i.e. exactly the user's path; the harness only clicks the
+    window to focus it and then types on the emulated keyboard.
+    """
+    a = h.a
+    bins = _termwindow_bins(a.skip_build)
+    disk = CACHE / f"e2e_termwindow_disk_{a.disk_mb}mb.img"
+    if not (a.reuse_termwindow_disk and _desktop_disk_ready(disk, bins)):
+        if a.reuse_termwindow_disk:
+            warn("termwindow: --reuse-termwindow-disk is not usable; rebuilding it")
+        # The distro step installs Debian packages into this volume; 64 MiB (the
+        # desktop-mode default) is only enough for the injected binaries.
+        _desktop_prepare_disk(h, disk, bins, size_mb=a.disk_mb)
+    else:
+        log(f"termwindow: reusing {rel(disk)}")
+
+    # The compositor command goes in through `/mnt/etc/autorun`, not through the
+    # emulated keyboard: the launch-target spec contains `{socket}`, whose
+    # shifted braces forced a QMP chord, and a chord whose release is lost under
+    # TCG leaves Ctrl/Shift stuck on QEMU's keyboard — the guest then turns the
+    # next `c` into a real ^C. Autorun is also the shipped desktop recipe
+    # (`rust-apps/pagh-desktop/desktop-autorun`).
+    autorun = (f"lxrun /mnt/pd --backend fbdev --input evdev --quiet --full-render "
+               # `{socket}` is the compositor's placeholder; without it the server
+               # appends `--connect <socket>`, which the kernel-session client
+               # rejects (that flag belongs to pagh-files).
+               f"--launch-target terminal=/mnt/pagh-terminal|--socket|{{socket}}"
+               f"|--size|{a.term_size}|--log-file|/mnt/term.log "
+               f"--autostart terminal "
+               f"--exit-after-ms {a.pd_lifetime_ms} --selfcheck-ms {a.selfcheck_ms}\n")
+    _debugfs_write_text(disk, "/etc/autorun", autorun)
+    log(f"autorun: {autorun.strip()}")
+
+    h.boot(need_keyboard=False, disk=disk, net=not a.no_net)
+    assert h.guest is not None
+    _require_boot_serial(h, "termwindow boot", a.serial_start_timeout)
+    guest = h.guest
+    kb = QemuShotKeyboard(h.monitor, a.key_delay)
+    ok = True
+    shots: list[pathlib.Path] = []
+
+    def shot(name: str) -> pathlib.Path:
+        path = CACHE / f"termwindow-{name}.png"
+        kb.screenshot(path)
+        shots.append(path)
+        return path
+
+    def mark() -> int:
+        return len(guest.serial())
+
+    def wait_new(offset: int, patterns, timeout: float, label: str) -> str | None:
+        deadline = time.time() + timeout
+        compiled = [re.compile(pat) for pat in patterns]
+        while time.time() < deadline:
+            text = guest.serial()[offset:]
+            for pat in compiled:
+                if pat.search(text):
+                    return pat.pattern
+            if guest.proc is not None and not guest.alive():
+                raise HarnessError(f"QEMU exited before the {label}; serial tail:\n"
+                                   f"{tail(guest.serial())}")
+            time.sleep(0.5)
+        return None
+
+    def diag(name: str, phase: str = "done") -> str:
+        return rf"\[DIAG\] window session=1 {phase}={re.escape(name)}"
+
+    def run_in_window(slug: str, command: str, name: str,
+                      timeout: float | None = None) -> bool:
+        """Type one line into the focused window and require its DIAG round trip."""
+        limit = a.cmd_timeout if timeout is None else timeout
+        offset = mark()
+        log(f"window command: {command}")
+        kb.text(command)
+        kb.key("ret")
+        # Two waits, but a failed start must not burn the whole completion
+        # budget: the DIAG "command=" line is written by the session shell
+        # BEFORE the handler runs, so its absence means the keystrokes never
+        # reached the window at all.
+        started = wait_new(offset, [diag(name, "command")], min(30.0, limit), f"{slug} start")
+        finished = None
+        if started is not None:
+            finished = wait_new(offset, [diag(name, "done")], limit, f"{slug} completion")
+        time.sleep(a.settle_shot)
+        shot(slug)
+        line = regex_first(diag(name, "done"), guest.serial()[offset:]) or ""
+        return h.check(f"{slug}: `{command}` ran in the window session shell",
+                       started is not None and finished is not None,
+                       line or (f"reached the shell but never returned (timeout {limit:.0f}s)"
+                                if started else f"no {name} DIAG round trip"))
+
+    try:
+        kb.connect(timeout=min(a.boot_timeout, 180.0))
+        if h.qmp is None:
+            h.qmp = QmpClient(h.qmp_path)
+            h.qmp.connect()
+        # Autorun runs before the first prompt, so the marker to wait for is the
+        # compositor's own, not `pagh:/>`.
+        offset = mark()
+        landed = wait_new(offset, [r"\[autorun\] lxrun /mnt/pd"], a.boot_timeout,
+                          "autorun compositor")
+        ok &= h.check("autorun started the compositor (no typing involved)",
+                      landed is not None, "[autorun] lxrun /mnt/pd" if landed else "no autorun line")
+        selfcheck = wait_new(offset, [r"pagh-desktop: fbdev selfcheck (PASS|FAIL)"],
+                             180.0, "compositor selfcheck")
+        text = guest.serial()[offset:]
+        # `--quiet` keeps per-client diagnostics off the console (TOSTOP), so the
+        # backend/input lines are absent by design; the takeover line and the
+        # selfcheck are the fbdev/evdev evidence.
+        ok &= h.check("compositor opened /dev/fb0 (takeover) and /dev/input/event0",
+                      "/dev/fb0 opened" in text,
+                      regex_first(r"\[FB\] /dev/fb0 opened[^\r\n]*", text) or "no /dev/fb0 line")
+        ok &= h.check("compositor selfcheck PASS", "fbdev selfcheck PASS" in text,
+                      regex_first(r"pagh-desktop: fbdev selfcheck[^\r\n]*", text) or "FAIL")
+
+        shot("00-desktop")
+        # ── the shipped kernel-session terminal window ──
+        # The compositor's launch-target execve is the serial proof that the
+        # configured client (not a demo/stub) started; opening /dev/vtfb1 then
+        # spawns kernel-shell session 1.
+        started = wait_new(offset, [r"execve pid=\d+ '/mnt/pagh-terminal'"], 120.0,
+                           "terminal client exec")
+        ok &= h.check("compositor launched the real /mnt/pagh-terminal window",
+                      started is not None, started or "no execve line for pagh-terminal")
+        # Focus: pointer homing, then a click inside the window content. The
+        # window is placed by the compositor (cascade origin, clamped); a click
+        # at (500, 350) is inside any content area this scenario creates.
+        for _ in range(24):
+            h.qmp.rel(-100, -100)
+            time.sleep(0.02)
+        for _ in range(10):
+            h.qmp.rel(50, 35)
+            time.sleep(0.02)
+        h.qmp.button("left", True)
+        time.sleep(0.15)
+        h.qmp.button("left", False)
+        # The first printable key still reaches the boot ring before the client
+        # writes /dev/vtinput1 and claims ownership; burn it on a space so the
+        # boot shell's line editor never accumulates a command.
+        kb.key("spc")
+        time.sleep(a.term_settle)
+        window = shot("01-window")
+
+        # ── every kernel-shell command the acceptance names ──
+        cases = [
+            ("02-df", "df", "df"),
+            ("03-ps", "ps", "ps"),
+            ("04-ps-ef", "ps -ef", "ps"),
+            ("05-id", "id", "id"),
+            ("06-id-un", "id -un", "id"),
+            ("07-groups", "groups", "groups"),
+            ("08-ls-la", "ls -la /mnt", "ls"),
+            ("09-disk", "disk list", "disk"),
+            ("10-clear", "clear", "clear"),
+            ("11-help", "help", "help"),
+        ]
+        for slug, command, name in cases:
+            ok &= run_in_window(slug, command, name)
+
+        # ── kernel `nano`: open, edit, save, quit ──
+        offset = mark()
+        log("window command: nano /mnt/win-nano.txt")
+        kb.text("nano /mnt/win-nano.txt")
+        kb.key("ret")
+        opened = wait_new(offset, [diag("nano", "command")], 45.0, "nano start")
+        time.sleep(a.term_settle)
+        shot("12-nano-open")
+        kb.text("QTERM-NANO-OK")
+        time.sleep(1.0)
+        shot("13-nano-typed")
+        h.qmp.keys(["ctrl", "s"])           # kernel nano: save
+        h.qmp.release_modifiers()
+        time.sleep(a.term_settle)
+        shot("14-nano-saved")
+        h.qmp.keys(["ctrl", "q"])           # kernel nano: quit
+        h.qmp.release_modifiers()
+        closed = wait_new(offset, [diag("nano", "done")], 60.0, "nano exit")
+        ok &= h.check("kernel nano opened, edited, saved and returned to the shell",
+                      opened is not None and closed is not None,
+                      regex_first(diag("nano", "done"), guest.serial()[offset:]) or "no nano round trip")
+
+        # ── distro userland: ppkg + bare-name `nano`/`fastfetch` ──
+        if not a.no_distro:
+            ok &= run_in_window("15-ppkg-update", "ppkg update", "ppkg",
+                                timeout=a.ppkg_timeout)
+            ok &= run_in_window("16-ppkg-install", "ppkg install nano fastfetch", "ppkg",
+                                timeout=a.ppkg_timeout)
+
+            # Linux nano by bare name through lxrun: Ctrl+O saves, Enter keeps the
+            # name, Ctrl+X exits — the real ncurses binary, not the kernel editor.
+            offset = mark()
+            log("window command: lxrun nano /mnt/linux-nano.txt")
+            kb.text("lxrun nano /mnt/linux-nano.txt")
+            kb.key("ret")
+            opened = wait_new(offset, [diag("lxrun", "command")], 60.0, "lxrun nano start")
+            time.sleep(a.term_settle * 2)
+            shot("17-lxrun-nano-open")
+            kb.text("QTERM-LINUX-NANO-OK")
+            time.sleep(1.5)
+            h.qmp.keys(["ctrl", "o"])
+            h.qmp.release_modifiers()
+            time.sleep(1.5)
+            kb.key("ret")                   # accept the offered filename
+            time.sleep(2.0)
+            shot("18-lxrun-nano-saved")
+            h.qmp.keys(["ctrl", "x"])
+            h.qmp.release_modifiers()
+            closed = wait_new(offset, [diag("lxrun", "done")], 120.0, "lxrun nano exit")
+            ok &= h.check("`lxrun nano` (real Linux nano) runs in the window and exits",
+                          opened is not None and closed is not None,
+                          regex_first(diag("lxrun", "done"), guest.serial()[offset:]) or "no lxrun round trip")
+
+            # Bare `fastfetch`: no `lxrun` prefix, the shell resolves it in PATH.
+            ok &= run_in_window("19-fastfetch", "fastfetch", "fastfetch",
+                                timeout=180.0)
+            fastfetch_out = guest.serial()[offset:]
+            ok &= h.check("bare `fastfetch` produced output (compat stdout on serial)",
+                          len(fastfetch_out.strip()) > 120,
+                          f"{len(fastfetch_out)} bytes after the command")
+
+        # ── routing assertions on the serial log ──
+        text = guest.serial()
+        leaked = [needle for needle in ("1K-blocks", "STAT COMMAND", "uid=0(root)",
+                                        "Available commands", "DEVICE      SIZE")
+                  if needle in text]
+        ok &= h.check("no kernel-shell command output leaked into the boot console",
+                      not leaked, ", ".join(leaked) if leaked else "serial clean")
+        crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE|SIGSEGV", text)
+        ok &= h.check("no panic/exception/SIGSEGV in the guest", not crashes,
+                      crashes[0] if crashes else "none")
+
+        # Flush the ext2 journal before reading the image from the host.
+        run_in_window("20-sync", "sync", "sync")
+
+        # ── files written by nano are read straight from the image ──
+        guest.stop()
+        for name, needle in (("win-nano", "QTERM-NANO-OK"),
+                             ("linux-nano", "QTERM-LINUX-NANO-OK")):
+            if a.no_distro and name == "linux-nano":
+                continue
+            content = _debugfs_cat(disk, f"/{name}.txt")
+            ok &= h.check(f"nano saved /mnt/{name}.txt (read back from the ext2 image)",
+                          bool(content) and needle in (content or ""),
+                          (content or "file missing").strip().splitlines()[0][:80]
+                          if content else "file missing")
+        h.metrics["window screenshots"] = ", ".join(rel(path) for path in shots)
+        return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+    finally:
+        kb.close()
+
+
 def _net_probe_binary() -> pathlib.Path:
     """Assemble `tools/net_probe.c` into a freestanding static ELF.
 
@@ -4185,6 +4539,7 @@ MODES = {
     "rndis": mode_rndis,
     "scroll": mode_scroll,
     "desktop": mode_desktop,
+    "termwindow": mode_termwindow,
     "groups": mode_groups,
     "netperms": mode_netperms,
     "smoke": mode_smoke,
@@ -4375,6 +4730,39 @@ def build_parser() -> argparse.ArgumentParser:
                          "0-serial failures (default 25 s)")
     dp.add_argument("--selfcheck-ms", type=int, default=3_000,
                     help="delay of the in-guest fbdev selfcheck (default 3000)")
+
+    tw = sub.add_parser(
+        "termwindow", parents=[common],
+        help="Stage-2 acceptance: the desktop terminal window is a FULL kernel-shell "
+             "session — every registry command, bare-name nano/fastfetch via PATH, "
+             "and nano save verified from the ext2 image")
+    tw.add_argument("--skip-build", action="store_true",
+                    help="use existing static pagh-desktop/pagh-terminal binaries")
+    tw.add_argument("--reuse-termwindow-disk", action="store_true",
+                    help="reuse .cache/e2e_termwindow_disk.img (already formatted/injected)")
+    tw.add_argument("--term-size", default="1180x700",
+                    help="window size passed to pagh-terminal --size (default 1180x700)")
+    tw.add_argument("--pd-lifetime-ms", type=int, default=3_600_000,
+                    help="compositor lifetime passed as --exit-after-ms (default 3600000)")
+    tw.add_argument("--selfcheck-ms", type=int, default=3_000,
+                    help="delay of the in-guest fbdev selfcheck (default 3000)")
+    tw.add_argument("--term-settle", type=float, default=2.5,
+                    help="settle after each window keystroke burst (default 2.5 s)")
+    tw.add_argument("--settle-shot", type=float, default=1.5,
+                    help="settle before a per-command screenshot (default 1.5 s)")
+    tw.add_argument("--cmd-timeout", type=float, default=90.0,
+                    help="timeout for one window command's DIAG round trip (default 120 s)")
+    tw.add_argument("--ppkg-timeout", type=float, default=1500.0,
+                    help="timeout for `ppkg update`/`ppkg install` in the window")
+    tw.add_argument("--no-net", action="store_true",
+                    help="boot without e1000 (ppkg update/install will fail)")
+    tw.add_argument("--no-distro", action="store_true",
+                    help="skip the distro userland step (ppkg, lxrun nano, fastfetch)")
+    tw.add_argument("--disk-mb", type=int, default=256,
+                    help="size of the pagh-owned volume that ppkg installs into "
+                         "(default 256 MiB; 64 MiB holds only the injected binaries)")
+    tw.add_argument("--serial-start-timeout", type=float, default=25.0,
+                    help="fail-fast window for the first serial bytes after boot")
 
     sub.add_parser("usb", parents=[common],
                    help="USB-input acceptance: boot the staged image with an "
