@@ -52,6 +52,7 @@ use super::unix_sock;
 /// Биты типа `st_mode` для символьного устройства (консоль/stdin), чтобы
 /// `fstat` стандартного потока сообщал правдоподобный (не regular) тип.
 const S_IFCHR: u32 = 0o020000;
+const S_IFBLK: u32 = 0o060000;
 
 /// Биты типа `st_mode` для сокета (концы socketpair).
 const S_IFSOCK: u32 = 0o140000;
@@ -494,6 +495,48 @@ fn read_evdev_event(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
     }
 }
 
+/// `read(2)` с `/dev/uevent`: ровно одна запись v2 (144 байта).
+///
+/// `count < 144` — `EINVAL`, а не «вернуть сколько влезло»: частичная запись
+/// сдвинула бы границу следующего чтения и читатель склеил бы поля двух событий.
+/// Пустое кольцо: `O_NONBLOCK` → `EAGAIN`, blocking → уступка CPU с
+/// перепроверкой сигнала (тот же контракт, что у evdev).
+fn read_uevent_record(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
+    const RECORD: u64 = crate::drivers::usb_uevent_abi::RECORD_SIZE as u64;
+    if count < RECORD {
+        return Err(Errno::EINVAL);
+    }
+    check_user_ptr_writable(buf, RECORD)?;
+    let nonblock = fd_open_flags(fd)
+        .map(|f| f & crate::task::fd::O_NONBLOCK != 0)
+        .unwrap_or(false);
+    let mut record = [0u8; crate::drivers::usb_uevent_abi::RECORD_SIZE];
+    loop {
+        if crate::drivers::usb_uevent::pop(&mut record) {
+            // Повторная проверка приёмника: буфер мог исчезнуть, пока вызов
+            // уступал CPU (тот же TOCTOU-контракт, что у pipe/read).
+            copy_out_checked(buf, &record)?;
+            return Ok(RECORD);
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if super::signal::has_deliverable_current() {
+            return Err(Errno::EINTR);
+        }
+        crate::task::scheduler::yield_current();
+    }
+}
+
+/// `ioctl` `/dev/uevent`: только `PUEV_IOC_SNAPSHOT`; прочее — `ENOTTY`.
+fn uevent_ioctl(request: u64) -> Result<u64, Errno> {
+    if crate::drivers::usb_uevent::ioctl(request) {
+        Ok(0)
+    } else {
+        Err(Errno::ENOTTY)
+    }
+}
+
 /// `read(2)` с `/dev/vtconsole0`: один целостный снимок shared-поверхности.
 ///
 /// Отличается от общего файлового пути только подготовкой приёмника. Клиент
@@ -554,6 +597,9 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         }
         if node.is_evdev() {
             return read_evdev_event(fd as u32, buf, count);
+        }
+        if node.is_uevent() {
+            return read_uevent_record(fd as u32, buf, count);
         }
         if node.is_vtconsole() || node.is_vtfb1() {
             return read_snapshot_dev(fd as u32, buf, count);
@@ -1295,6 +1341,17 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
     // как раз такая ссылка, и открытие должно вернуть реальный образ, а не узел
     // ссылки.
     let node = walk(abs, true)?;
+    // `/dev/uevent` — один читатель: второй `open` получает `EBUSY`, а первый
+    // сразу получает initial snapshot (cold-plug не должен быть невидим).
+    let claimed_uevent = if node.is_uevent() {
+        if !crate::drivers::usb_uevent::claim_reader() {
+            return Err(Errno::EBUSY);
+        }
+        crate::drivers::usb_uevent::snapshot();
+        true
+    } else {
+        false
+    };
     let obj = if node.is_directory() {
         let children = node.readdir().unwrap_or_default();
         OpenObject::Dir {
@@ -1309,8 +1366,16 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
             offset: 0,
         }
     };
-    let fd = compat::with_current_compat(|cs| cs.fds.alloc_with_flags(obj, flags))
-        .ok_or(Errno::EBADF)??;
+    let fd = match compat::with_current_compat(|cs| cs.fds.alloc_with_flags(obj, flags)) {
+        Some(Ok(fd)) => fd,
+        other => {
+            if claimed_uevent {
+                crate::drivers::usb_uevent::release_reader();
+            }
+            other.ok_or(Errno::EBADF)??;
+            return Err(Errno::EBADF);
+        }
+    };
     if node.is_vtconsole() {
         // Публикация включается после успешной аллокации fd: клиент сразу
         // получает снимок уже нарисованного shell-текста.
@@ -1511,6 +1576,10 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
         resolve_fd(fd as u32),
         Some(Resolved::File { ref node, .. }) if node.is_vtfb1() || node.is_vtinput1()
     );
+    let closing_uevent = matches!(
+        resolve_fd(fd as u32),
+        Some(Resolved::File { ref node, .. }) if node.is_uevent()
+    );
     let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
     match res {
         Some(Ok(())) => {
@@ -1519,6 +1588,9 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
             }
             if closing_session_dev {
                 crate::drivers::session::note_close(1);
+            }
+            if closing_uevent {
+                crate::drivers::usb_uevent::release_reader();
             }
             Ok(0)
         }
@@ -1871,12 +1943,15 @@ fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
         S_IFDIR | perms
     } else if node.is_symlink() {
         S_IFLNK | perms
+    } else if node.is_blockdev() {
+        S_IFBLK | perms
     } else if node.is_fbdev()
         || node.is_evdev()
         || node.is_vtconsole()
         || node.is_vtinput()
         || node.is_vtfb1()
         || node.is_vtinput1()
+        || node.is_uevent()
     {
         // Символьные устройства варианта B: композитор видит S_IFCHR, как
         // `/dev/fb0`/`/dev/input/event0` в Linux, и может отличить их от
@@ -2089,6 +2164,7 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
             vtconsole_ioctl(&node, request, arg)
         }
         Some(Resolved::File { node, .. }) if node.is_vtfb1() => vtfb_ioctl(&node, request, arg),
+        Some(Resolved::File { node, .. }) if node.is_uevent() => uevent_ioctl(request),
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
         // Сетевые `SIOCGIF*` — на любом `AF_INET`-сокете, как в Linux. До этой
         // ветки они падали в общий ENOTTY, и `ifconfig` не видел ни адреса, ни
@@ -3634,6 +3710,90 @@ fn write_statfs(buf: u64, fs: Option<vfs::FsStat>) -> Result<(), Errno> {
 /// `statfs` (137): заполнить пользовательский `struct statfs` реальной ёмкостью
 /// смонтированной ФС, когда она доступна (путь обязан существовать, иначе
 /// `ENOENT`). Возвращает 0.
+/// `mount(2)` (nr 165): Phase 1 — только `mount("usb0p1", "/usb0p1", "ext2", 0, 0)`.
+///
+/// Точка монтирования обязана быть ровно `"/" + source`: `vfs::mount_at`
+/// поддерживает односоставные точки, а uevent несёт `mount[16]` (≤15 символов +
+/// NUL). Более длинное имя — `ENAMETOOLONG` и лог `bad_mount`, без усечения.
+/// Root-only: policy (какой том монтировать) живёт в userspace-композиторе;
+/// ядро не решает это по содержимому на hotplug.
+pub fn sys_mount(
+    source: u64,
+    target: u64,
+    filesystemtype: u64,
+    mountflags: u64,
+    _data: u64,
+) -> Result<u64, Errno> {
+    if !current_creds().is_root() {
+        return Err(Errno::EPERM);
+    }
+    if mountflags != 0 {
+        // MS_RDONLY/MS_REMOUNT и прочее — future; молча игнорировать флаг
+        // значит пообещать ro-режим, которого нет.
+        return Err(Errno::EINVAL);
+    }
+    if filesystemtype == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fstype = read_user_cstr(filesystemtype)?;
+    if fstype != "ext2" {
+        return Err(Errno::EINVAL);
+    }
+    let source = read_user_cstr(source)?;
+    let target = read_user_cstr(target)?;
+    if target.len() > 15 {
+        crate::warn!(
+            "[linux] mount: bad_mount target too long ({} bytes; max 15): {}",
+            target.len(),
+            target
+        );
+        return Err(Errno::ENAMETOOLONG);
+    }
+    let expected = alloc::format!("/{}", source);
+    if target != expected {
+        crate::warn!(
+            "[linux] mount: bad_mount {} -> {} (target must be exactly {})",
+            source,
+            target,
+            expected
+        );
+        return Err(Errno::EINVAL);
+    }
+    match crate::drivers::usb_storage::mount(&source, &target) {
+        Ok(()) => Ok(0),
+        Err(crate::drivers::usb_storage::MountError::NoDevice) => Err(Errno::ENODEV),
+        Err(crate::drivers::usb_storage::MountError::NotPagh) => Err(Errno::EINVAL),
+        Err(crate::drivers::usb_storage::MountError::Busy) => Err(Errno::EBUSY),
+        Err(crate::drivers::usb_storage::MountError::Io) => Err(Errno::EIO),
+        Err(crate::drivers::usb_storage::MountError::Invalid) => Err(Errno::EINVAL),
+    }
+}
+
+/// `umount2(2)` (nr 166): `flags` — 0 или `MNT_FORCE` (1).
+///
+/// На живом томе при открытых fd — `EBUSY`; `MNT_FORCE` на живом — `EINVAL`
+/// (принудительный отрыв живой ФС запрещён). Ошибка flush оставляет том
+/// смонтированным. На dead-томе detach происходит в обоих случаях, но без
+/// `MNT_FORCE` возвращается `EIO`: `unclean` не выдаётся за clean.
+pub fn sys_umount2(target: u64, flags: u64) -> Result<u64, Errno> {
+    const MNT_FORCE: u64 = 1;
+    if !current_creds().is_root() {
+        return Err(Errno::EPERM);
+    }
+    if flags & !MNT_FORCE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let target = read_user_cstr(target)?;
+    match crate::drivers::usb_storage::umount(&target, flags & MNT_FORCE != 0) {
+        Ok(crate::drivers::usb_storage::UmountOutcome::Clean)
+        | Ok(crate::drivers::usb_storage::UmountOutcome::Forced) => Ok(0),
+        Ok(crate::drivers::usb_storage::UmountOutcome::DirtyDetach) => Err(Errno::EIO),
+        Err(crate::drivers::usb_storage::MountError::Busy) => Err(Errno::EBUSY),
+        Err(crate::drivers::usb_storage::MountError::Io) => Err(Errno::EIO),
+        Err(_) => Err(Errno::EINVAL),
+    }
+}
+
 pub fn sys_statfs(path: u64, buf: u64) -> Result<u64, Errno> {
     check_user_ptr_writable(buf, core::mem::size_of::<LinuxStatfs>() as u64)?;
     let p = read_user_cstr(path)?;
@@ -3767,6 +3927,13 @@ fn poll_revents(fd: i32, events: i16) -> i16 {
                 } else {
                     0
                 }
+            } else if node.is_uevent() {
+                // uevent: POLLIN ровно когда ring непуст.
+                if crate::drivers::usb_uevent::has_events() {
+                    events & POLLIN
+                } else {
+                    0
+                }
             } else if node.is_fbdev() {
                 // Фреймбуфер всегда готов к записи (mmap — отдельный путь).
                 events & POLLOUT
@@ -3890,6 +4057,8 @@ fn select_ready(fd: u64, want_write: bool) -> bool {
         Some(Resolved::File { node, .. }) => {
             if node.is_evdev() {
                 !want_write && crate::drivers::evdev::has_events()
+            } else if node.is_uevent() {
+                !want_write && crate::drivers::usb_uevent::has_events()
             } else {
                 true
             }

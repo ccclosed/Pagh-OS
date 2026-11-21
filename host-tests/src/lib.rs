@@ -493,6 +493,11 @@ pub mod usb_msc_proto;
 #[path = "../../src/drivers/usb_scsi.rs"]
 pub mod usb_scsi;
 
+// `/dev/uevent` ABI v2: 144-байтовая запись, смещения `mount`/`uuid`, все
+// flags/error/fs_class и отказ v1. `core`-only.
+#[path = "../../src/drivers/usb_uevent_abi.rs"]
+pub mod usb_uevent_abi;
+
 // Политика сброса корневого порта xHCI. Только `core`, самодостаточна: state
 // machine порта для USB2 debounce/training, ожиданий PRC/PED+U0, стабильности и
 // backoff, без PP power-cycle. Host-тесты симулируют порты (Polling сотни

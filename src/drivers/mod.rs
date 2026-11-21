@@ -43,6 +43,8 @@ pub mod usb_rndis;
 pub mod usb_rndis_proto;
 pub mod usb_scsi;
 pub mod usb_storage;
+pub mod usb_uevent;
+pub mod usb_uevent_abi;
 pub mod virtio;
 pub mod vt;
 /// Чистый ABI `/dev/vtconsole0` (128-байтный заголовок + 16-байтные клетки).
@@ -103,6 +105,12 @@ pub trait BlockDevice: Send + Sync {
     /// driver that has not implemented the command yet.
     fn flush(&self) -> Result<(), ()> {
         Ok(())
+    }
+
+    /// Устройство физически исчезло (hot-unplug). `umount2` на мёртвом
+    /// устройстве не может сделать clean flush и обязан сообщить `unclean`.
+    fn is_dead(&self) -> bool {
+        false
     }
 }
 

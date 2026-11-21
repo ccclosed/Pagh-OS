@@ -371,6 +371,10 @@ fn chroot_predicate_is_component_exact() {
         "/dev/null",
         "/tmp/x",
         "/sys",
+        "/usb0p1",
+        "/usb0p1/e2e.txt",
+        "/usbfoo",
+        "/mnt/usb0p1",
     ] {
         assert!(guest_path_keeps_root(keep), "{keep} must keep the root");
     }
@@ -379,6 +383,7 @@ fn chroot_predicate_is_component_exact() {
         "/usr/bin/x",
         "/process",
         "/procfoo",
+        "/media/usb0p1",
         "/devices",
         "/etc/resolv.conf",
     ] {

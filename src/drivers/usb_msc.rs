@@ -401,6 +401,10 @@ impl BlockDevice for MscDevice {
         self.sectors
     }
 
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
+
     fn flush(&self) -> Result<(), ()> {
         if self.dead.load(Ordering::SeqCst) {
             return Err(());
