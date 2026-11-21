@@ -20,8 +20,8 @@ use pagh_terminal::font::{CELL_H, CELL_W};
 use pagh_terminal::keys::{self, KeyModes};
 use pagh_terminal::protocol::{buttons, InputEvent};
 use pagh_terminal::render::{
-    render_screen, render_screen_into, render_window, Canvas, RenderOptions, Theme,
-    VIEWPORT_PADDING,
+    render_screen, render_screen_into, render_screen_into_cleared, render_window, Canvas,
+    RenderOptions, Theme, VIEWPORT_PADDING,
 };
 use pagh_terminal::screen::{CursorStyle, SelectionMode};
 use pagh_terminal::session::{self, ShellSession};
@@ -408,8 +408,11 @@ impl FrameSnapshot {
 /// Перерисовать отрезки поверх уже готового кадра.
 ///
 /// Каждый отрезок рисуется как самостоятельный экран из одной строки: это
-/// ровно тот же код (`render_screen_into`), что и в полном кадре, поэтому
-/// результат совпадает пиксель-в-пиксель, а стоит O(клеток отрезка).
+/// тот же рендер, что и в полном кадре, поэтому результат совпадает
+/// пиксель-в-пиксель, а стоит O(клеток отрезка). Здесь нужен полный
+/// [`render_screen_into`], а не `_cleared` из #164: область отрезка держит
+/// пиксели прошлого кадра, а не заливку `theme.bg`, поэтому фон каждой клетки
+/// обязан быть перерисован.
 fn render_runs(
     canvas: &mut Canvas,
     screen: &Screen,
@@ -476,8 +479,12 @@ fn paint_frame(
 ) -> Damage {
     let damage = match prev.as_ref().map(|snapshot| snapshot.damage(screen, opts)) {
         None | Some(FrameDamage::Full) => {
+            // #164 (opt-level/row-store): фон заливается один раз, а
+            // `render_screen_into_cleared` пропускает клетки с bg == theme.bg —
+            // пиксель-в-пиксель то же, что полный `render_screen_into`, без
+            // второй заливки каждой клетки.
             canvas.fill(theme.bg);
-            render_screen_into(
+            render_screen_into_cleared(
                 canvas,
                 VIEWPORT_PADDING,
                 VIEWPORT_PADDING,
@@ -573,7 +580,7 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                 let canvas = fallback
                     .get_or_insert_with(|| Canvas::new(width as usize, height as usize, theme.bg));
                 canvas.fill(theme.bg);
-                render_screen_into(
+                render_screen_into_cleared(
                     canvas,
                     VIEWPORT_PADDING,
                     VIEWPORT_PADDING,
@@ -1145,7 +1152,7 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                 }
             } else if let Some(canvas) = fallback.as_mut() {
                 canvas.fill(theme.bg);
-                render_screen_into(
+                render_screen_into_cleared(
                     canvas,
                     VIEWPORT_PADDING,
                     VIEWPORT_PADDING,
@@ -1169,7 +1176,7 @@ fn render_frame(screen: &pagh_terminal::Screen, theme: &Theme, width: u32, heigh
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
     let mut canvas = Canvas::new(width, height, theme.bg);
-    render_screen_into(
+    render_screen_into_cleared(
         &mut canvas,
         VIEWPORT_PADDING,
         VIEWPORT_PADDING,

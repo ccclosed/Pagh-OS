@@ -96,8 +96,9 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "ls",
-        description: "List a directory; -l shows mode, links, owner and size",
-        usage: "ls [-l] [path]",
+        description:
+            "List a directory; -l long format, -a accepted (all entries are always listed)",
+        usage: "ls [-l] [-a] [path]",
         handler: super::commands::cmd_ls,
     },
     CommandSpec {
@@ -179,9 +180,21 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_disk,
     },
     CommandSpec {
+        name: "mount",
+        description: "Not implemented: kernel mount(2) is deferred (USB S1); use `disk`",
+        usage: "mount -t ext2 <device> <point>  (not implemented)",
+        handler: super::commands::cmd_mount,
+    },
+    CommandSpec {
+        name: "umount",
+        description: "Not implemented: kernel umount2(2) is deferred (USB S1); use `disk`",
+        usage: "umount <point>  (not implemented)",
+        handler: super::commands::cmd_umount,
+    },
+    CommandSpec {
         name: "df",
-        description: "Show mounted filesystems and capacity",
-        usage: "df",
+        description: "Show mounted filesystems and capacity; -h binary and -H SI units",
+        usage: "df [-h] [-H]",
         handler: super::commands::cmd_df,
     },
     CommandSpec {
@@ -192,8 +205,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "ps",
-        description: "List compat processes (PID/PPID/STAT/COMMAND)",
-        usage: "ps",
+        description: "List compat processes and kernel threads; -f adds UID and full command line",
+        usage: "ps [-e] [-f]",
         handler: super::commands::cmd_ps,
     },
     CommandSpec {
@@ -258,8 +271,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "id",
-        description: "Show uid/gid/groups of the session or a user",
-        usage: "id [user]",
+        description: "Show uid/gid/groups of the session or a user; -u/-g/-G select, -n names",
+        usage: "id [-u|-g|-G] [-n] [user]",
         handler: super::commands::cmd_id,
     },
     CommandSpec {
@@ -344,7 +357,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "nano",
         description: "Configurable editor: undo, replace, clipboard and backups",
-        usage: "nano <path> | nano --settings ...",
+        usage: "nano [path] | nano --settings [show|reset|set <key> <value>]",
         handler: super::commands::cmd_nano,
     },
     CommandSpec {
@@ -410,8 +423,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "lxrun",
-        description: "Run an installed static Linux binary",
-        usage: "lxrun <path> [args...]",
+        description: "Run a Linux ELF by path or by bare name searched in PATH",
+        usage: "lxrun [path|program] [args...]",
         handler: super::commands::cmd_lxrun,
     },
     CommandSpec {
