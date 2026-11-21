@@ -595,6 +595,31 @@ fn log_file_receives_the_diagnostics_instead_of_stderr() {
 /// Фатальная ошибка тоже обязана уходить в `--log-file`: у приложения,
 /// запущенного композитором, запись в stderr останавливает его SIGTTOU, и
 /// иначе сбой старта («неизвестный аргумент») не увидел бы никто.
+/// Второй запуск не должен затирать строки первого: `O_APPEND` в этом
+/// Linux-слое не реализован, поэтому клиент ищет конец файла сам.
+#[test]
+fn the_log_file_keeps_earlier_runs() {
+    let dir = temp_dir("append");
+    let log = dir.join("client.log");
+    for _ in 0..2 {
+        let out = Command::new(binary())
+            .args(["--no-such-flag"])
+            .arg("--log-file")
+            .arg(&log)
+            .stdout(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+    }
+    let text = std::fs::read_to_string(&log).expect("log file");
+    assert_eq!(
+        text.matches("unknown argument").count(),
+        2,
+        "both runs must be preserved (append, not overwrite): {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fatal_errors_go_to_the_log_file_when_one_is_given() {
     let dir = temp_dir("fatal");

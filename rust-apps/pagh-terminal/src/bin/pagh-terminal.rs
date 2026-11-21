@@ -24,6 +24,7 @@
 #[path = "pagh-terminal/devfs.rs"]
 mod devfs;
 
+use std::io::Seek;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -71,10 +72,16 @@ impl Diag {
                 // Append, не truncate: перезапуск окна (и новая сессия ядра) не
                 // должен стирать строки предыдущего запуска — именно их читают
                 // как evidence.
-                let file = std::fs::OpenOptions::new()
+                let mut file = std::fs::OpenOptions::new()
                     .create(true)
-                    .append(true)
+                    .write(true)
                     .open(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                // `O_APPEND` этот Linux-слой не реализует (флаг принимается и
+                // игнорируется), поэтому конец файла ищется явно: иначе второй
+                // запуск клиента затирал бы строки первого — а именно они и есть
+                // evidence.
+                file.seek(std::io::SeekFrom::End(0))
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 Ok(Diag { file: Some(file) })
             }
@@ -236,9 +243,11 @@ fn report_fatal(error: &str) {
     if let Some(path) = log_file {
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
             .open(&path)
         {
+            // Как и в `Diag::new`: без `O_APPEND` конец файла ищется вручную.
+            let _ = file.seek(std::io::SeekFrom::End(0));
             if writeln!(file, "pagh-terminal: {error}").is_ok() {
                 return;
             }
