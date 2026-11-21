@@ -52,6 +52,50 @@ use pagh_ui::geom::Rect;
 
 const VERSION: &str = "0.1.0";
 
+/// Куда писать диагностику окна.
+///
+/// Обычный путь — stderr (запуск из shell).  Но desktop запускает приложения
+/// через `--launch-target` из **фоновой** группы консоли, а TOSTOP в этом ядре
+/// включён по умолчанию: первая же строка в stderr останавливает клиента
+/// сигналом SIGTTOU (в serial это видно как `stopped by pgid N (foreground 1)
+/// -> SIGTTOU + EINTR`).  Поэтому `--log-file PATH` уводит все строки в файл
+/// (ext2), а не в консоль.
+struct Diag {
+    file: Option<std::fs::File>,
+}
+
+impl Diag {
+    fn new(path: Option<&std::path::Path>) -> Result<Diag, String> {
+        match path {
+            Some(path) => {
+                // Append, не truncate: перезапуск окна (и новая сессия ядра) не
+                // должен стирать строки предыдущего запуска — именно их читают
+                // как evidence.
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                Ok(Diag { file: Some(file) })
+            }
+            None => Ok(Diag { file: None }),
+        }
+    }
+
+    /// Одна строка диагностики (с префиксом `pagh-terminal:`).
+    fn line(&mut self, text: &str) {
+        use std::io::Write;
+        match self.file.as_mut() {
+            // Файл — не tty: SIGTTOU здесь невозможен, а строка должна быть
+            // видна сразу (`cat` во время работы клиента).
+            Some(file) => {
+                let _ = writeln!(file, "pagh-terminal: {text}");
+            }
+            None => eprintln!("pagh-terminal: {text}"),
+        }
+    }
+}
+
 /// Kernel shell-session pixel surface (mode default).
 const KERNEL_FB: &str = "/dev/vtfb1";
 /// Kernel shell-session input device.
@@ -76,6 +120,8 @@ struct Args {
     vt_fb: String,
     /// Log every drawn kernel frame (generation evidence for live runs).
     vt_trace: bool,
+    /// Diagnostics sink: a file instead of stderr (desktop-launched apps).
+    log_file: Option<PathBuf>,
     size: (u32, u32),
     cols: Option<usize>,
     rows: Option<usize>,
@@ -119,6 +165,7 @@ impl Default for Args {
             vt_input: None,
             vt_fb: KERNEL_FB.to_string(),
             vt_trace: false,
+            log_file: None,
             size: (900, 600),
             cols: None,
             rows: None,
@@ -1271,46 +1318,65 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
 fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     let fb_path = args.vt_fb.as_str();
     let input_path = args.kernel_input();
+    // Все строки режима — через `Diag`: при запуске композитором они уходят в
+    // `--log-file`, иначе первая же строка в stderr остановила бы клиента
+    // SIGTTOU (фоновая группа консоли + TOSTOP).
+    let mut diag = Diag::new(args.log_file.as_deref())?;
+    macro_rules! note {
+        ($($arg:tt)*) => {
+            diag.line(&format!($($arg)*))
+        };
+    }
 
-    let source = match devfs::open_frame_source(fb_path) {
-        Ok(source) => source,
+    let opened = match devfs::open_frame_source(fb_path) {
+        Ok(opened) => opened,
         Err(devfs::OpenError::Missing) => {
-            eprintln!(
-                "pagh-terminal: {fb_path} is not present (kernel without the shell-session \
+            note!(
+                "{fb_path} is not present (kernel without the shell-session \
                  surface); falling back to the private userspace shell session"
             );
             return run_shell_session(args, socket);
         }
-        Err(devfs::OpenError::Failed(reason)) => return fail_with_notice(args, socket, &reason),
+        Err(devfs::OpenError::Failed(reason)) => {
+            return fail_with_notice(args, socket, &mut diag, &reason)
+        }
     };
+    note!("{}", opened.note);
     let key_sink = match FileInput::open(input_path) {
         Ok(sink) => sink,
         Err(error) if is_missing_device(&error) => {
-            eprintln!(
-                "pagh-terminal: {input_path} is not present (kernel without the shell-session \
+            note!(
+                "{input_path} is not present (kernel without the shell-session \
                  input); falling back to the private userspace shell session"
             );
             return run_shell_session(args, socket);
         }
-        Err(error) => return fail_with_notice(args, socket, &format!("{input_path}: {error}")),
+        Err(error) => {
+            return fail_with_notice(args, socket, &mut diag, &format!("{input_path}: {error}"))
+        }
     };
-    let mut frame = match KernelFrame::open(source) {
+    let mut frame = match KernelFrame::open(opened.source) {
         Ok(frame) => frame,
-        Err(error) => return fail_with_notice(args, socket, &error.message()),
+        Err(error) => return fail_with_notice(args, socket, &mut diag, &error.message()),
     };
     let info = frame.info();
-    eprintln!(
-        "pagh-terminal: kernel session {}x{} (stride {}, generation {}) on {fb_path}",
-        info.width, info.height, info.stride, info.generation
+    note!(
+        "kernel session {}x{} (stride {}, generation {}) on {fb_path}",
+        info.width,
+        info.height,
+        info.stride,
+        info.generation
     );
 
     let mut client = SurfaceClient::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
     let welcome = client
         .handshake("pagh-terminal", Duration::from_secs(5))
         .map_err(|e| format!("handshake: {e}"))?;
-    eprintln!(
-        "pagh-terminal: kernel session connected (client {}, screen {}x{})",
-        welcome.client_id, welcome.screen_width, welcome.screen_height
+    note!(
+        "kernel session connected (client {}, screen {}x{})",
+        welcome.client_id,
+        welcome.screen_width,
+        welcome.screen_height
     );
     client
         .create_window(args.window_id, args.size.0, args.size.1, &args.title)
@@ -1330,7 +1396,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     let mut shm = match client.enable_shm(width, height) {
         Ok(shm) => shm,
         Err(error) => {
-            eprintln!("pagh-terminal: shm unavailable ({error}); full frames");
+            note!("shm unavailable ({error}); full frames");
             None
         }
     };
@@ -1360,7 +1426,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
             match frame.draw_if_changed(canvas, &theme) {
                 Ok(Draw::Drawn { generation }) => {
                     if trace {
-                        eprintln!("pagh-terminal: kernel frame generation {generation} drawn");
+                        note!("kernel frame generation {generation} drawn");
                     }
                     dirty = true;
                 }
@@ -1369,6 +1435,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     return end_kernel_session(
                         &mut client,
                         &mut shm,
+                        &mut diag,
                         &theme,
                         width,
                         height,
@@ -1384,8 +1451,15 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                         "",
                         "Close this window and relaunch pagh-terminal to retry.",
                     ];
-                    let _ =
-                        end_kernel_session(&mut client, &mut shm, &theme, width, height, &lines);
+                    let _ = end_kernel_session(
+                        &mut client,
+                        &mut shm,
+                        &mut diag,
+                        &theme,
+                        width,
+                        height,
+                        &lines,
+                    );
                     return Err(message);
                 }
             }
@@ -1492,15 +1566,13 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                         // Сессия закончилась между кадром и нажатием: следующий
                         // опрос поверхности вернёт ENODEV и закроет окно честно.
                         if !input_error_reported {
-                            eprintln!(
-                                "pagh-terminal: session ended while forwarding a key ({error})"
-                            );
+                            note!("session ended while forwarding a key ({error})");
                             input_error_reported = true;
                         }
                     }
                     Err(error) => {
                         if !input_error_reported {
-                            eprintln!("pagh-terminal: cannot write {input_path}: {error}");
+                            note!("cannot write {input_path}: {error}");
                             input_error_reported = true;
                         }
                     }
@@ -1514,19 +1586,11 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                 }
                 Event::Input(InputEvent::Motion { .. }) => {}
                 Event::Close { reason, .. } => {
-                    eprintln!(
-                        "pagh-terminal: server closed the window ({})",
-                        close_name(reason)
-                    );
+                    note!("server closed the window ({})", close_name(reason));
                     return Ok(());
                 }
                 Event::Error { code, message } => {
-                    eprintln!(
-                        "pagh-terminal: server error {} ({}): {}",
-                        error_name(code),
-                        code,
-                        message
-                    );
+                    note!("server error {} ({}): {}", error_name(code), code, message);
                 }
                 Event::Ping(_) | Event::Pong(_) => {}
             }
@@ -1567,6 +1631,7 @@ fn canvas_mut<'a>(
 fn end_kernel_session(
     client: &mut SurfaceClient,
     shm: &mut Option<ShmFrame>,
+    diag: &mut Diag,
     theme: &Theme,
     width: u32,
     height: u32,
@@ -1574,7 +1639,7 @@ fn end_kernel_session(
 ) -> Result<(), String> {
     show_notice(client, shm, theme, width, height, lines)?;
     let _ = client.close();
-    eprintln!("pagh-terminal: kernel session ended (the shell exited); window closed");
+    diag.line("kernel session ended (the shell exited); window closed");
     Ok(())
 }
 
@@ -1602,8 +1667,13 @@ fn show_notice(
 /// Окно создаётся только чтобы сказать правду (запуск из шелла без дисплея
 /// просто получит ошибку в stderr). Никакого отката в демо-шелл: пользователь
 /// должен видеть, что сессии ядра нет.
-fn fail_with_notice(args: &Args, socket: &str, reason: &str) -> Result<(), String> {
-    eprintln!("pagh-terminal: kernel session unavailable: {reason}");
+fn fail_with_notice(
+    args: &Args,
+    socket: &str,
+    diag: &mut Diag,
+    reason: &str,
+) -> Result<(), String> {
+    diag.line(&format!("kernel session unavailable: {reason}"));
     let mut client = SurfaceClient::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
     client
         .handshake("pagh-terminal", Duration::from_secs(5))
@@ -1683,6 +1753,9 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             "--vt-input" => out.vt_input = Some(next_value(&mut args, "--vt-input")?),
             "--vt-fb" => out.vt_fb = next_value(&mut args, "--vt-fb")?,
             "--vt-trace" => out.vt_trace = true,
+            "--log-file" => {
+                out.log_file = Some(PathBuf::from(next_value(&mut args, "--log-file")?))
+            }
             "--size" => out.size = parse_size(&next_value(&mut args, "--size")?)?,
             "--cols" => out.cols = Some(parse_usize(&next_value(&mut args, "--cols")?)?),
             "--rows" => out.rows = Some(parse_usize(&next_value(&mut args, "--rows")?)?),
@@ -1784,8 +1857,12 @@ WINDOW (default with --socket): KERNEL SHELL SESSION
   only, and simulates nothing.
   --vt-fb PATH      session pixel surface (default /dev/vtfb1)
   --vt-input PATH   session input device (default /dev/vtinput1)
-  --vt-trace        log every drawn frame (its kernel generation) to stderr;
+  --vt-trace        log every drawn frame (its kernel generation);
                    the guest console forwards that to the serial log
+  --log-file PATH   send client diagnostics to PATH instead of stderr.  Needed
+                   when the desktop launches the app (`--launch-target`): such
+                   a child runs in a BACKGROUND console group and the kernel's
+                   TOSTOP stops it with SIGTTOU on the first stderr write
   If the devices are missing (kernel without the session surface) the window
   says so on stderr and falls back to the private userspace shell session.  If
   the devices exist but fail, the window shows the honest error and exits; it

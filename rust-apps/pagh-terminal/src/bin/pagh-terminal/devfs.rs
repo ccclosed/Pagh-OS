@@ -38,6 +38,17 @@ extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
 }
 
+/// Открытая поверхность плюс одна строка о том, **как** получены пиксели.
+///
+/// Строку пишет вызывающий (bin), а не этот модуль: приложение может быть
+/// запущено композитором в фоновой группе консоли, где TOSTOP останавливает
+/// первого же писателя в stderr, поэтому место записи — политика клиента
+/// (`--log-file`), а не устройство.
+pub struct OpenedSurface {
+    pub source: Box<dyn FrameSource>,
+    pub note: String,
+}
+
 /// Почему устройство не открылось.
 pub enum OpenError {
     /// Устройства нет в системе (`ENOENT`): ядро без `/dev/vtfb1`.
@@ -52,7 +63,7 @@ pub enum OpenError {
 /// фатальным: контракт разрешает `read()`-снимки, поэтому клиент деградирует на
 /// них и говорит об этом в stderr.  Отсутствие самого устройства — не деградация,
 /// а [`OpenError::Missing`], по которому вызывающий откатывается на pipe-сессию.
-pub fn open_frame_source(path: &str) -> Result<Box<dyn FrameSource>, OpenError> {
+pub fn open_frame_source(path: &str) -> Result<OpenedSurface, OpenError> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(OpenError::Missing),
@@ -63,16 +74,19 @@ pub fn open_frame_source(path: &str) -> Result<Box<dyn FrameSource>, OpenError> 
         }
     };
     match MmapSurface::new(file, path) {
-        Ok(surface) => Ok(Box::new(surface)),
-        Err(reason) => {
-            eprintln!(
-                "pagh-terminal: mmap of {path} unavailable ({reason}); falling back to read() snapshots"
-            );
-            match ReadFrameSource::open(path) {
-                Ok(source) => Ok(Box::new(source)),
-                Err(error) => Err(OpenError::Failed(format!("{path}: {}", error.message()))),
-            }
-        }
+        Ok((surface, note)) => Ok(OpenedSurface {
+            source: Box::new(surface),
+            note,
+        }),
+        Err(reason) => match ReadFrameSource::open(path) {
+            Ok(source) => Ok(OpenedSurface {
+                source: Box::new(source),
+                note: format!(
+                    "mmap of {path} unavailable ({reason}); falling back to read() snapshots"
+                ),
+            }),
+            Err(error) => Err(OpenError::Failed(format!("{path}: {}", error.message()))),
+        },
     }
 }
 
@@ -87,7 +101,7 @@ struct MmapSurface {
 }
 
 impl MmapSurface {
-    fn new(file: File, path: &str) -> Result<MmapSurface, String> {
+    fn new(file: File, path: &str) -> Result<(MmapSurface, String), String> {
         let info = query_info(&file)
             .map_err(|error| format!("ioctl 0x{VTFB_IOCTL_GET_INFO:04x}: {error}"))?;
         let len = info.pixels_len();
@@ -115,19 +129,22 @@ impl MmapSurface {
         }
         // Одна строка на открытие: по ней видно, что поверхность получена
         // именно общим отображением (а не read()-снимками), и какая геометрия
-        // объявлена ядром. В гостевой консоли она попадает в serial-лог, то
-        // есть служит доказательством live-интеграции без отладчика.
-        eprintln!(
-            "pagh-terminal: kernel surface {path}: mmap {len} bytes PROT_READ|MAP_SHARED \
+        // объявлена ядром. Клиент пишет её в свой лог, поэтому live-прогон
+        // доказывает путь получения пикселей без отладчика.
+        let note = format!(
+            "kernel surface {path}: mmap {len} bytes PROT_READ|MAP_SHARED \
              (ioctl 0x{VTFB_IOCTL_GET_INFO:04x} {}x{} stride {} bpp {})",
             info.width, info.height, info.stride, info.bpp
         );
-        Ok(MmapSurface {
-            file,
-            base: base as *mut u8,
-            len,
-            info,
-        })
+        Ok((
+            MmapSurface {
+                file,
+                base: base as *mut u8,
+                len,
+                info,
+            },
+            note,
+        ))
     }
 }
 

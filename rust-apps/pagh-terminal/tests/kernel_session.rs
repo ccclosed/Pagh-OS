@@ -426,6 +426,7 @@ fn help_names_the_kernel_session_mode_and_its_devices() {
         "/dev/vtinput1",
         "--vt-fb",
         "--vt-trace",
+        "--log-file",
         "--pipe-shell",
         "--demo-shell",
         "no PTY/termios",
@@ -537,6 +538,55 @@ fn missing_kernel_devices_fall_back_to_the_pipe_shell_session() {
     assert!(
         out.status.success(),
         "fallback-клиент обязан штатно закрыться по close: {:?}",
+        out.status
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Диагностика режима должна уметь уходить в файл: desktop запускает клиента
+/// `--launch-target` в фоновой группе консоли, где TOSTOP останавливает первую
+/// же запись в stderr (SIGTTOU). `--log-file` — штатный путь для такого запуска.
+#[test]
+fn log_file_receives_the_diagnostics_instead_of_stderr() {
+    let dir = temp_dir("logfile");
+    let socket = dir.join("desktop.sock");
+    let (server, ready) = spawn_fake_desktop(&socket);
+    let log = dir.join("client.log");
+    let missing_fb = dir.join("no-such-vtfb1");
+    let missing_input = dir.join("no-such-vtinput1");
+
+    let out = Command::new(binary())
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["--size", "320x200"])
+        .arg("--vt-fb")
+        .arg(&missing_fb)
+        .arg("--vt-input")
+        .arg(&missing_input)
+        .arg("--log-file")
+        .arg(&log)
+        .stdout(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let text = std::fs::read_to_string(&log).expect("log file");
+    assert!(
+        text.contains("is not present") && text.contains("falling back"),
+        "the kernel-session note must go to the log file: {text:?}"
+    );
+    assert!(
+        text.starts_with("pagh-terminal: "),
+        "log lines keep the client prefix: {text:?}"
+    );
+    assert!(
+        !stderr.contains("is not present"),
+        "with --log-file that line must not reach stderr: {stderr:?}"
+    );
+    assert!(ready.recv_timeout(Duration::from_secs(10)).is_ok());
+    server.join().expect("fake compositor");
+    assert!(
+        out.status.success(),
+        "fallback client must exit cleanly: {:?}",
         out.status
     );
     let _ = std::fs::remove_dir_all(&dir);
