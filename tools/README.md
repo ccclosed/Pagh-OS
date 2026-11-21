@@ -109,6 +109,22 @@
   `ping: reply from 10.0.2.2` и HTTP GET (`pkg 10.0.2.2 /README.md`, локальный
   `http.server`) — то есть путь до данных, а не только MAC. Требует QEMU с `usb-net`
   (проверено на 10.2.2) и OVMF; реальное железо режим не заменяет.
+- `python3 tools/e2e.py desktop` — приёмка **desktop-варианта B** (живой путь, не демо):
+  собирает статические musl-бинарники (`pagh-desktop`, `pagh-files`, `pagh-terminal`),
+  готовит pagh-ext2 диск и ставит в его копию `/mnt/etc/autorun` (рецепт
+  `rust-apps/pagh-desktop/desktop-autorun` с настоящими `--launch-target`, см. `--autorun`
+  у `mkimage.py`), затем грузит гостем и проверяет по serial и кадрам QEMU: композитор
+  открыл `/dev/fb0`, прочитал оба ioctl и пережил selfcheck; evdev-бэкенд декодировал
+  настоящие keyboard(F10)/mouse(REL, BTN_LEFT) события; `pagh-files` подключился по PDP/1 и
+  его окно нарисовано; глобальный Alt+Shift+F4 отправляет `launch` (type 13) и композитор
+  поднимает сконфигурированную цель (реальный бинарник, его PNG под `/mnt` — доказательство);
+  `pagh-terminal` подключается вторым окном и продолжает коммитить кадры; serial-shell
+  переживает всё это, kernel-консоль остаётся suspended (takeover), паники/`ENOSYS` нет.
+  Флаги: `--skip-build` (взять уже собранные бинарники), `--reuse-desktop-disk` (переиспользовать
+  `.cache/e2e_desktop_disk.img`), `--run-ms`, `--pd-lifetime-ms`, `--selfcheck-ms`.
+  `--legacy-demo` оставляет **прежний** сценарий с демо-клиентом (`pagh-desktop-demo` +
+  `--spawn-demo`) как регрессию тестового фолбэка: обычный путь демо-клиент не инжектит и
+  `--spawn-demo` не передаёт.
 - Env-оверрады: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF`/`--ovmf`
   (если заданы и файл существует — берутся они; иначе `OVMF.fd` из корня репо; иначе системный
   `OVMF_CODE.fd`, напр. `/usr/share/edk2/ovmf/`), `PAGH_DISK` (дефолт `disk.img`),
@@ -156,6 +172,15 @@ Limine не находит конфиг; поэтому же первый ISO з
 `disk.img` вкладывать, дефолт одноимённый), `--size-mb` (минимальный размер
 USB-образа), `--make-disk PATH [--disk-size-mb 1024] [--userland DIR]` — собрать
 GPT-диск с одним ext2-разделом и выйти (или вложить его в образ тем же прогоном).
+
+`--autorun RECIPE` ставит рецепт в **копию** `--disk` (не в оригинал) как
+`/mnt/etc/autorun` через `debugfs`: shell исполняет его один раз перед промптом
+(`src/shell/mod.rs::run_autorun`). Обычный рецепт —
+`rust-apps/pagh-desktop/desktop-autorun` с настоящими `--launch-target`; демо-клиент и
+его флаги (`--spawn-demo`/`--demo-window`) тестовые и в рецепт не входят. Рецепт
+обязан влезать в 512 байт: ядро читает файл в буфер 512 и исполняет непустые строки,
+не начинающиеся с `#`. Том должен быть bare ext2, а `debugfs` (e2fsprogs) — в `PATH`;
+иначе сборщик падает с внятной ошибкой, а не выпускает образ без desktop.
 
 Записать на Ventoy — просто скопировать файл: Ventoy ищет `iso/wim/img/vhd(x)` в
 любых каталогах своей первой флешки, а `.img` грузит через memdisk.
