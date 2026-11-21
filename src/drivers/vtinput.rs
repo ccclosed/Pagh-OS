@@ -200,6 +200,7 @@ pub fn write(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
     }
+    let session = crate::drivers::session::current();
     // Запись от userspace-процесса означает, что клавиатурой владеет VT-клиент:
     // физические байты теперь доставляются в shell только через этот путь.
     // kernel-контекст (selftest) владельцем не становится.
@@ -236,7 +237,7 @@ pub fn reset() {
 
 /// `/dev/vtinput1`: VT-байты **терминальной сессии** — в её кольцо ввода.
 ///
-/// Отличия от boot-пути [`write`], и оба несущие:
+/// Отличия от boot-пути [`write`]:
 ///
 /// 1. **Защёлкивает владельца физической клавиатуры** (`client_active`), как и
 ///    boot-путь: пока kernel-session окно живо, физические скан-коды не
@@ -249,10 +250,11 @@ pub fn reset() {
 /// 2. **Пишет в кольцо сессии** (`ps2_kbd::push_session_scancode`), а не в
 ///    boot-кольцо: иначе ввод окна попадал бы в boot-shell.
 ///
-/// Как и boot-путь, отдаёт байты дословно в `STDIN_PENDING`, пока в системе есть
-/// foreground-программа (`lxrun` в окне): её stdin — это байты терминала, а не
-/// скан-коды shell-редактора. Ограничение (одна глобальная foreground-группа)
-/// названо в `docs/terminal-session.md`.
+/// 3. **Ввод адресуется foreground-программе ЭТОЙ сессии** (`ps2_kbd::fg_pid` —
+///    массив по сессиям): ввод окна не уходит в stdin программы другого окна или
+///    boot-shell'а. Raw-режим получает байты дословно в stdin-очередь сессии,
+///    cooked-режим — `ISIG` (сигналы её foreground-группе) плюс scancode-кольцо
+///    сессии, чтобы `read_stdin_line` применял ту же cooked-дисциплину.
 pub fn write_session(session: usize, bytes: &[u8]) -> usize {
     if bytes.is_empty() || session == crate::drivers::session_route::BOOT_SESSION {
         return write(bytes);

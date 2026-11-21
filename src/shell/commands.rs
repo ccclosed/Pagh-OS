@@ -2212,6 +2212,20 @@ fn foreground_wait(pid: u64, pgid: u64, command: &str) {
     while crate::task::compat::compat_exists(pid) && !parked {
         let stopped =
             crate::shell::keys::take_ctrl_z_latch() | crate::drivers::ps2_kbd::take_ctrl_z(session);
+        // Клавиатура, которую держит клиент окна, адресована ОКНУ, а не этой
+        // boot-сессии: её ^C/^Z не должны останавливать/убивать задание
+        // boot-shell'а (compositor/клиент). Защёлки именно дренируются, а не
+        // копятся, чтобы не сработать позже на чужом задании.
+        let foreign_keys = crate::drivers::vtinput::client_active()
+            && session == crate::drivers::session_route::BOOT_SESSION;
+        if foreign_keys {
+            let _ = crate::shell::keys::take_ctrl_c_latch();
+            let _ = crate::shell::keys::take_ctrl_z_latch();
+            let _ = crate::drivers::ps2_kbd::take_ctrl_c(session);
+            let _ = crate::drivers::ps2_kbd::take_ctrl_z(session);
+            crate::task::scheduler::yield_current();
+            continue;
+        }
         if stopped {
             // Остановить foreground-группу ТЕРМИНАЛА. Записанный pid — лишь
             // собственный waiter shell: задание, сделавшее fork, имеет несколько
@@ -2321,9 +2335,14 @@ pub(super) fn cmd_fg(_ctx: &mut ShellCtx, _args: &[&str]) {
 /// `PATH` здесь — ещё и источник для поиска голого имени (см.
 /// [`lxrun_search_dirs`]); жёсткое `/mnt/usr/bin` — подмножество
 /// [`super::lxpath::DEFAULT_PATH`], так что поиск не сужается.
-fn lxrun_env() -> [&'static [u8]; 12] {
+fn lxrun_env() -> [&'static [u8]; 13] {
     [
         b"TERM=xterm",
+        // Terminfo-база Debian (`ncurses-base`) живёт под /mnt, а ncurses ищет
+        // её по вкомпилированному /usr/share/terminfo: без явного TERMINFO
+        // ncurses-программы в этой ОС падают на старте («Error opening
+        // terminal: xterm.»), хотя сам бинарь и libtinfo загружены.
+        b"TERMINFO=/mnt/usr/share/terminfo",
         b"PYTHON_BASIC_REPL=1",
         b"PATH=/mnt/usr/bin",
         b"LD_LIBRARY_PATH=/mnt/usr/lib/x86_64-linux-gnu:/mnt/usr/lib:/mnt/usr/lib64:/mnt/lib64",
