@@ -8468,6 +8468,293 @@ mod desktop_b_tests {
         Some(frame)
     }
 
+    /// Respawn сессии через **device-путь** (`open`/`ioctl`/`mmap`), как это
+    /// делает userspace-клиент терминального окна.
+    ///
+    /// Почему отдельная рутина, если `session::note_open` уже проверен прямым
+    /// вызовом: живой клиент ходит через syscall-слой, и именно там respawn
+    /// ломался — после `exit` окно получало `ENODEV` на `open`/`ioctl`, хотя
+    /// прямой `note_open` из selftest поверхность поднимал.
+    ///
+    /// Что проверяется:
+    ///   * гонка «close всех fd → быстрый open»: запрос выхода, оставленный
+    ///     последним close, ОТМЕНЯЕТСЯ переоткрытием, иначе задача сессии
+    ///     выходит уже после нового open и клиент получает `ENODEV` на живой
+    ///     только что сессии (его лог: «surface not up yet … retrying»);
+    ///   * `open` после настоящего выхода сессии поднимает её заново (respawn),
+    ///     `ENODEV` остаётся только для «пересоздать нельзя»;
+    ///   * поверхность ОДНА на сессию: тот же кадр, та же геометрия;
+    ///   * `generation` не откатывается (тот же счётчик продолжается);
+    ///   * команда, отправленная в respawn'нутую сессию, реально исполняется
+    ///     (маркер в VFS, а не текст в буфере редактора).
+    pub fn vtfb1_respawn_after_exit() {
+        use crate::drivers::vtfb_abi::{VTFBIOGET_INFO, VTFB_INFO_SIZE};
+        use crate::drivers::{offscreen, session};
+
+        const INFO: u64 = 0x100;
+        const CMD: u64 = 0x300;
+        const PATH: u64 = 0x400;
+        const MARKER: &str = "/tmp/qvtfb-respawn";
+        const WAIT_MS: u64 = 3000;
+
+        let wait_until = |cond: &dyn Fn() -> bool| -> bool {
+            let mut waited = 0u64;
+            while waited < WAIT_MS {
+                if cond() {
+                    return true;
+                }
+                scheduler::sleep_ticks(1);
+                waited += 1;
+            }
+            cond()
+        };
+
+        let (me, saved) = install_synth();
+        let ran = with_user_space(|| {
+            // ── 1. Первая сессия: поверхность + ввод ────────────────────────
+            put_cstr(PATH, b"/dev/vtfb1");
+            let fd_fb = match io_sys::sys_open(SCRATCH_VA + PATH, O_RDONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_kernel!(false, "respawn: first open(/dev/vtfb1) succeeded");
+                    return;
+                }
+            };
+            assert_kernel!(
+                session::live(1),
+                "respawn: first open(/dev/vtfb1) spawns the session"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_ioctl(fd_fb, VTFBIOGET_INFO, SCRATCH_VA + INFO),
+                Ok(0),
+                "respawn: VTFBIOGET_INFO works on the first session"
+            );
+            let width0 = get_u32(INFO);
+            let height0 = get_u32(INFO + 4);
+            let stride0 = get_u32(INFO + 8);
+            let bpp0 = get_u32(INFO + 12);
+            let gen0 = get_u64(INFO + 16);
+            assert_kernel!(
+                width0 > 0 && height0 > 0 && stride0 == width0 * 4 && bpp0 == 32,
+                "respawn: first ioctl reports a sane 32bpp geometry"
+            );
+            let pixels = (stride0 as u64) * (height0 as u64);
+            let base0 =
+                match mem_sys::sys_mmap(0, pixels, PROT_READ as u64, MAP_SHARED as u64, fd_fb, 0) {
+                    Ok(base) => base,
+                    Err(_) => {
+                        assert_kernel!(false, "respawn: first mmap of the surface succeeded");
+                        return;
+                    }
+                };
+            let frame0 = offscreen::page(1, 0);
+
+            put_cstr(PATH + 0x20, b"/dev/vtinput1");
+            let fd_in = match io_sys::sys_open(SCRATCH_VA + PATH + 0x20, O_WRONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_kernel!(false, "respawn: open(/dev/vtinput1) succeeded");
+                    return;
+                }
+            };
+
+            // ── 1b. Гонка «последний close → быстрый open» ─────────────────
+            // Так клиент и переоткрывает окно: close всех fd ставит запрос
+            // выхода, open идёт следом, ДО того как задача сессии проверит флаг
+            // на границе цикла. Переоткрытие обязано флаг снять, иначе сессия
+            // умрёт уже после open и ioctl клиента вернёт `ENODEV`.
+            session::request_reap(1);
+            assert_kernel!(
+                session::note_open(1),
+                "respawn: fast reopen is accepted while the session is live"
+            );
+            // Дать циклу сессии шанс увидеть (уже снятый) флаг.
+            scheduler::sleep_ticks(5);
+            assert_kernel!(
+                session::live(1),
+                "respawn: a fast reopen cancels the pending reap (session survives)"
+            );
+            // Сбалансировать счётчик с реальными fd (два выше + этот синтетический).
+            session::note_close(1);
+
+            // ── 2. `exit` в окне: сессия завершается ────────────────────────
+            put(CMD, b"exit\n");
+            assert_eq_kernel!(
+                io_sys::sys_write(fd_in, SCRATCH_VA + CMD, 5),
+                Ok(5),
+                "respawn: the window shell received `exit`"
+            );
+            assert_kernel!(
+                wait_until(&|| !session::live(1)),
+                "respawn: the session exited after `exit`"
+            );
+            // Клиентский контракт: закрыть ВСЕ fd старой сессии до любого open.
+            assert_eq_kernel!(
+                io_sys::sys_close(fd_in),
+                Ok(0),
+                "respawn: close(old vtinput1)"
+            );
+            assert_eq_kernel!(io_sys::sys_close(fd_fb), Ok(0), "respawn: close(old vtfb1)");
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(base0, pixels),
+                Ok(0),
+                "respawn: munmap(old surface)"
+            );
+
+            // ── 3. Respawn: ввод первым, поверхность второй (порядок клиента) ─
+            let fd_in2 = match io_sys::sys_open(SCRATCH_VA + PATH + 0x20, O_WRONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_kernel!(
+                        false,
+                        "respawn: reopen(/dev/vtinput1) spawns the session (no ENODEV)"
+                    );
+                    return;
+                }
+            };
+            assert_kernel!(
+                session::live(1),
+                "respawn: reopened input spawned a live session"
+            );
+            let fd_fb2 = match io_sys::sys_open(SCRATCH_VA + PATH, O_RDONLY, 0) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    assert_kernel!(
+                        false,
+                        "respawn: reopen(/dev/vtfb1) succeeds after the session was respawned"
+                    );
+                    return;
+                }
+            };
+            assert_eq_kernel!(
+                io_sys::sys_ioctl(fd_fb2, VTFBIOGET_INFO, SCRATCH_VA + INFO),
+                Ok(0),
+                "respawn: VTFBIOGET_INFO works on the respawned surface"
+            );
+            let width1 = get_u32(INFO);
+            let height1 = get_u32(INFO + 4);
+            let stride1 = get_u32(INFO + 8);
+            let gen1 = get_u64(INFO + 16);
+            assert_eq_kernel!(
+                (width1, height1, stride1),
+                (width0, height0, stride0),
+                "respawn: the surface geometry is unchanged"
+            );
+            assert_kernel!(
+                gen1 >= gen0,
+                "respawn: generation does not go backwards across a respawn"
+            );
+            // ОДНА поверхность на сессию: переоткрытие переиспользует кадры.
+            assert_eq_kernel!(
+                offscreen::page(1, 0),
+                frame0,
+                "respawn: the respawned session reuses the same surface frame"
+            );
+            let pixels1 = (stride1 as u64) * (height1 as u64);
+            let base1 =
+                match mem_sys::sys_mmap(0, pixels1, PROT_READ as u64, MAP_SHARED as u64, fd_fb2, 0)
+                {
+                    Ok(base) => base,
+                    Err(_) => {
+                        assert_kernel!(false, "respawn: mmap of the respawned surface succeeded");
+                        return;
+                    }
+                };
+
+            // ── 4. Команда в respawn'нутой сессии реально исполняется ───────
+            // Маркер в VFS, а не текст в буфере: набранная строка тоже видна в
+            // сетке, поэтому проверка «строка появилась» доказывала бы только
+            // эхо ввода.
+            // Длина вместе с переводом строки: без `\n` Enter не придёт, и
+            // команда просто осталась бы набранной в буфере (именно эта
+            // опечатка когда-то выглядела как «respawn не исполняет команды»).
+            let line = b"touch /tmp/qvtfb-respawn\n";
+            put(CMD, line);
+            assert_eq_kernel!(
+                io_sys::sys_write(fd_in2, SCRATCH_VA + CMD, line.len() as u64),
+                Ok(line.len() as u64),
+                "respawn: the respawned window shell received a full command line"
+            );
+            assert_kernel!(
+                wait_until(&|| crate::vfs::lookup_path(MARKER).is_ok()),
+                "respawn: a command typed after the respawn runs in the window"
+            );
+            if let Ok(tmp) = crate::vfs::lookup_path("/tmp") {
+                let name = MARKER.rsplit('/').next().unwrap_or("qvtfb-respawn");
+                assert_kernel!(
+                    tmp.remove(name).is_ok(),
+                    "respawn: the marker file is removed again"
+                );
+            }
+
+            // ── 4b. Регистровые команды в respawn'нутой сессии ─────────────
+            // `df`/`ps` — то, чем клиент/человек проверяет, что окно живое:
+            // их вывод должен появиться в сетке ИМЕННО этой сессии.
+            let session_text = |needle: &str| -> bool {
+                crate::drivers::framebuffer::writer_for(1)
+                    .with(|w| w.text_snapshot())
+                    .map(|snap| {
+                        let mut text = alloc::string::String::new();
+                        for (ch, _, _) in snap.cells.iter() {
+                            text.push(*ch as char);
+                        }
+                        text.contains(needle)
+                    })
+                    .unwrap_or(false)
+            };
+            for (line, needle) in [(&b"df\n"[..], "Filesystem"), (&b"ps\n"[..], "STAT COMMAND")] {
+                put(CMD, line);
+                assert_eq_kernel!(
+                    io_sys::sys_write(fd_in2, SCRATCH_VA + CMD, line.len() as u64),
+                    Ok(line.len() as u64),
+                    "respawn: the respawned session received the command"
+                );
+                assert_kernel!(
+                    wait_until(&|| session_text(needle)),
+                    "respawn: the respawned session executed the command (output in its grid)"
+                );
+            }
+
+            // ── 5. Прибрать: сессия выходит, fd закрыты, кадры в PMM ───────
+            put(CMD, b"exit\n");
+            let _ = io_sys::sys_write(fd_in2, SCRATCH_VA + CMD, 5);
+            assert_kernel!(
+                wait_until(&|| !session::live(1)),
+                "respawn: the respawned session also exits on `exit`"
+            );
+            assert_eq_kernel!(
+                mem_sys::sys_munmap(base1, pixels1),
+                Ok(0),
+                "respawn: munmap of the respawned surface"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(fd_fb2),
+                Ok(0),
+                "respawn: close(new vtfb1)"
+            );
+            assert_eq_kernel!(
+                io_sys::sys_close(fd_in2),
+                Ok(0),
+                "respawn: close(new vtinput1)"
+            );
+            assert_eq_kernel!(VTFB_INFO_SIZE, 24, "respawn: info header is 24 bytes");
+        });
+        restore_synth(me, saved);
+        // Тест писал в `/dev/vtinput1` из задачи с СИНТЕТИЧЕСКИМ compat-состоянием,
+        // а этот путь защёлкивает владельца клавиатуры (`vtinput::client_active`):
+        // без сброса прямой IRQ1/USB-путь в boot-кольцо остался бы подавленным до
+        // конца загрузки, и следующие рутины (USB HID, `inputd`) во втором проходе
+        // `selftest 2` не увидели бы своих же байтов. Реальный `reap_dead_client`
+        // снимает защёлку из цикла shell, которого во время selftest нет.
+        crate::drivers::vtinput::reset();
+        // Поверхность освобождается только когда задача сессии действительно
+        // вышла: иначе flush писал бы в освобождённые кадры.
+        if !session::live(1) {
+            crate::drivers::framebuffer::reset_session(1);
+            offscreen::free(1);
+        }
+    }
+
     /// Выполнить `f` в свежем пользовательском PML4, где отображена только
     /// scratch-страница. После возврата адресное пространство сносится целиком
     /// (`drop_user_space`), поэтому все кадры и таблицы возвращаются в PMM.
@@ -11805,6 +12092,13 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "terminal-session::registry commands route into the window session",
             terminal_session_tests::window_commands_reach_session_shell
+        ),
+        // Respawn через device-путь (open/ioctl/mmap), как у клиента окна:
+        // именно syscall-путь ломался после `exit`, хотя прямой `note_open` из
+        // selftest поверхность поднимал.
+        (
+            "desktop-b::/dev/vtfb1 respawn after session exit (device path)",
+            desktop_b_tests::vtfb1_respawn_after_exit
         ),
     ]
 }
