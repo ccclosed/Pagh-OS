@@ -16,6 +16,12 @@ full-screen TUIs such as `nvim`.
   fallback for images that ship no link at all.
 - `LD_LIBRARY_PATH` for `lxrun` children includes `/mnt/usr/lib/x86_64-linux-gnu`,
   where `apt` actually installs libraries.
+- `lxrun <program>` — and a bare command typed at the shell — resolves a name
+  without `/` through PATH (`/mnt/usr/bin:/usr/bin:/bin` plus the launcher's
+  `PATH` entries), with the same `/mnt` fallback as a full path, so
+  `/mnt/usr/bin/fastfetch` answers to `fastfetch`. Built-in shell commands keep
+  priority; a miss prints `not found in PATH (searched: …)` instead of running a
+  different binary.
 - The kernel itself is built without SSE/AVX (soft-float), so user-space SIMD
   register state (XMM/MXCSR) is never clobbered by syscalls, interrupts, or
   context switches — the Linux syscall ABI preserves vector registers.
@@ -122,6 +128,10 @@ gaps left are the ones named above, plus the deliberately unverified manual `pkg
 - `lxrun: <path>: file not found or unreadable` for a file that exists usually means
   the **interpreter or a library** was missing, not the binary — check serial for
   `[linux] interpreter … fallback` lines.
+- `…: not found in PATH (searched: …)` names the directories that were tried
+  (`/usr/bin` and `/bin` are probed both literally and under `/mnt`). Install the
+  package that provides the program (`ppkg install fastfetch`) or run it by full
+  path.
 - `Package_Installer: … cause=NoSpace` names the file that failed to write.
 - Decode problems during `ppkg update` appear as `deb: inflate …` / `ppkg: index decode
   failed …` lines before any fallback is tried.

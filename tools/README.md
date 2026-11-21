@@ -28,7 +28,7 @@
 | `font_check.py` | Проверка шрифта консоли: (1) без QEMU — контракт ассета (95 глифов × высота клетки, ровно один пустой глиф — пробел, дубликаты, края) и сверка `CHAR_WIDTH`/`CHAR_HEIGHT` из `src/drivers/framebuffer.rs` с ассетом; (2) по скриншоту — побайтовое сравнение нарисованного текста с ассетом: `--find` сам ищет строку на экране, `--fg` фиксирует цвет чернил, `--scan-all` обходит все клетки консоли, `--diff-out` пишет панели expected/screen/diff. Exit 0 = совпало, 1 = расхождение, 2 = ошибка входа. Ловит даже один стёртый пиксель в букве, поэтому подмена шрифта не может проехать незамеченной |
 | `qemu_shot.py` | Драйвер живого QEMU через monitor: `screendump` (PNG фреймбуфера — консоль, `paint`, курсор, статус-бар) и `sendkey` (ввод в гостя; shell читает **PS/2**, а не serial). `send_key`/`--key` шлёт клавиши без символа (стрелки, Enter, Esc) — `send_keys`/`--keys` печатают текст. Умеет сам поднять headless-инстанс, ответить `n` на вопрос про python3 и дождаться промпта |
 | `build-rust-app.sh` | Сборка userland-приложений (`rust-apps/`) под `x86_64-unknown-linux-musl` |
-| `e2e_shell_tools.script` | Сценарий `e2e.py shell` для shell-команд 2.19.0 (`free`, `date`, `head`/`tail`/`wc`/`grep`, `ls -l`, `chmod`/`chown`): 36 шагов, 18 serial-ассертов, без сети |
+| `e2e_shell_tools.script` | Сценарий `e2e.py shell` для shell-команд (`free`, `date`, `head`/`tail`/`wc`/`grep`, `ls -l/-la/--`, `chmod`/`chown`), POSIX-форм getopt (`id -u/-un`, `df -H`, `ps -ef`, `nano --settings`, неизвестные опции) и PATH-поиска (`fastfetch`, `lxrun nano`, not-found со списком каталогов): 99 строк `cmd`/`expect`, 54 serial-ассерта, без сети |
 | `e2e_local_mirror.ps1` | Детерминированный apt E2E: release-сборка c `--features lx_selftest`, stage, serve mini_repo, QEMU, assert serial-маркеров |
 | `e2e_live_update.ps1` | Live `ppkg update` против `deb.debian.org` (`--features lx_livetest`) **по HTTPS** (issue #19 закрыт: живой путь идёт аутентифицированным транспортом, харнесс отказывается стартовать на cleartext-конфиге); assert `LIVE_APT_UPDATE: count=N`, N ≥ 50000; тайминги soft |
 | `e2e_bigindex.ps1` | Репро parse-краша #14 (`--features lx_bigindex`, `-InRam` добавляет `lx_bigindex_inram`); скан serial на `[EXC #14]` |
@@ -281,21 +281,25 @@ body=13332733 raw_in=… read_polls=… pending_polls=… bytes_per_s=…`
 
 Скриншоты остаются в `.cache/e2e_scroll_*.png`.
 
-### Регрессия shell-команд 2.19.0 (`free`, `date`, текст, `ls -l`, `chmod`/`chown`)
+### Регрессия shell-команд (`free`, текст, `ls`, `id`, `df`, `ps`, PATH)
 
 `tools/e2e_shell_tools.script` — сценарий для `e2e.py shell`: печатает в гостя
 `free`, `date`, `head`/`tail`/`wc`/`grep` по `/mnt/etc/hosts`, `head -n 2
-/proc/meminfo`, `ls -l`, round-trip `chmod`/`chown` и диагностику отсутствующего
-файла, затем ассертит вывод regex'ами по serial-логу:
+/proc/meminfo`, `ls -l`/`-la`/`--`, round-trip `chmod`/`chown`, POSIX-формы
+`id -u`/`id -un`, `df -H`, `ps -ef`, `nano --settings`, диагностику неизвестных
+опций (`ls -q`, `id -x`, `df -q`, `ps -q`, `nano -q`), PATH-fallback голого имени
+(`fastfetch`, `lxrun nano` — `not found in PATH` со списком каталогов),
+неизменность полного пути (`lxrun /mnt/…`, `rust /mnt/…`) и честные заглушки
+`mount`/`umount`, затем ассертит вывод regex'ами по serial-логу:
 
 ```sh
 python3 tools/e2e.py shell --script tools/e2e_shell_tools.script
 ```
 
-Ожидаемый вердикт — `E2E RESULT: PASS` (36 шагов, 18 expects); сеть не нужна,
-scratch-диск e2e создаёт сам. Сценарий фиксирует пользовательское поведение
-команд, а не их внутренности — колонки и парсинг отдельно покрыты `Property 30`
-в in-kernel selftest.
+Ожидаемый вердикт — `E2E RESULT: PASS` (99 строк `cmd`/`expect`, 54 asserts);
+сеть не нужна, scratch-диск e2e создаёт сам. Сценарий фиксирует пользовательское
+поведение команд, а не их внутренности — колонки и парсинг отдельно покрыты
+`Property 30` в in-kernel selftest и host-свойствами `lxpath_paths`/`getopt_args`.
 
 ## worktrees.py — гигиена worktree
 
