@@ -299,6 +299,7 @@ impl VfsNode for ProcDir {
                 for e in fmt::PROC_FILES.iter().copied() {
                     out.push(file_for(e));
                 }
+                out.push(partitions_file());
                 out.push(net_dir());
             }
             DirKind::SelfDir => {
@@ -389,6 +390,11 @@ impl VfsNode for ProcDir {
                     } else {
                         Err(VfsError::NotFound)
                     };
+                }
+                if name == "partitions" {
+                    // Живая таблица из DeviceManager, а не ProcKind из
+                    // статического списка: устройство может появиться позже.
+                    return Ok(partitions_file());
                 }
                 fmt::proc_file(name).map(file_for).ok_or(VfsError::NotFound)
             }
@@ -545,6 +551,35 @@ fn current_exe() -> Option<String> {
     compat::with_current_compat(|cs| cs.exe_path.clone()).filter(|p| !p.is_empty())
 }
 
+/// `/proc/partitions`: отдельный узел, потому что таблица рендерится из
+/// `DeviceManager`, а не из статического списка `PROC_FILES`.
+fn partitions_file() -> Arc<dyn VfsNode> {
+    Arc::new(ProcFile {
+        name: Cow::Borrowed("partitions"),
+        ino: fmt::PROC_INO_BASE + 25,
+        kind: fmt::ProcKind::Partitions,
+        pid: 0,
+        fd: 0,
+        buf: Spinlock::new(None),
+    })
+}
+
+/// Синтетический minor для `/proc/partitions`: `16*N + M` (`M=0` — целое
+/// устройство, `M` — номер раздела). Возвращает `(N, minor)`; имя без цифр
+/// после `usb` (например `usbx`) не должно паниковать.
+fn usb_minor(name: &str) -> (u32, u32) {
+    let rest = name.strip_prefix("usb").unwrap_or(name);
+    let digits: alloc::string::String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let index: u32 = digits.parse().unwrap_or(0);
+    let part = match rest[digits.len()..].strip_prefix('p') {
+        Some(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            p.parse::<u32>().unwrap_or(0)
+        }
+        _ => 0,
+    };
+    (index, index.saturating_mul(16).saturating_add(part))
+}
+
 struct ProcFile {
     /// Имя из статической таблицы или десятичный fd для узла `fdinfo`.
     name: Cow<'static, str>,
@@ -646,6 +681,28 @@ impl ProcFile {
             // Сетевые счётчики — живой снимок канала; канала нет — только две
             // шапки (Linux так же печатает таблицу без интерфейсов). Формат и
             // ширины колонок живут в чистом форматтере.
+            ProcKind::Partitions => {
+                let names: Vec<(alloc::string::String, u64)> = crate::drivers::list_blocks()
+                    .into_iter()
+                    .filter(|(name, _)| name.starts_with("usb"))
+                    .collect();
+                let mut owned: Vec<(u32, u32, u64, alloc::string::String)> = Vec::new();
+                for (name, sectors) in names.iter() {
+                    let (index, minor) = usb_minor(name);
+                    owned.push((240, minor, sectors / 2, name.clone()));
+                    let _ = index;
+                }
+                let rows: Vec<fmt::PartitionRow> = owned
+                    .iter()
+                    .map(|(major, minor, blocks, name)| fmt::PartitionRow {
+                        major: *major,
+                        minor: *minor,
+                        blocks: *blocks,
+                        name: name.as_str(),
+                    })
+                    .collect();
+                fmt::format_partitions(&rows)
+            }
             ProcKind::NetDev => {
                 let rows: Vec<fmt::NetDevRow> = crate::net::iface_stats()
                     .map(|s| fmt::NetDevRow {

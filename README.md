@@ -263,6 +263,22 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
   Ограничения: хабы, hot-unplug и interrupt-IN уведомления RNDIS не
   обрабатываются; onboard Realtek RTL8125 не поддерживается — это отдельный
   драйвер, не e1000.
+- **USB-накопители (xHCI + BOT/SCSI).** `drivers/usb_msc.rs`, `usb_scsi.rs` и
+  `usb_msc_proto.rs` перечисляют Bulk-Only Transport (class 8/subclass 6/protocol
+  0x50) на том же xHCI-контроллере, читают `GET_MAX_LUN` и гоняют SCSI через BOT
+  (CBW 31 B / CSW 13 B, STALL→ClearFeature+Reset Endpoint, Reset Recovery,
+  30-секундное ожидание CSW). Флешка появляется как `usbN`, разделы GPT/MBR — как
+  `usbNpM` (тот же `drivers::partition`), а `/proc/partitions` и read-only
+  `/dev/block/<name>` дают диагностику. `/dev/uevent` v2 (144 B) отдаёт
+  `ADD/REMOVE/CHANGE/ERROR/MOUNTED/UNMOUNTED` с `mount[16]`/`uuid[16]`; root-
+  композитор монтирует pagh-том через `mount(2)` (nr 165)/`umount2(2)` (nr 166),
+  ядро само на hotplug не монтирует. Выдёргивание замечается по `PORTSC.CCS`,
+  канал помечается dead (I/O → `EIO`), clean `umount2` делает
+  `SYNCHRONIZE CACHE(10)` и только затем `safe_to_remove`. Ограничения Phase 1:
+  только 512-байтовый логический блок (4K — явный `unsupported_block`), только
+  LBA ≤ 32 бит (>2 TiB — `capacity_overflow`, без усечения), LUN>0 логируется и
+  не обслуживается, хабы/UAS/EHCI не поддерживаются, реальное железо не
+  проверялось (QEMU `usb-storage` проверен).
 - **Хранилище:** перечисление PCI, блочные устройства virtio-blk и NVMe, **поддержка
   разделов GPT/MBR** (каждый раздел становится отдельным блочным устройством, поэтому pagh
   может владеть одним разделом, а не всем диском) и ext2-совместимая read/write файловая
@@ -530,7 +546,7 @@ Prompt показывает текущий рабочий каталог и ре
 | `pci`                | Список перечисленных PCI-устройств (virtio помечены)            |
 | `usb`                | Состояние xHCI-контроллера и статус каждого порта (диагностика) |
 | `disk [list\|setup\|mount <n>\|format <n> [--force]\|cancel]` | Список блочных устройств; форматировать одно как ext2 и смонтировать в `/mnt` |
-| `mount` / `umount`   | **Не реализовано**: `mount(2)`/`umount2(2)` в ядре ещё нет (отложено до USB S1); печатают честное сообщение и отсылают к `disk` |
+| `mount` / `umount`   | Shell-команды нет. `mount(2)` nr 165 / `umount2(2)` nr 166 ядро поддерживает для pagh-ext2 USB-томов (`usb0p1` → `/usb0p1`); вызывает root-композитор, а не shell |
 | `ifconfig`           | Показать сетевой интерфейс (IP, gateway, MAC)                   |
 | `ping <ip>`          | Отправить один ICMP echo и напечатать RTT                       |
 | `df [-h\|-H]`        | Смонтированные файловые системы: blocks/size, used, available, use%, mount point; `-h` — двоичные единицы, `-H` — десятичные (SI) |

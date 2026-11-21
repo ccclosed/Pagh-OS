@@ -1943,6 +1943,7 @@ mod procfs_tests {
                 String::from("filesystems"),
                 String::from("loadavg"),
                 String::from("mounts"),
+                String::from("partitions"),
                 String::from("net"),
             ],
             "procfs: /proc readdir order"
@@ -11719,6 +11720,12 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "terminal-session::nano draws in the session surface and exits on Esc",
             terminal_session_tests::nano_draws_in_session
         ),
+        // USB mass storage S1: BOT/SCSI/uevent layouts and the guest-path rule.
+        // Pure encoding/parsing only — no hardware, no global state.
+        (
+            "usb::BOT/SCSI/uevent layouts and /usb root rule",
+            usb_storage_prop_tests::pure_layouts
+        ),
     ]
 }
 
@@ -13519,6 +13526,146 @@ mod ring3_fault_tests {
             frames_before,
             frames_after,
             metadata
+        );
+    }
+}
+
+// ============================================================================
+// USB mass storage S1: чистые раскладки BOT/SCSI/uevent
+// ============================================================================
+//
+// Routine намеренно не трогает ring `/dev/uevent` и `DeviceManager`: проверяются
+// только кодирование/разбор и чистая политика. Никакого железа и никакой
+// глобальной мутации, поэтому `selftest 2` видит одинаковые проходы.
+mod usb_storage_prop_tests {
+    use crate::arch::x86_64::linux::io::guest_path_keeps_root;
+    use crate::drivers::{usb_msc_proto, usb_scsi, usb_uevent_abi};
+
+    pub fn pure_layouts() {
+        // CBW 31 B: подпись, тег, длина, направление, CDB и нулевой хвост.
+        let read10 = usb_scsi::read10(0x0102_0304, 0x0102);
+        let cbw =
+            usb_msc_proto::encode_cbw(0xAABB_CCDD, 1024, usb_msc_proto::Direction::In, 0, &read10)
+                .expect("CBW encoding must accept a 10-byte READ(10)");
+        assert_kernel!(cbw.len() == usb_msc_proto::CBW_SIZE, "CBW is 31 bytes");
+        assert_kernel!(&cbw[0..4] == b"USBC", "CBW signature is USBC");
+        assert_kernel!(
+            u32::from_le_bytes([cbw[4], cbw[5], cbw[6], cbw[7]]) == 0xAABB_CCDD,
+            "CBW tag round-trips"
+        );
+        assert_kernel!(cbw[12] == 0x80, "IN data stage sets bit 7");
+        assert_kernel!(cbw[14] == 10, "CBWCB length is 10");
+        assert_kernel!(cbw[25..].iter().all(|b| *b == 0), "CBW tail is zero");
+        let parsed = usb_msc_proto::decode_cbw(&cbw).expect("CBW must decode");
+        assert_kernel!(
+            parsed.transfer_len == 1024,
+            "CBW transfer length round-trips"
+        );
+        assert_kernel!(
+            parsed.direction == usb_msc_proto::Direction::In,
+            "CBW direction round-trips"
+        );
+
+        // CSW 13 B: pass/fail/phase, тег и residue.
+        let mut csw = [0u8; usb_msc_proto::CSW_SIZE];
+        csw[0..4].copy_from_slice(&usb_msc_proto::CSW_SIGNATURE.to_le_bytes());
+        csw[4..8].copy_from_slice(&0xAABB_CCDDu32.to_le_bytes());
+        csw[8..12].copy_from_slice(&5u32.to_le_bytes());
+        csw[12] = 1;
+        let parsed = usb_msc_proto::decode_csw(&csw, 0xAABB_CCDD).expect("CSW must decode");
+        assert_kernel!(parsed.residue == 5, "CSW residue is read");
+        assert_kernel!(
+            parsed.status == usb_msc_proto::CswStatus::Failed,
+            "CSW failed status"
+        );
+        csw[4] ^= 0xFF;
+        assert_kernel!(
+            usb_msc_proto::decode_csw(&csw, 0xAABB_CCDD).is_err(),
+            "CSW tag mismatch is rejected"
+        );
+
+        // SCSI: READ CAPACITY 4K и >2 TiB — явный отказ, без усечения.
+        let cap = usb_scsi::parse_capacity10(&[0, 0, 0, 7, 0, 0, 0x10, 0])
+            .expect("8-byte capacity must parse");
+        assert_kernel!(cap.last_lba == 7, "capacity last_lba is big-endian");
+        assert_kernel!(
+            cap.block_length == 4096,
+            "capacity block length is big-endian"
+        );
+        assert_kernel!(
+            usb_scsi::capacity_problem(cap.last_lba, cap.block_length)
+                == Some(usb_scsi::CapacityProblem::UnsupportedBlock(4096)),
+            "4K logical block is an explicit reject"
+        );
+        assert_kernel!(
+            usb_scsi::capacity_problem(u32::MAX, 512) == Some(usb_scsi::CapacityProblem::Overflow),
+            "last_lba=0xFFFFFFFF is an explicit overflow"
+        );
+
+        // Sense 06/28 (UNIT ATTENTION) → TUR+retry, а не fatal.
+        let sense = usb_scsi::Sense {
+            response: 0x70,
+            key: 0x06,
+            asc: 0x28,
+            ascq: 0,
+        };
+        assert_kernel!(
+            usb_scsi::sense_action(sense) == usb_scsi::SenseAction::RetryTur,
+            "unit attention retries through TUR"
+        );
+
+        // uevent v2: ровно 144 байта, известные смещения, round-trip.
+        assert_kernel!(
+            usb_uevent_abi::RECORD_SIZE == 144,
+            "uevent v2 record is 144 bytes"
+        );
+        let mut record = usb_uevent_abi::Record::zeroed();
+        record.kind = usb_uevent_abi::kind::ADD;
+        record.flags = usb_uevent_abi::flags::REMOVABLE | usb_uevent_abi::flags::DETACHED;
+        record.fs_class = usb_uevent_abi::fs_class::PAGH_EXT2;
+        record.error = usb_uevent_abi::error::BAD_MOUNT;
+        record.seq = 0x1122_3344;
+        record.sectors = 0x0102_0304_0506_0708;
+        record.sector_size = 512;
+        usb_uevent_abi::set_str(&mut record.dev, "usb0p1");
+        usb_uevent_abi::set_str(&mut record.mount, "/usb0p1");
+        record.uuid = [0xAB; 16];
+        let mut raw = [0u8; usb_uevent_abi::RECORD_SIZE];
+        record.encode(&mut raw);
+        assert_kernel!(&raw[0..4] == b"PUEV", "uevent magic is PUEV");
+        assert_kernel!(
+            u16::from_le_bytes([raw[4], raw[5]]) == 2,
+            "uevent version is 2"
+        );
+        assert_kernel!(&raw[28..34] == b"usb0p1", "dev lives at offset 28");
+        assert_kernel!(&raw[44..51] == b"/usb0p1", "mount lives at offset 44");
+        assert_kernel!(
+            &raw[128..144] == &[0xAB; 16],
+            "uuid lives at offset 128..143"
+        );
+        let decoded = usb_uevent_abi::Record::decode(&raw).expect("v2 record must decode");
+        assert_kernel!(decoded == record, "uevent round-trip preserves every field");
+        assert_kernel!(
+            usb_uevent_abi::Record::decode(&raw[..128]).is_none(),
+            "v1 128-byte record is not v2"
+        );
+
+        // Гостевой путь: `/usb0p1` сохраняет корень, `/mnt/usb0p1` — под /mnt.
+        assert_kernel!(
+            guest_path_keeps_root("/usb0p1"),
+            "/usb0p1 keeps the VFS root"
+        );
+        assert_kernel!(
+            guest_path_keeps_root("/usb0p1/e2e.txt"),
+            "/usb0p1/file keeps the VFS root"
+        );
+        assert_kernel!(
+            guest_path_keeps_root("/mnt/usb0p1"),
+            "/mnt/usb0p1 stays under /mnt"
+        );
+        assert_kernel!(
+            !guest_path_keeps_root("/media/usb0p1"),
+            "/media/usb0p1 is a guest path"
         );
     }
 }

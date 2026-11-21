@@ -330,3 +330,209 @@ pub fn parse_rndis_interfaces(conf: &[u8]) -> Option<RndisIface> {
         bulk_out_max_packet: d.bulk_out.max_packet,
     })
 }
+
+// ─── Mass storage: Bulk-Only Transport (class 8/6/0x50) ─────────────────────
+
+/// Один интерфейс USB mass storage (BOT): обе bulk-точки и их максимальные
+/// пакеты.
+///
+/// Phase 1 обслуживает только LUN 0 и только первое полное устройство на
+/// интерфейсе. `interface` нужен для class-запросов `GET_MAX_LUN` и
+/// Bulk-Only Reset (`wIndex`); `config_value` — для SET_CONFIGURATION.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MscIface {
+    /// `bConfigurationValue` конфигурации, в которой найден интерфейс.
+    pub config_value: u8,
+    /// `bInterfaceNumber` (он же `wIndex` class-запросов).
+    pub interface: u8,
+    /// Адрес bulk-IN эндпоинта (бит 7 установлен).
+    pub bulk_in_addr: u8,
+    /// `wMaxPacketSize` bulk-IN.
+    pub bulk_in_max_packet: u16,
+    /// Адрес bulk-OUT эндпоинта (бит 7 снят).
+    pub bulk_out_addr: u8,
+    /// `wMaxPacketSize` bulk-OUT.
+    pub bulk_out_max_packet: u16,
+}
+
+/// Найти первый mass-storage интерфейс BOT (class 8, subclass 6, protocol
+/// 0x50) с обеими bulk-точками в настройке по умолчанию (alt 0).
+///
+/// Разбор тотальный: испорченный bLength не паникует и не зацикливает обход,
+/// а половина пары (только IN или только OUT) интерфейсом не считается —
+/// устройство без data-стадии в одну сторону не может быть диском.
+///
+/// Multi-LUN здесь не различается: интерфейс один, LUN выбирается CBW-полем,
+/// и Phase 1 его не читает (всегда 0).
+pub fn parse_msc_interfaces(conf: &[u8]) -> Option<MscIface> {
+    if conf.len() < 9 || conf[0] < 9 || conf[1] != DESC_CONFIG {
+        return None;
+    }
+    let config_value = conf[5];
+    let mut current = false;
+    let mut in_ep: Option<(u8, u16)> = None;
+    let mut out_ep: Option<(u8, u16)> = None;
+    let mut current_iface = 0u8;
+    let mut i = 0usize;
+    while i + 2 <= conf.len() {
+        let len = conf[i] as usize;
+        if len < 2 || i + len > conf.len() {
+            break;
+        }
+        let kind = conf[i + 1];
+        if kind == DESC_INTERFACE && len >= 9 {
+            // Закрыть предыдущий интерфейс: только полная пара становится
+            // результатом, и только если это был наш класс.
+            if current && in_ep.is_some() && out_ep.is_some() {
+                let (in_addr, in_mps) = in_ep.unwrap();
+                let (out_addr, out_mps) = out_ep.unwrap();
+                return Some(MscIface {
+                    config_value,
+                    interface: current_iface,
+                    bulk_in_addr: in_addr,
+                    bulk_in_max_packet: in_mps,
+                    bulk_out_addr: out_addr,
+                    bulk_out_max_packet: out_mps,
+                });
+            }
+            current_iface = conf[i + 2];
+            let alternate = conf[i + 3];
+            let class = conf[i + 5];
+            let subclass = conf[i + 6];
+            let protocol = conf[i + 7];
+            current = alternate == 0 && class == 8 && subclass == 6 && protocol == 0x50;
+            in_ep = None;
+            out_ep = None;
+        } else if kind == DESC_ENDPOINT && len >= 7 && current {
+            let addr = conf[i + 2];
+            let attrs = conf[i + 3];
+            let mps = u16::from_le_bytes([conf[i + 4], conf[i + 5]]);
+            // bmAttributes bits 0-1 == 2: bulk. Направление — бит 7 адреса.
+            if attrs & 0x03 == 2 && mps & 0x07FF != 0 {
+                if addr & 0x80 != 0 {
+                    if in_ep.is_none() {
+                        in_ep = Some((addr, mps));
+                    }
+                } else if out_ep.is_none() {
+                    out_ep = Some((addr, mps));
+                }
+            }
+        }
+        i += len;
+    }
+    if current && in_ep.is_some() && out_ep.is_some() {
+        let (in_addr, in_mps) = in_ep.unwrap();
+        let (out_addr, out_mps) = out_ep.unwrap();
+        return Some(MscIface {
+            config_value,
+            interface: current_iface,
+            bulk_in_addr: in_addr,
+            bulk_in_max_packet: in_mps,
+            bulk_out_addr: out_addr,
+            bulk_out_max_packet: out_mps,
+        });
+    }
+    None
+}
+
+#[cfg(test)]
+mod msc_tests {
+    use super::*;
+
+    fn config_desc(total: u16, value: u8) -> alloc::vec::Vec<u8> {
+        let [lo, hi] = total.to_le_bytes();
+        alloc::vec![9, 2, lo, hi, 0, value, 0x80, 0x32, 0]
+    }
+
+    fn iface_desc(
+        number: u8,
+        alt: u8,
+        class: u8,
+        subclass: u8,
+        protocol: u8,
+    ) -> alloc::vec::Vec<u8> {
+        alloc::vec![9, 4, number, alt, 0, class, subclass, protocol, 0]
+    }
+
+    fn ep_desc(addr: u8, attrs: u8, max_packet: u16) -> alloc::vec::Vec<u8> {
+        let [lo, hi] = max_packet.to_le_bytes();
+        alloc::vec![7, 5, addr, attrs, lo, hi, 0]
+    }
+
+    /// QEMU `usb-storage`: один интерфейс 08/06/50, bulk-IN 0x81 и bulk-OUT
+    /// 0x02, high-speed max packet 512, bConfigurationValue 1.
+    fn qemu_msc_config() -> alloc::vec::Vec<u8> {
+        let mut body = alloc::vec::Vec::new();
+        body.extend(iface_desc(0, 0, 8, 6, 0x50));
+        body.extend(ep_desc(0x81, 0x02, 512));
+        body.extend(ep_desc(0x02, 0x02, 512));
+        let mut conf = config_desc((9 + body.len()) as u16, 1);
+        conf.extend(body);
+        conf
+    }
+
+    #[test]
+    fn parses_qemu_msc_interface() {
+        let iface = parse_msc_interfaces(&qemu_msc_config()).unwrap();
+        assert_eq!(iface.config_value, 1);
+        assert_eq!(iface.interface, 0);
+        assert_eq!(iface.bulk_in_addr, 0x81);
+        assert_eq!(iface.bulk_out_addr, 0x02);
+        assert_eq!(iface.bulk_in_max_packet, 512);
+        assert_eq!(iface.bulk_out_max_packet, 512);
+    }
+
+    #[test]
+    fn skips_hid_before_msc_and_alt_settings() {
+        let mut body = alloc::vec::Vec::new();
+        body.extend(iface_desc(0, 0, 3, 1, 1));
+        body.extend(ep_desc(0x81, 0x03, 8));
+        body.extend(iface_desc(1, 1, 8, 6, 0x50)); // alt 1 — не выбираем
+        body.extend(ep_desc(0x82, 0x02, 64));
+        body.extend(ep_desc(0x03, 0x02, 64));
+        body.extend(iface_desc(2, 0, 8, 6, 0x50));
+        body.extend(ep_desc(0x84, 0x02, 64));
+        body.extend(ep_desc(0x05, 0x02, 64));
+        let mut conf = config_desc((9 + body.len()) as u16, 3);
+        conf.extend(body);
+        let iface = parse_msc_interfaces(&conf).unwrap();
+        assert_eq!(iface.interface, 2);
+        assert_eq!(iface.bulk_in_addr, 0x84);
+        assert_eq!(iface.bulk_out_addr, 0x05);
+        assert_eq!(iface.config_value, 3);
+    }
+
+    #[test]
+    fn half_a_pair_is_not_a_device() {
+        let mut body = alloc::vec::Vec::new();
+        body.extend(iface_desc(0, 0, 8, 6, 0x50));
+        body.extend(ep_desc(0x81, 0x02, 64));
+        // Нет bulk-OUT: интерфейс негоден.
+        let mut conf = config_desc((9 + body.len()) as u16, 1);
+        conf.extend(body);
+        assert!(parse_msc_interfaces(&conf).is_none());
+    }
+
+    #[test]
+    fn wrong_subclass_or_protocol_is_not_bot_phase1() {
+        let mut body = alloc::vec::Vec::new();
+        body.extend(iface_desc(0, 0, 8, 5, 0x50)); // SFF-8070, не 6
+        body.extend(ep_desc(0x81, 0x02, 64));
+        body.extend(ep_desc(0x02, 0x02, 64));
+        let mut conf = config_desc((9 + body.len()) as u16, 1);
+        conf.extend(body);
+        assert!(parse_msc_interfaces(&conf).is_none());
+    }
+
+    #[test]
+    fn truncated_and_hostile_descriptors_do_not_panic() {
+        let mut conf = qemu_msc_config();
+        conf.truncate(conf.len() - 3);
+        let _ = parse_msc_interfaces(&conf);
+        let mut hostile = qemu_msc_config();
+        hostile[9] = 255; // bLength интерфейса за пределами буфера
+        assert!(parse_msc_interfaces(&hostile).is_none());
+        assert!(parse_msc_interfaces(&[]).is_none());
+        assert!(parse_msc_interfaces(&[0xFFu8; 40]).is_none());
+    }
+}
