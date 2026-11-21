@@ -68,8 +68,21 @@ pub fn client_active() -> bool {
     CLIENT_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Заявить физическую клавиатуру за вызывающим compat-процессом.
+///
+/// Вызывается при `open` устройств терминальной сессии и из записи в
+/// `/dev/vtinput1`: владение должно начаться с ПЕРВОГО нажатия, а не после него,
+/// иначе самый первый `Ctrl+C`/`Ctrl+Z` из окна успевает отработать в boot-сессии
+/// (найдено в live-QEMU: окно исчезало). Не-compat вызывающий (ядро/selftest)
+/// владельцем не становится.
+pub fn claim_keyboard() {
+    if crate::task::compat::current_has_compat() {
+        note_client(crate::task::scheduler::current_pid());
+    }
+}
+
 /// Запомнить писавшего как владельца клавиатуры. Вызывается только из
-/// [`write`] и только когда текущая задача — compat-процесс.
+/// [`claim_keyboard`]/[`write`], когда текущая задача — compat-процесс.
 fn note_client(pid: u64) {
     CLIENT_PID.store(pid, Ordering::Relaxed);
     CLIENT_ACTIVE.store(true, Ordering::Relaxed);
@@ -225,10 +238,14 @@ pub fn reset() {
 ///
 /// Отличия от boot-пути [`write`], и оба несущие:
 ///
-/// 1. **Не защёлкивает владельца физической клавиатуры.** Окно не владеет PS/2:
-///    физические байты IRQ1 продолжают идти в boot-кольцо, а в окно ввод
-///    приходит только отсюда. Дедупликация boot-пути (`client_active`) не
-///    меняется — контракт прямо требует этого.
+/// 1. **Защёлкивает владельца физической клавиатуры** (`client_active`), как и
+///    boot-путь: пока kernel-session окно живо, физические скан-коды не
+///    дублируются в boot-кольцо, а `Ctrl+C`/`Ctrl+Z` из IRQ-трекинга не
+///    убивают/не паркуют boot-задание. Без защёлки одно нажатие доходило до
+///    двух разных терминалов (live-QEMU: `Ctrl+C` в окне убивал композитора, а
+///    `Ctrl+Z` парковал его), то есть «per-session» на бумаге было общим на
+///    деле. `reap_dead_client` возвращает клавиатуру boot-shell'у после выхода
+///    окна.
 /// 2. **Пишет в кольцо сессии** (`ps2_kbd::push_session_scancode`), а не в
 ///    boot-кольцо: иначе ввод окна попадал бы в boot-shell.
 ///
@@ -239,6 +256,17 @@ pub fn reset() {
 pub fn write_session(session: usize, bytes: &[u8]) -> usize {
     if bytes.is_empty() || session == crate::drivers::session_route::BOOT_SESSION {
         return write(bytes);
+    }
+    // Запись из окна забирает физическую клавиатуру у boot-консоли. Это
+    // ОБЯЗАТЕЛЬНО для kernel-session окна: QEMU/железо доставляет нажатие и в
+    // evdev (композитору), и в IRQ1 (shell-кольцо boot), поэтому без защёлки
+    // `Ctrl+C`/`Ctrl+Z`, набранный в окне, ДОПОЛНИТЕЛЬНО убивал/парковал
+    // boot-задание (терминального клиента) из IRQ-трекинга, и окно исчезало.
+    // Теперь физические скан-коды boot-shell'а не пополняются, пока окно живо
+    // (`reap_dead_client` возвращает клавиатуру после его выхода), а сигналы
+    // обрабатывает сессия окна (`ISIG` ниже).
+    if crate::task::compat::current_has_compat() {
+        note_client(crate::task::scheduler::current_pid());
     }
     // Foreground — программа ИМЕННО этой сессии: ввод окна не должен уходить
     // в stdin программы другого окна/ boot-shell'а, а `ISIG` (`^C`/`^Z`) обязан
