@@ -151,6 +151,27 @@ ctx.end()?;
 ctx.delete_lists(list, 1)?;                       // эмуляция: см. ограничения
 ```
 
+Освещение (PR5, fixed-function upstream `light.c`):
+
+```rust
+use tinygl::{Capability, Light, LightParam, MaterialFace, MaterialParam};
+
+ctx.light(Light::Light0, LightParam::Position, [0.4, 0.7, 1.0, 0.0])?; // w=0 — направленный
+ctx.light(Light::Light0, LightParam::Diffuse, [1.0, 1.0, 1.0, 1.0])?;
+ctx.material(MaterialFace::FrontAndBack, MaterialParam::AmbientAndDiffuse,
+             [0.8, 0.5, 0.2, 1.0])?;
+ctx.material(MaterialFace::FrontAndBack, MaterialParam::Shininess,
+             [24.0, 0.0, 0.0, 0.0])?;
+ctx.enable(Capability::Lighting);
+ctx.enable(Capability::Light0);
+// дальше — normal3f на каждой вершине; цвет материала заменяет glColor3f.
+```
+
+`Position` умножается на **текущую modelview** в момент вызова (так делает
+upstream `glopLight`): задавайте свет после камеры и до поворотов объекта.
+`glColorMaterial`, spot/attenuation и `glLightModel*` в безопасный слой не
+выведены — демо `pagh-gl-demo` их не использует; сам C их поддерживает.
+
 `src/ffi.rs` приватный: сырые `extern "C"`-вызовы снаружи крейта недоступны, а
 безопасный слой держит инварианты. Прототипы immediate-mode
 (`glVertex3f`, `glColor3f`, `glNormal3f`, `glTexCoord*` и т. д.) объявлены в
@@ -168,6 +189,9 @@ ctx.delete_lists(list, 1)?;                       // эмуляция: см. о�
 `glBegin` / `glEnd` / `glVertex{2,3,4}f` / `glVertex3fv` / `glColor{3,4}f` /
 `glColor{3,4}fv` / `glNormal3f` / `glNormal3fv` / `glTexCoord{2,4}f` /
 `glTexCoord2fv`; `glShadeModel`.
+
+PR5: `glLightfv` / `glMaterialfv` (fixed-function освещение; в демо —
+`gears`).
 
 PR3: `glGenTextures` / `glDeleteTextures` / `glBindTexture` / `glTexImage2D` /
 `glTexEnvi` / `glTexParameteri`; `glGenLists` / `glIsList` / `glNewList` /

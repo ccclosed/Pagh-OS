@@ -127,6 +127,23 @@ extern "C" {
     pub fn glCullFace(mode: c_int);
     pub fn glFrontFace(mode: c_int);
 
+    // --- lighting (PR5) ---------------------------------------------------
+    // Upstream 0.4.1 реализует fixed-function освещение (light.c):
+    // `GL_LIGHTING` + до 16 `GL_LIGHT0..15`, материалы front/back и
+    // `GL_COLOR_MATERIAL`. Эти символы экспортированы `api.c`, но в
+    // `include/GL/gl.h` объявлены только `glMaterialfv`/`glLightfv` и т. п.;
+    // прототипы ниже повторяют реальные сигнатуры C.
+
+    /// `glLightfv(light, pname, params)` — 4 float для AMBIENT/DIFFUSE/
+    /// SPECULAR/POSITION. `POSITION` умножается на **текущую modelview** в
+    /// момент вызова (upstream `glopLight`), поэтому позиционный источник
+    /// задаётся в координатах глаза, а не мира.
+    pub fn glLightfv(light: c_int, pname: c_int, params: *const f32);
+
+    /// `glMaterialfv(face, pname, params)` — 4 float; для `GL_SHININESS`
+    /// upstream читает только `params[0]` (`glMaterialfv` выставляет n=1).
+    pub fn glMaterialfv(face: c_int, pname: c_int, params: *const f32);
+
     pub fn glBegin(mode: c_int);
     pub fn glEnd();
 
@@ -260,6 +277,27 @@ pub const GL_MAX_PROJECTION_STACK_DEPTH: c_int = 0x0D38;
 pub const GL_MAX_LIGHTS: c_int = 0x0D31;
 /// `GL_MAX_TEXTURE_SIZE` (`get.c` возвращает 256).
 pub const GL_MAX_TEXTURE_SIZE: c_int = 0x0D33;
+
+/// `GL_LIGHTING` — включает расчёт освещения в `vertex.c`.
+pub const GL_LIGHTING: c_int = 0x0B50;
+/// `GL_NORMALIZE` — нормализует нормали после modelview (upstream поддерживает).
+pub const GL_NORMALIZE: c_int = 0x0BA1;
+/// `GL_LIGHT0` — первый источник; валидны `GL_LIGHT0..GL_LIGHT0+15`.
+pub const GL_LIGHT0: c_int = 0x4000;
+/// `GL_AMBIENT` (и материал, и источник).
+pub const GL_AMBIENT: c_int = 0x1200;
+/// `GL_DIFFUSE` (и материал, и источник).
+pub const GL_DIFFUSE: c_int = 0x1201;
+/// `GL_SPECULAR` (и материал, и источник).
+pub const GL_SPECULAR: c_int = 0x1202;
+/// `GL_POSITION` — параметр источника (x,y,z,w; w=0 — направленный).
+pub const GL_POSITION: c_int = 0x1203;
+/// `GL_EMISSION` — параметр материала.
+pub const GL_EMISSION: c_int = 0x1600;
+/// `GL_SHININESS` — параметр материала; upstream ждёт одно значение.
+pub const GL_SHININESS: c_int = 0x1601;
+/// `GL_AMBIENT_AND_DIFFUSE` — материал: ambient и diffuse одним вызовом.
+pub const GL_AMBIENT_AND_DIFFUSE: c_int = 0x1602;
 
 /// `GL_CULL_FACE` — единственный cull-переключатель upstream.
 pub const GL_CULL_FACE: c_int = 0x0B44;
