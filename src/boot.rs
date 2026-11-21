@@ -806,12 +806,20 @@ fn kernel_main() -> ! {
     task::scheduler::kernel_thread_spawn_named(shell_thread, "shell");
     debug!("Shell thread spawned (PID should be 1)");
 
+    // Диспетчер физического ввода. Производители (PS/2 IRQ1/IRQ12 и USB HID из
+    // потока `usb`) только кладут байты в его кольцо; этот поток — единственный,
+    // кто доставляет их в `/dev/input/event0` и в shell-кольцо, сохраняя
+    // дедупликацию `vtinput` в одном месте (`ps2_kbd::deliver_physical`).
+    // Спавнится безусловно: без оборудования очередь пуста, а поток спит на
+    // тиках. SMP здесь не заявляется — очередь одна и поток один.
+    task::scheduler::kernel_thread_spawn_named(crate::drivers::inputd::inputd_thread, "inputd");
+
     // Спавнить поток опроса сети (R13.4). Он должен стартовать, когда
     // планировщик уже работает, а прерывания включены (ниже), потому что часы
     // стека двигаются от тика LAPIC и обслуживание DHCP/echo опирается на
     // периодический poll. Если NIC не подключён, `net::poll` — дешёвый no-op,
     // так что безусловный spawn безвреден.
-    task::scheduler::kernel_thread_spawn_named(net::net_thread, "net");
+    task::scheduler::kernel_thread_spawn_named(net::net_thread, "netd");
 
     // Поток опроса USB: перечисляет новые устройства и собирает HID-отчёты.
     // Спавнится безусловно — без контроллера `xhci::poll` это no-op, а условие

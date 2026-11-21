@@ -764,6 +764,14 @@ pub fn load_averages() -> (u32, u32, u32) {
     (hundredths(0), hundredths(1), hundredths(2))
 }
 
+/// Подготовить входящую задачу к исполнению: TSS RSP0, зеркало syscall-стека и
+/// `FS.base`.
+///
+/// `FS.base` — часть контекста задачи, поэтому он выставляется при каждом
+/// переключении: из compat-состояния задачи, а если состояния нет — нулём (см.
+/// тело). Idle-задача пропускается: она не исполняет ни ring-3 кода, ни
+/// `%fs`-относительных инструкций, а первая же активация не-idle задачи всё равно
+/// перезапишет регистр.
 fn activate_task(pid: u64) {
     if is_idle(pid) {
         return;
@@ -771,9 +779,17 @@ fn activate_task(pid: u64) {
     let top = crate::memory::layout::kernel_stack_for_pid(pid).2;
     crate::arch::x86_64::gdt::set_kernel_stack(top);
     crate::arch::x86_64::syscall::set_syscall_kernel_stack(top);
-    if let Some(base) = crate::task::compat::fs_base_for(pid) {
-        x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(base));
-    }
+    // FS.base — часть контекста задачи, поэтому он пишется при КАЖДОМ
+    // переключении, а не только когда у задачи есть compat-состояние. Задача без
+    // него (ядерный поток, нативная задача, либо поток, чьё состояние уже снято
+    // `exit_group`/`finish_compat_exit`) не должна бежать с 32-ТиБ FS.base
+    // предыдущей compat-задачи: musl берёт errno/TLS по `%fs:0`, и первое же
+    // такое обращение уходит на страницу чужого (или уже снятого) адресного
+    // пространства — это `[EXC #14] addr=FS.base` в `__errno_location`. Ноль —
+    // честное «TLS нет»: отказ остаётся отказом, но на своём адресе и без чтения
+    // чужой памяти.
+    let base = crate::task::compat::fs_base_for(pid).unwrap_or(0);
+    x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(base));
 }
 
 pub fn kernel_thread_spawn(entry: fn()) -> u64 {

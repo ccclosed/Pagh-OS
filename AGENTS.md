@@ -209,7 +209,13 @@ Semver `MAJOR.MINOR.PATCH` — именно в этом стандартном �
 зелёный до слияния); стабилизация релиза сливает `dev` в `main` через `--no-ff`, без
 изменений кода помимо релизных метаданных. Release candidates приходят только из `dev` и
 только как `vX.Y.Z-rc.N` (канала `-pre.N` нет); стабильные релизы тегируются `vX.Y.Z` из
-`main`, а старые голые числовые теги репозитория остаются историей. Hotfix ограничен
+`main`, а старые голые числовые теги репозитория остаются историей. **Demo-канал — третий и
+нестабильный: demo-релиз (тег содержит `-demo`, как `2.24.0-demo`, ИЛИ образ, собранный из
+ветки `integration/demo`) ОБЯЗАН быть помечен GitHub Pre-release (`prerelease: true`) и
+никогда не Latest/production-ready — Latest остаётся только за stable `vX.Y.Z` из `main`.**
+`.github/workflows/release.yml` demo-теги не публикует (его format guard принимает только
+`vX.Y.Z` и `vX.Y.Z-rc.N`), поэтому demo-релиз создаётся вручную, и `--prerelease` в
+`gh release create` — обязательный шаг; чек-лист — в `RELEASING.md`. Hotfix ограничен
 critical/high verified security finding или регрессией, блокирующей релиз, в выпущенной
 версии: ответвляется от `main`, тегируется сразу в stable **без** RC и сливается обратно в
 `dev` через `--no-ff`. Строка версии `main` ниже описывает только stable-релиз — `dev` её

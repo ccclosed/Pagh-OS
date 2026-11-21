@@ -14,6 +14,10 @@ pub mod fb_surface;
 pub mod framebuffer;
 /// Чистый кодек `struct input_event` + set-1 → Linux keycodes, host-тестируемый.
 pub mod input_event;
+/// Чистое кольцо сырого ввода (`inputd`-очередь), host-тестируемое.
+pub mod input_ring;
+/// `inputd`: kernel-поток диспетчеризации PS/2 + USB-HID в evdev/shell-кольцо.
+pub mod inputd;
 pub mod memdisk;
 pub mod nvme;
 pub mod nvme_prp;
@@ -172,8 +176,12 @@ pub fn input_summary() -> alloc::string::String {
         }
         text
     };
+    // `inputd` печатает своё состояние рядом с оборудованием: `pending` должен
+    // быть 0 после синхронного дренажа boot-меню, а `dropped` — 0 на исправной
+    // машине. Ненулевой `dropped` здесь означает, что ввод терялся ещё до shell.
+    let inputd = inputd::stats();
     format!(
-        "usb: {} ctrl, {} ports, device on [{}], {} HID, kbd {} / mouse {} reports{} | ps2: {}",
+        "usb: {} ctrl, {} ports, device on [{}], {} HID, kbd {} / mouse {} reports{} | ps2: {} | inputd: {} pending, {} dropped",
         usb.controllers,
         usb.ports,
         ports,
@@ -189,7 +197,9 @@ pub fn input_summary() -> alloc::string::String {
             "yes"
         } else {
             "no"
-        }
+        },
+        inputd.pending,
+        inputd.dropped
     )
 }
 
