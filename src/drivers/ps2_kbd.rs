@@ -66,6 +66,22 @@ impl CharacterDevice for Ps2Keyboard {
 
 static KEYBOARD: Spinlock<Option<Arc<Ps2Keyboard>>> = Spinlock::new(None);
 
+/// Кольца ввода терминальных сессий (`[0]` не используется — boot-сессия читает
+/// кольцо [`KEYBOARD`]).
+///
+/// Сессия окна получает **своё** кольцо: физическая клавиатура ей не принадлежит
+/// (`/dev/vtinput1` — единственный источник, контракт `vtfb1`/`vtinput1`), поэтому
+/// IRQ1/USB никогда в это кольцо не пишут, а `/dev/vtinput1` — пишет. Благодаря
+/// отдельному кольцу ввод окна не смешивается с вводом boot-shell'а и наоборот.
+static SESSION_RINGS: [Spinlock<KeyboardInner>; crate::drivers::session_route::MAX_SESSIONS] = [const {
+    Spinlock::new(KeyboardInner {
+        buf: [0; BUF_SIZE],
+        head: 0,
+        tail: 0,
+    })
+};
+    crate::drivers::session_route::MAX_SESSIONS];
+
 /// Initialize the PS/2 keyboard driver.
 pub fn init() {
     let kbd = Arc::new(Ps2Keyboard::new());
@@ -96,8 +112,66 @@ pub fn controller_present() -> bool {
 /// for any other kernel consumer (the in-QEMU selftest drives the HID translator
 /// and reads back what it produced, which is the only way to test that path
 /// without a human at the keyboard).
+///
+/// Роутинг по задаче: boot-сессия читает кольцо физической клавиатуры, сессия
+/// окна — своё кольцо `/dev/vtinput1`. Поэтому `nano`, `paint` и `read_secret`
+/// работают в окне, не зная о существовании двух источников.
 pub fn take_scancode() -> Option<u8> {
-    KEYBOARD.lock().as_ref().and_then(|kbd| kbd.read_char())
+    take_scancode_for(crate::drivers::session::current())
+}
+
+/// Взять скан-код из кольца указанной сессии (`0` — физическая клавиатура).
+pub fn take_scancode_for(session: usize) -> Option<u8> {
+    if session == crate::drivers::session_route::BOOT_SESSION {
+        return KEYBOARD.lock().as_ref().and_then(|kbd| kbd.read_char());
+    }
+    let Some(ring) = SESSION_RINGS.get(session) else {
+        return None;
+    };
+    let mut inner = ring.lock();
+    if inner.head == inner.tail {
+        return None;
+    }
+    let byte = inner.buf[inner.head];
+    inner.head = (inner.head + 1) % BUF_SIZE;
+    Some(byte)
+}
+
+/// Есть ли непрочитанный скан-код в кольце указанной сессии.
+pub fn has_scancode_for(session: usize) -> bool {
+    if session == crate::drivers::session_route::BOOT_SESSION {
+        // Именно `has_scancode_raw`, а не `has_scancode`: последний сам
+        // маршрутизируется через эту функцию, и вызов дал бы бесконечную
+        // рекурсию (переполнение стека ядра на первом же тике после промпта —
+        // в живом прогоне это выглядело как «shell перестал принимать ввод»).
+        return has_scancode_raw();
+    }
+    let Some(ring) = SESSION_RINGS.get(session) else {
+        return false;
+    };
+    let inner = ring.lock();
+    inner.head != inner.tail
+}
+
+/// Положить скан-код в кольцо сессии (`/dev/vtinput1`; см. [`SESSION_RINGS`]).
+///
+/// Вытеснение при переполнении — то же, что у физического кольца: ввод окна не
+/// должно блокировать запись клиента.
+pub fn push_session_scancode(session: usize, byte: u8) {
+    if session == crate::drivers::session_route::BOOT_SESSION {
+        push_to_ring(byte);
+        return;
+    }
+    let Some(ring) = SESSION_RINGS.get(session) else {
+        return;
+    };
+    let mut inner = ring.lock();
+    let tail = inner.tail;
+    let next = (tail + 1) % BUF_SIZE;
+    if next != inner.head {
+        inner.buf[tail] = byte;
+        inner.tail = next;
+    }
 }
 
 /// Inject a scancode from another keyboard source (USB HID), exactly as if the
@@ -163,6 +237,15 @@ pub fn inject_scancode_from_vt(byte: u8) {
 /// keypress from an idle wake-up, so it can skip the overlay/repaint cycle (and
 /// the frame flush it ends with) when there is nothing to do.
 pub fn has_scancode() -> bool {
+    has_scancode_for(crate::drivers::session::current())
+}
+
+/// Кольцо физической клавиатуры безусловно (без роутинга по задаче).
+///
+/// Нужно самому [`has_scancode_for`] и путям, которые обязаны смотреть именно
+/// физическое кольцо (роутинг сессии зовёт эту функцию после своей проверки —
+/// рекурсия исключена порядком веток).
+fn has_scancode_raw() -> bool {
     KEYBOARD
         .lock()
         .as_ref()

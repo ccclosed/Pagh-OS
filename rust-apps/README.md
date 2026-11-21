@@ -46,3 +46,29 @@ Demos and screenshot tests render the same deterministic scenes; the end-to-end
 test in `pagh-files/tests/pdp_e2e.rs` runs the real `pagh-desktop` compositor and
 the real Files binary over an `AF_UNIX` socket. See `pagh-ui/README.md`,
 `pagh-files/README.md`, `pagh-ui/PROTOCOL.md` and `pagh-desktop/PROTOCOL.md`.
+
+## CPU OpenGL-1.1 subset: `tinygl`
+
+`rust-apps/tinygl` vendors upstream **TinyGL 0.4.1** (MIT, Fabrice Bellard) and
+wraps it in a thin Rust FFI layer. It renders **on the CPU only** into a dense
+`0x00RRGGBB` (`XRGB8888`) buffer — the compositor's pixel format — so a client
+can draw straight into its memfd and commit damage. This is PR1 (build-probe):
+upstream C 0.4.1 + `build.rs` for this crate only, no system build changes.
+
+Honest limits: fixed-function GL 1.1 subset, no shaders/GLSL/GL 2.0+, no
+FBO/VBO/`glDrawArrays`, 16-bit Z, `stride == width*4`, `width % 4 == 0`,
+one context per process (`gl_ctx` is global), and upstream `gl_fatal_error` is
+`exit(1)`. See `tinygl/README.md` for the full list and
+`tinygl/UPSTREAM.md` for the pinned pixel digest.
+
+```bash
+cd rust-apps/tinygl && cargo test             # criterion6 pixel digest
+cargo run --bin tinygl-probe                  # TINYGL PROBE digest/center/corner
+cargo build --release --target x86_64-unknown-linux-musl   # needs musl C compiler
+```
+
+The musl build needs a C compiler for `x86_64-unknown-linux-musl`
+(`apt install musl-tools`, or clang + `TINYGL_MUSL_SYSROOT`); `build.rs` detects
+it and prints the install instructions if missing. The ELF is static-pie
+(`INTERP` gate: `tinygl-probe --check-interp` plus the existing
+`tools/build-rust-app.sh` check).

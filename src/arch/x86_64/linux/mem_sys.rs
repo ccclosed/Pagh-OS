@@ -307,6 +307,21 @@ pub fn sys_mmap(
         return mmap_vtconsole(node, &backing, fixed, addr, len);
     }
 
+    // `/dev/vtfb1`: read-only пиксельная поверхность терминальной сессии.
+    // Контракт — `PROT_READ|MAP_SHARED`, offset 0; запись в окно не имеет смысла
+    // (пиксели публикует kernel-shell сессии), поэтому `PROT_WRITE` отвергается
+    // тем же правилом, что и у `vtconsole0`.
+    if let Some(info) = node.as_ref().and_then(|n| n.vtfb_info()) {
+        if !shared || prot != PROT_READ as u64 || off != 0 || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if len > crate::drivers::vtfb_abi::pixel_bytes(&info) {
+            return Err(Errno::EINVAL);
+        }
+        let node = node.as_ref().expect("vtfb node");
+        return mmap_vtfb(node, &backing, fixed, addr, len);
+    }
+
     // MAP_SHARED: общие физические кадры (memfd) либо общие анонимные страницы.
     if shared {
         // Запись в MAP_SHARED требует открытого на запись файла (Linux).
@@ -680,6 +695,80 @@ fn mmap_vtconsole(
         let mut mapped: Vec<u64> = Vec::new();
         for i in 0..pages {
             let Some(frame) = node.vtconsole_page(i) else {
+                unwind(&mapped);
+                return Err(Errno::ENOMEM);
+            };
+            pmm::cow_ref(frame);
+            let page = base + i * PAGE_SIZE;
+            if vmm::map(frame, page, pte_flags).is_err() {
+                if pmm::cow_unref(frame) {
+                    pmm::free_frame(frame);
+                }
+                unwind(&mapped);
+                return Err(Errno::ENOMEM);
+            }
+            mapped.push(page);
+        }
+        vm.mmaps.push(MmapRegion {
+            base,
+            pages,
+            writable: false,
+            nx: true,
+            prot: PROT_READ,
+            anon: false,
+            backing: backing.clone(),
+        });
+        if !fixed && end > vm.mmap_next_hint {
+            vm.mmap_next_hint = end;
+        }
+        Ok(base)
+    })
+    .unwrap_or(Err(Errno::EINVAL))?;
+    Ok(base)
+}
+
+/// `mmap(/dev/vtfb1)`: read-only отображение пиксельной поверхности сессии.
+///
+/// Кадры поверхности запинены ядром (`pmm::cow_ref` при аллокации); каждый лист
+/// получает ссылку отображения, которая отпускается `munmap`/exit. `WRITABLE` не
+/// ставится никогда, а `VT_RO_BIT` заставляет `mprotect` отказать в попытке
+/// добавить запись: клиент не может подменить кадр, который публикует сессия.
+fn mmap_vtfb(
+    node: &Arc<dyn VfsNode>,
+    backing: &Option<MmapBacking>,
+    fixed: bool,
+    addr: u64,
+    len: u64,
+) -> Result<u64, Errno> {
+    let pages = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
+        .ok_or(Errno::ENOMEM)?;
+    let span = pages.checked_mul(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+    let base = compat::with_current_compat(|cs| -> Result<u64, Errno> {
+        let vm = &mut cs.vm.lock();
+        let base = if fixed {
+            if addr == 0 || addr & (PAGE_SIZE - 1) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            addr
+        } else {
+            plan_mmap_base(&vm.mmaps, vm.mmap_floor, pages, USER_ADDR_MAX).ok_or(Errno::ENOMEM)?
+        };
+        let end = base.checked_add(span).ok_or(Errno::ENOMEM)?;
+        if end > USER_ADDR_MAX {
+            return Err(Errno::ENOMEM);
+        }
+        if fixed {
+            for i in 0..pages {
+                let _ = vmm::release_user_leaf(base + i * PAGE_SIZE);
+            }
+            cut_regions(&mut vm.mmaps, base, pages);
+        }
+        let pte_flags = leaf_flags(false, true) | vmm::VT_RO_BIT;
+        let mut mapped: Vec<u64> = Vec::new();
+        for i in 0..pages {
+            let Some(frame) = node.vtfb_page(i) else {
                 unwind(&mapped);
                 return Err(Errno::ENOMEM);
             };

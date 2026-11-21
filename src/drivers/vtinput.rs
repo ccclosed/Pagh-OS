@@ -37,7 +37,17 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use super::vt_keys::KeyParser;
 use crate::sync::spinlock::Spinlock;
 
-static PARSER: Spinlock<KeyParser> = Spinlock::new(KeyParser::new());
+/// Декодеры VT-байтов по сессиям: `[0]` — boot-консоль, `[i >= 1]` — окно.
+///
+/// У каждой сессии свой [`KeyParser`]: ESC-последовательность, начатая в одном
+/// окне, не должна достраиваться из байтов другого (и состояние модификаторов
+/// тоже сессионное). Чистый декодер тот же самый.
+static PARSERS: [Spinlock<KeyParser>; crate::drivers::session_route::MAX_SESSIONS] =
+    [const { Spinlock::new(KeyParser::new()) }; crate::drivers::session_route::MAX_SESSIONS];
+
+fn parser_for(session: usize) -> &'static Spinlock<KeyParser> {
+    &PARSERS[if session < PARSERS.len() { session } else { 0 }]
+}
 
 /// PID userspace-владельца клавиатуры (последний писавший в `/dev/vtinput`).
 static CLIENT_PID: AtomicU64 = AtomicU64::new(0);
@@ -110,7 +120,7 @@ pub fn write(bytes: &[u8]) -> usize {
         return bytes.len();
     }
     {
-        let mut parser = PARSER.lock();
+        let mut parser = parser_for(crate::drivers::session::current()).lock();
         parser.feed(bytes, &mut |scancode| {
             crate::drivers::ps2_kbd::inject_scancode_from_vt(scancode);
         });
@@ -123,7 +133,42 @@ pub fn write(bytes: &[u8]) -> usize {
 /// Сбросить недособранную ESC-последовательность и защёлку владельца
 /// (selftest/переоткрытие).
 pub fn reset() {
-    PARSER.lock().reset();
+    for parser in PARSERS.iter() {
+        parser.lock().reset();
+    }
     CLIENT_ACTIVE.store(false, Ordering::Relaxed);
     CLIENT_PID.store(0, Ordering::Relaxed);
+}
+
+/// `/dev/vtinput1`: VT-байты **терминальной сессии** — в её кольцо ввода.
+///
+/// Отличия от boot-пути [`write`], и оба несущие:
+///
+/// 1. **Не защёлкивает владельца физической клавиатуры.** Окно не владеет PS/2:
+///    физические байты IRQ1 продолжают идти в boot-кольцо, а в окно ввод
+///    приходит только отсюда. Дедупликация boot-пути (`client_active`) не
+///    меняется — контракт прямо требует этого.
+/// 2. **Пишет в кольцо сессии** (`ps2_kbd::push_session_scancode`), а не в
+///    boot-кольцо: иначе ввод окна попадал бы в boot-shell.
+///
+/// Как и boot-путь, отдаёт байты дословно в `STDIN_PENDING`, пока в системе есть
+/// foreground-программа (`lxrun` в окне): её stdin — это байты терминала, а не
+/// скан-коды shell-редактора. Ограничение (одна глобальная foreground-группа)
+/// названо в `docs/terminal-session.md`.
+pub fn write_session(session: usize, bytes: &[u8]) -> usize {
+    if bytes.is_empty() || session == crate::drivers::session_route::BOOT_SESSION {
+        return write(bytes);
+    }
+    let fg = crate::drivers::ps2_kbd::FG_PID.load(Ordering::Relaxed);
+    if fg != 0 && crate::task::compat::compat_exists(fg) {
+        crate::arch::x86_64::linux::io_sys::push_stdin_bytes(bytes);
+        return bytes.len();
+    }
+    {
+        let mut parser = parser_for(session).lock();
+        parser.feed(bytes, &mut |scancode| {
+            crate::drivers::ps2_kbd::push_session_scancode(session, scancode);
+        });
+    }
+    bytes.len()
 }
