@@ -3307,27 +3307,30 @@ class TermuxPointer:
         self._rel((x - self.x) / self.scale_x, (y - self.y) / self.scale_y)
         self.x, self.y = x, y
 
-    def _locate_after_probe(self, before, after, old_x: int, old_y: int,
-                            probe_x: int) -> tuple[int, int] | None:
-        """Find the cursor tip in `after` after a +probe_x move from (old_x, old_y)."""
+    def _locate_after_probe(self, before, after) -> tuple[int, int] | None:
+        """Return the cursor tip in `after` after a probe moved it +40 px.
+
+        The diff contains BOTH the old and the new sprite. The new one is the
+        rightmost cluster (probe direction is +x), so take the rightmost 14 px
+        band and its top-left point — the arrow tip. Tracking error does not
+        matter: the band is relative to the observed pixels, not to the model.
+        """
         w, hgt = before[0], before[1]
         ra, rb = before[2], after[2]
-        expected = (old_x + probe_x, old_y)
-        best = []
-        fallback = []
+        pts = []
         for y in range(0, hgt - 60, 2):
             row = y * w * 3
             for x in range(0, w, 2):
                 off = row + x * 3
-                if ra[off:off + 3] == rb[off:off + 3]:
-                    continue
-                if abs(x - expected[0]) <= 150 and abs(y - expected[1]) <= 100:
-                    best.append((x, y))
-                fallback.append((x, y))
-        pool = best if len(best) >= 6 else fallback
-        if len(pool) < 6:
+                if ra[off:off + 3] != rb[off:off + 3]:
+                    pts.append((x, y))
+        if not pts:
             return None
-        return min(x for x, _ in pool), min(y for _, y in pool)
+        max_x = max(x for x, _ in pts)
+        band = [(x, y) for (x, y) in pts if x >= max_x - 14]
+        if len(band) < 4:
+            return None
+        return min(x for x, _ in band), min(y for _, y in band)
 
     def home_pointer(self) -> None:
         """Push the pointer into the (0,0) clamp, then track from there.
@@ -3352,10 +3355,9 @@ class TermuxPointer:
         for _ in range(tries):
             self.move_to(x, y)
             before = _termux_ppm(self.kb, CACHE / "termux_aim_a.ppm")
-            old = (self.x, self.y)
             self._rel(40, 0)
             after = _termux_ppm(self.kb, CACHE / "termux_aim_b.ppm")
-            found = self._locate_after_probe(before, after, old[0], old[1], 40)
+            found = self._locate_after_probe(before, after)
             if found is None:
                 continue
             # The probe left the physical pointer +40 px to the right; step back
@@ -3508,6 +3510,7 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
     text (that is the boot-VT isolation check).
     """
     a = h.a
+    quick = os.environ.get("TERMUX_QUICK") == "1"
     bins = _desktop_bins(a.skip_build)
     disk = CACHE / "e2e_termux_disk.img"
     if not (a.reuse_desktop_disk and _desktop_disk_ready(disk, bins)):
@@ -3729,7 +3732,9 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
 
         # Close/reopen x20: every reopen must run a command, so /mnt/r ends with
         # 20 lines. A crash (#PF/panic) or a failed respawn loses a line.
-        for cycle in range(1, TERMUX_CLOSE_CYCLES + 1):
+        # TERMUX_QUICK=1 skips the mouse-driven close/window legs for a shorter
+        # UX-marker pass (used while iterating on pointer emulation).
+        for cycle in (range(1, TERMUX_CLOSE_CYCLES + 1) if not quick else ()):
             close_window(1)
             if cycle % 5 == 0:
                 _termux_shot(kb, ev / f"21-closed-{cycle:02d}.png")
@@ -3742,19 +3747,20 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         # reach the other nor the boot shell (serial check below). Start from a
         # clean slate so the slots are deterministic: close the last cycle
         # window, let its session reap, then open slot 1 and slot 2.
-        close_window(1)
-        time.sleep(2.5)
-        open_terminal("23b-window1", wait=6.5)
-        open_terminal("23c-window2", wait=7.0)
-        focus_window(2)
-        _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q9two two")
-        _termux_shot(kb, ev / "24-two-windows-window2.png")
-        focus_window(1)
-        # After the raise, window 1's content is on top at its own frame.
-        pointer.click(400, 300)
-        time.sleep(0.3)
-        _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q9one one")
-        _termux_shot(kb, ev / "25-two-windows-window1.png")
+        if not quick:
+            close_window(1)
+            time.sleep(2.5)
+            open_terminal("23b-window1", wait=6.5)
+            open_terminal("23c-window2", wait=7.0)
+            focus_window(2)
+            _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q9two two")
+            _termux_shot(kb, ev / "24-two-windows-window2.png")
+            focus_window(1)
+            # After the raise, window 1's content is on top at its own frame.
+            pointer.click(400, 300)
+            time.sleep(0.3)
+            _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q9one one")
+            _termux_shot(kb, ev / "25-two-windows-window1.png")
 
         # Give the shell/desktop a moment to flush, then stop the guest and read
         # the disk: the verdict is the marker files, not a screenshot.
@@ -3762,8 +3768,10 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         _termux_shot(kb, ev / "26-final-desktop.png")
         serial = guest.serial()
         (ev / "serial.log").write_text(serial)
+        # Keep `h.guest`: the boot-identity gate reads the serial file through
+        # it after the mode returns. Clearing it made every termux run REFUSED
+        # ("no kernel boot banner") even though the log existed on disk.
         guest.stop()
-        h.guest = None
 
         def cat(name: str) -> str:
             return _termux_debugfs_cat(disk, name)
@@ -3795,10 +3803,13 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         ok &= h.check("exit -> notice -> Enter restarted the session",
                       files["q7"].strip() == "after-restart", files["q7"].strip())
         cycles = [line for line in files["r"].splitlines() if line.startswith("C")]
-        ok &= h.check(f"{TERMUX_CLOSE_CYCLES} close/reopen cycles each ran a command",
+        if quick:
+            h.info_check(f"{TERMUX_CLOSE_CYCLES} close/reopen cycles", "skipped (TERMUX_QUICK)")
+            h.info_check("two windows are two independent sessions", "skipped (TERMUX_QUICK)")
+        ok &= quick or h.check(f"{TERMUX_CLOSE_CYCLES} close/reopen cycles each ran a command",
                       len(cycles) == TERMUX_CLOSE_CYCLES,
                       f"{len(cycles)} of {TERMUX_CLOSE_CYCLES}: {cycles[:3]}…{cycles[-2:]}")
-        ok &= h.check("two windows are two independent sessions",
+        ok &= quick or h.check("two windows are two independent sessions",
                       files["q9one"].strip() == "one" and files["q9two"].strip() == "two",
                       f"one={files['q9one'].strip()!r} two={files['q9two'].strip()!r}")
         log_text = files["term.log"]
@@ -3809,7 +3820,7 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         ok &= h.check("session restart visible in the client log",
                       "kernel session reopened" in log_text, _first_line(log_text, "reopened"))
         closed_count = log_text.count("server closed the window")
-        ok &= h.check(f"all {TERMUX_CLOSE_CYCLES} window closes came from the server",
+        ok &= quick or h.check(f"all {TERMUX_CLOSE_CYCLES} window closes came from the server",
                       closed_count >= TERMUX_CLOSE_CYCLES,
                       f"{closed_count} Close events logged")
 

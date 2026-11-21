@@ -26,11 +26,11 @@ static long sys3(long n, long a, long b, long c) {
     return syscall4(n, a, b, c, 0);
 }
 
-static void write_str(const char *s) {
+static void write_fd(long fd, const char *s) {
     long len = 0;
     while (s[len])
         len++;
-    sys3(1 /* write */, 1, (long)s, len);
+    sys3(1 /* write */, fd, (long)s, len);
 }
 
 static void fail(long code) __attribute__((noreturn));
@@ -57,11 +57,11 @@ void start_c(long *sp) {
         fail(4);
 
     for (long i = 2; i < argc; i++) {
-        write_str(argv[i]);
+        write_fd(fd, argv[i]);
         if (i + 1 < argc)
-            write_str(" ");
+            write_fd(fd, " ");
     }
-    write_str("\n");
+    write_fd(fd, "\n");
     sys3(3 /* close */, fd, 0, 0);
     sys3(60 /* exit */, 0, 0, 0);
     for (;;) {
