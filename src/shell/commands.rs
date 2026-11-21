@@ -2325,9 +2325,14 @@ pub(super) fn cmd_fg(_ctx: &mut ShellCtx, _args: &[&str]) {
 /// `PATH` здесь — ещё и источник для поиска голого имени (см.
 /// [`lxrun_search_dirs`]); жёсткое `/mnt/usr/bin` — подмножество
 /// [`super::lxpath::DEFAULT_PATH`], так что поиск не сужается.
-fn lxrun_env() -> [&'static [u8]; 12] {
+fn lxrun_env() -> [&'static [u8]; 13] {
     [
         b"TERM=xterm",
+        // Terminfo-база Debian (`ncurses-base`) живёт под /mnt, а ncurses ищет
+        // её по вкомпилированному /usr/share/terminfo: без явного TERMINFO
+        // ncurses-программы в этой ОС падают на старте («Error opening
+        // terminal: xterm.»), хотя сам бинарь и libtinfo загружены.
+        b"TERMINFO=/mnt/usr/share/terminfo",
         b"PYTHON_BASIC_REPL=1",
         b"PATH=/mnt/usr/bin",
         b"LD_LIBRARY_PATH=/mnt/usr/lib/x86_64-linux-gnu:/mnt/usr/lib:/mnt/usr/lib64:/mnt/lib64",
