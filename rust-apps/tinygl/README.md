@@ -4,11 +4,14 @@
 Bellard) для userspace Pagh. Рендер — **только CPU**, в буфер вызывающего
 (`0x00RRGGBB` = `XRGB8888`, формат композитора).
 
-> **Статус: PR2 — FFI core, headless.** PR1 доказал, что upstream C 0.4.1
-> собирается под `x86_64-unknown-linux-musl`, линкуется static-pie и даёт
-> эталонные пиксели. PR2 добавляет полный безопасный слой: контекст,
+> **Статус: PR3 — текстуры + display lists, headless.** PR1 доказал, что
+> upstream C 0.4.1 собирается под `x86_64-unknown-linux-musl`, линкуется
+> static-pie и даёт эталонные пиксели. PR2 добавил безопасный слой: контекст,
 > viewport/clear, матрицы (stack, `load/mult`, `frustum`, перспектива),
-> immediate-mode примитивы, depth/cull и `ZB_resize`.
+> immediate-mode примитивы, depth/cull и `ZB_resize`. PR3 добавляет текстуры
+> (в пределах upstream 0.4.1), третий матричный стек `GL_TEXTURE` и display
+> lists (`GL_COMPILE`/`GL_COMPILE_AND_EXECUTE`, вложенные вызовы, эмуляция
+> `glDeleteLists`).
 >
 > Это **не** полный OpenGL и **не** desktop-демо: fixed-function subset GL 1.1
 > без shaders/GLSL/GL 2.0+/FBO/VBO/EGL/GLX/Wayland/Mesa и без GPU/DRM/KMS.
@@ -24,10 +27,14 @@ cargo test                       # host gnu; C-компилятор = $CC или
 cargo run --bin tinygl-probe     # эталонный треугольник + ELF-класс
 ```
 
-`cargo test` прогоняет 24 теста: unit-тесты `Surface` (валидация/resize),
-`tests/criterion6.rs` (строгий эталон PR1 + детерминизм), `tests/ffi_core.rs`
-(матрицы/viewport, depth, culling, `ZB_resize`, bad-input, матричные стеки) и
-`tests/probe_binary.rs` (маркеры/cc/ELF собранного бинаря).
+`cargo test` прогоняет 55 тестов: unit-тесты `Surface`/`lists` (валидация,
+resize, зеркало list-слотов), `tests/criterion6.rs` (строгий эталон PR1 +
+детерминизм), `tests/ffi_core.rs` (матрицы/viewport, depth, culling,
+`ZB_resize`, bad-input, матричные стеки), `tests/textures.rs` (квадранты,
+ресемпл, DECAL, `GL_TEXTURE`-стек, пиксельные дайджесты textured triangle/quad/cube),
+`tests/display_lists.rs` (равенство immediate-рендеру, вложенность, эмуляция
+`glDeleteLists`, отказы на crash-условиях C) и `tests/probe_binary.rs`
+(маркеры/cc/ELF собранного бинаря).
 
 Эталон **criterion 6** спеки (`docs/tinygl-port-spec.md` §5.2) —
 детерминированный треугольник в `fb[64*64]`:
@@ -36,10 +43,23 @@ cargo run --bin tinygl-probe     # эталонный треугольник + E
 digest=0x3f7e5ece33386f9b center=0x003c4c7a corner=0x00000000
 ```
 
+PR3 закрепляет и текстурные кадры (те же 64×64, кадр `n` = угол `n*15°`):
+
+```text
+textured triangle digest=0xf65ae5ccdb28d083 center=0x0000ff00 coverage=2080
+textured quad     digest=0xd42374727addc383 center=0x0000ff00 coverage=4096
+textured cube 0   digest=0x72e1d21459ce58e1 center=0x0000ff00 coverage=1444
+textured cube 5   digest=0xe40990fcec6b8835 center=0x00ff0000 coverage=1288
+```
+
 Любое расхождение валит тест: это сделано намеренно (никакого «запишем и
-примем»). Зафиксированные дайджесты host-gcc и musl-gcc — в
-[`UPSTREAM.md`](UPSTREAM.md). Повёрнутые кадры (`angle = n * 30°`) внешнего
-эталона не имеют и проверяются на детерминизм, а не на выдуманное значение.
+примем»). Тест сначала сверяет **геометрию** (центр/покрытие) и падает с
+«geometry changed» — это FAIL, а не FP-reassociation; только при идентичной
+геометрии расхождение дайджеста классифицируется как цвет/интерполяция и оба
+значения (host + musl) должны быть записаны. Зафиксированные дайджесты
+host-gcc и musl-gcc — в [`UPSTREAM.md`](UPSTREAM.md). Повёрнутые кадры
+(`angle = n * 30°`) внешнего эталона не имеют и проверяются на детерминизм, а
+не на выдуманное значение.
 
 ### static-pie / musl
 
@@ -101,6 +121,36 @@ ctx.end()?;
 // ctx.viewport(), ctx.max_lights() — чтение состояния из C.
 ```
 
+Текстуры (только upstream-подмножество: RGB8, ресайз в 256×256, NEAREST,
+REPEAT, DECAL) и display lists:
+
+```rust
+use tinygl::{ListMode, TextureEnvMode, TextureParam, TexturePname};
+
+let names = ctx.gen_textures(1)?;                 // имя — ещё не объект
+ctx.bind_texture(names[0])?;                      // объект создаётся bind'ом
+ctx.tex_env(TextureEnvMode::Decal);               // единственный режим upstream
+ctx.tex_parameter(TexturePname::WrapS, TextureParam::Repeat)?;
+ctx.tex_parameter(TexturePname::MinFilter, TextureParam::Nearest)?;
+ctx.tex_image_2d(8, 8, &rgb8)?;                   // плотные строки w*h*3
+ctx.enable_texture_2d()?;                         // без картинки — наша Err
+// … glBegin/glTexCoord2f/glVertex3f …
+
+// display list: compile/execute и реплей
+let list = ctx.gen_lists(1)?;                     // 0 — валидное имя
+ctx.new_list(list, ListMode::Compile)?;
+ctx.begin(Primitive::Triangles)?;
+ctx.vertex3f(-1.0, -1.0, 0.0);
+ctx.vertex3f( 1.0, -1.0, 0.0);
+ctx.vertex3f( 0.0,  1.0, 0.0);
+ctx.end()?;
+ctx.end_list()?;
+ctx.begin(Primitive::Triangles)?;                 // список можно звать в begin
+ctx.call_list(list)?;
+ctx.end()?;
+ctx.delete_lists(list, 1)?;                       // эмуляция: см. ограничения
+```
+
 `src/ffi.rs` приватный: сырые `extern "C"`-вызовы снаружи крейта недоступны, а
 безопасный слой держит инварианты. Прототипы immediate-mode
 (`glVertex3f`, `glColor3f`, `glNormal3f`, `glTexCoord*` и т. д.) объявлены в
@@ -119,6 +169,11 @@ ctx.end()?;
 `glColor{3,4}fv` / `glNormal3f` / `glNormal3fv` / `glTexCoord{2,4}f` /
 `glTexCoord2fv`; `glShadeModel`.
 
+PR3: `glGenTextures` / `glDeleteTextures` / `glBindTexture` / `glTexImage2D` /
+`glTexEnvi` / `glTexParameteri`; `glGenLists` / `glIsList` / `glNewList` /
+`glEndList` / `glCallList`. `glDeleteLists` в upstream 0.4.1 **отсутствует как
+символ** (пустой `inline` в `gl.h`) — см. ограничения.
+
 ### Наши проверки до C
 
 * `Surface`: `width % 4 == 0`, `pixels.len() == width*height` (плотный
@@ -131,6 +186,25 @@ ctx.end()?;
   отвергают NaN/∞ и вырожденные проекции;
 * `begin`/`end`: вложенный `glBegin` и `glEnd` без `glBegin` → `FbError`
   (upstream — C-`assert`);
+* **текстуры**: имена `> i32::MAX` (C хранит `int` и делает
+  `assert(texture >= 0)`, отрицательный handle — OOB в хэш-таблице), размеры
+  `0`/`> 4096` (C-ресемплер делает `xsize << 16` — int-overflow), неверная
+  длина RGB-буфера, `glTexImage2D` без `bind`, `enable_texture_2d` без
+  загруженной картинки, удаление текущей текстуры при включённом
+  `GL_TEXTURE_2D`, неподдерживаемые пары `glTexParameteri` → `FbError`. Имя `0`
+  не передаётся в `glDeleteTextures`: upstream для него оставляет
+  `current_texture` висячим указателем;
+* **display lists**: `gen_lists` проверяет диапазон `1..=1024`, сам считает
+  свободные слоты и сверяет предсказанное имя с возвращённым C (upstream
+  возвращает `0` и при успехе, и при отказе); `new_list`/`call_list`
+  допускают только имена, выданные `gen_lists` (имя `>= 1024` в C —
+  OOB-запись в `shared_state.lists`). Перед `call_list` зеркало списка
+  проигрывается: overflow/underflow матричного стека, вложенный `glBegin`,
+  включённая текстура без картинки на текстурном треугольнике, рекурсия и
+  «отравленный» список (вершина вне begin) отвергаются **до** C; операции с
+  клиентскими указателями (`glTexImage2D`, `glGenTextures`,
+  `glDeleteTextures`, `glGenLists`) внутри компиляции запрещены — C записал бы
+  сырой указатель и на реплее прочитал освобождённую память;
 * `resize(width, height)`: одна и та же память, площадь не больше исходной
   ёмкости (`ResizeTooSmall`), `w%4==0`; viewport обновляется на весь новый
   размер. Для роста нужен новый `Surface`/`Context` (новый memfd — путь PR4/5).
@@ -165,8 +239,31 @@ ctx.end()?;
   `debug_assert!` (в release NaN — ошибка вызывающего: C-каст float→int UB);
 * `resize` не растит буфер (он принадлежит вызывающему); для большего окна —
   новый memfd/`Surface`/`Context`;
-* текстуры (когда дойдёт PR3) — upstream: только RGB/`UNSIGNED_BYTE`, ресайз в
-  256×256, `GL_NEAREST`, `GL_REPEAT`, `GL_DECAL`.
+* **текстуры — строго upstream 0.4.1**: единственное сочетание
+  `GL_RGB`/`GL_UNSIGNED_BYTE`/`level 0`/`border 0`/`components 3`; любой размер
+  ресемплится **без интерполяции** в **256×256** (mipmap-уровней нет,
+  `GL_MAX_TEXTURE_SIZE == 256`). Фильтрация **всегда `GL_NEAREST`**
+  (`GL_TEXTURE_MIN/MAG_FILTER` upstream молча игнорирует, значения не
+  сохраняются), wrap **всегда `GL_REPEAT`**, режим — только `GL_DECAL`, и в
+  32-битном растеризаторе он **заменяет цвет текселем** (цвет вершины/альфа не
+  используются). Текстурные координаты не проходят через
+  modelview/projection, но проходят через texture matrix, если она не
+  единичная. `GL_TEXTURE_2D` нельзя включить без загруженной текстуры: upstream
+  разыменовал бы `NULL`. Сбой C-`gl_malloc` под 256×256-картинку наш слой
+  увидеть не может — upstream оставляет `pixmap == NULL`, и следующий
+  текстурный треугольник упадёт (названное ограничение, не маскируется);
+* **display lists**: `glDeleteLists` в upstream — **пустой `inline`** в `gl.h`,
+  символа нет и освобождения C-слота не существует. `Context::delete_lists`
+  эмулирует GL-удаление **имён**: имя перестаёт быть вызываемым, записанные
+  операции освобождаются через `glNewList`+`glEndList`, но слот в C остаётся
+  занятым до переопределения имени или закрытия контекста. `glGenLists`
+  upstream возвращает `0` и при успехе (диапазон с нуля), и при отказе — наш
+  слой различает их по собственному зеркалу занятости. Вложенные списки и
+  вызов списка внутри `glBegin` поддерживаются, но безопасное подмножество
+  уже: `glCallList` не вызывается, если зеркало предсказывает `assert`/`fatal`.
+  Побочный эффект: список, собранный в `GL_COMPILE_AND_EXECUTE` с вершиной вне
+  `glBegin`, помечается «отравленным» (иначе C упал бы уже при записи), и
+  `end_list` вернёт `ListMalformed`.
 
 ## Лицензия и происхождение
 
@@ -184,11 +281,14 @@ ctx.end()?;
 ```text
 Cargo.toml  build.rs  LICENSE-TinyGL  THIRD_PARTY_NOTICES.md  UPSTREAM.md
 c_src/      23 C-файла ядра + 9 заголовков + include/GL/gl.h + PATCHES.md
-src/lib.rs  безопасная обёртка (Context/Surface/матрицы/immediate mode/depth/cull)
+src/lib.rs  безопасная обёртка (Context/Surface/матрицы/immediate mode/depth/cull/текстуры/lists)
 src/ffi.rs  приватные extern "C" прототипы (+ отсутствующие в gl.h immediate-mode)
 src/surface.rs  Surface + FbError (валидация, resize в пределах ёмкости)
+src/lists.rs    зеркало list-слотов и модель реплея (проверки до C)
 src/bin/tinygl-probe.rs  PR1-проба + ELF self-check (INTERP/static-pie)
 tests/criterion6.rs      строгий эталон дайджеста/центра/угла + детерминизм
 tests/ffi_core.rs        матрицы/viewport/depth/culling/resize/bad-input
+tests/textures.rs        текстуры: квадранты, ресемпл, DECAL, дайджесты quad/cube
+tests/display_lists.rs   list == immediate, вложенность, delete-эмуляция, отказы
 tests/probe_binary.rs    проверка собранного бинаря (маркеры/cc/interp)
 ```
