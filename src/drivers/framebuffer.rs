@@ -9,20 +9,13 @@ use core::fmt;
 /// должны брать клетку отсюда, а не объявлять своё. Вторая копия этих двух чисел —
 /// молчаливый баг раскладки при смене шрифта (`tools/gen_font.py` решает размер
 /// клетки; ассет и эти константы двигаются вместе).
-pub const CHAR_WIDTH: usize = 8;
-/// Высота глиф-клетки в пикселях (см. [`CHAR_WIDTH`]).
-pub const CHAR_HEIGHT: usize = 18;
-const CHARS_PER_LINE: usize = 100;
-const MAX_LINES: usize = 37;
-
-/// Высота в пикселях зарезервированной полосы status bar внизу экрана. Текстовая
-/// консоль никогда не прокручивается в эту область (см. `scroll`).
 ///
-/// Рассчитана на одну строку глифов с небольшим отступом: собственные метки
-/// полосы идут через `draw_text_px`, так что полоса ниже глифа обрезала бы их
-/// пополам. Taskbar `paint` использует ту же константу, чтобы полосы были
-/// выровнены.
-pub const STATUS_BAR_HEIGHT: usize = CHAR_HEIGHT;
+/// Сама арифметика сетки живёт в чистом [`super::console_layout`] (host-тесты
+/// исполняют её исходник): здесь остаётся реэкспорт, чтобы `framebuffer::CHAR_WIDTH`
+/// продолжал быть единственной точкой правды для потребителей.
+pub use super::console_layout::{CHAR_HEIGHT, CHAR_WIDTH, STATUS_BAR_HEIGHT};
+
+use super::console_layout::console_grid;
 
 /// Геометрия Limine-фреймбуфера для `/dev/fb0` (fbdev UAPI) и `mmap`.
 ///
@@ -110,11 +103,14 @@ pub fn release_takeover() {
     CONSOLE_TAKEOVER.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Сколько ушедших за экран строк консоли держит scrollback. Одна строка —
-/// `CHARS_PER_LINE` символов плюс их `u32`-цвета (~500 байт), так что это
-/// ограничивает историю ~256 KiB — память аллоцируется лениво по мере прокрутки,
-/// и сессия с прокруткой колесом на нормальной загрузке не достигает капа.
-const SCROLLBACK_ROWS: usize = 512;
+/// Бюджет истории консоли в байтах. Одна клетка строки — символ плюс его
+/// `u32`-цвет, [`ROW_BYTES_PER_CELL`] байт, так что число удерживаемых строк
+/// выводится из реальной ширины консоли, а не фиксируется: при 100 колонках это
+/// прежние ~512 строк (~256 KiB), при 320 колонках (2560×1440) — 163 строки, и
+/// бюджет остаётся тем же. Память аллоцируется лениво по мере прокрутки.
+const SCROLLBACK_BYTES: usize = 256 * 1024;
+/// Байт на клетку строки истории: `chars: Vec<u8>` + `fg: Vec<u32>`.
+const ROW_BYTES_PER_CELL: usize = 1 + core::mem::size_of::<u32>();
 
 /// Шрифт консоли: Fira Code (шрифт терминала хоста), растеризованный офлайн
 /// `tools/gen_font.py` в один глиф **8-битного покрытия** на печатную ASCII-кодовую
@@ -137,7 +133,7 @@ const SCROLLBACK_ROWS: usize = 512;
 /// size from the cell width rather than trusting a number here, and `--check`
 /// re-rasterises the asset and fails unless the bytes match. A wider cell renders
 /// the face at the size it was drawn for, but reduces the column count and the
-/// text grid (`CHARS_PER_LINE`); that trade was tried and rejected. Regenerating
+/// text grid (`console_layout::console_grid`); that trade was tried and rejected. Regenerating
 /// with another size or cell is supported, but these constants, the asset and the
 /// grid must change in the same commit.
 static FONT: &[u8] = include_bytes!("../../assets/font8x18.bin");
@@ -245,10 +241,21 @@ pub struct FramebufferWriter {
     /// keeps the classic destructive console. `false` leaves the pixels behind a
     /// glyph alone, which is what lets a wallpaper show *through* the text: with it
     /// on, every printed cell stamps `bg_color` over the gradient underneath and the
-    /// wallpaper survives only outside the 100x37 text grid.
+    /// wallpaper survives only outside the text grid.
     opaque_bg: bool,
-    /// A retained copy of what is currently on the text grid, `MAX_LINES` rows of
-    /// `CHARS_PER_LINE` cells. The pixels are still the display; this is the model
+    /// Number of text columns the console has on this screen.
+    ///
+    /// Derived from the framebuffer width (`console_layout::console_grid`), not a
+    /// constant: on a 1920-wide display the console is 240 columns, exactly as
+    /// `vtsurface` already assumed. A fixed 100-column grid left 58% of a 1080p
+    /// screen outside the console *and* outside any mouse selection.
+    cols: usize,
+    /// Number of text rows above the status bar (`console_layout::console_grid`).
+    /// A fixed 37-row grid is what made a corner-to-corner drag on a 16:9 screen
+    /// highlight only the top 46% of 2560×1440: `text_rows()` clamped to it.
+    rows: usize,
+    /// A retained copy of what is currently on the text grid, `rows` rows of
+    /// `cols` cells. The pixels are still the display; this is the model
     /// the shell needs to place things *at* a cell (the blinking caret) and to
     /// answer "what character is here" (a selection copied out of the screen).
     /// Kept in sync by `write_char`, `scroll` and `clear`.
@@ -262,7 +269,7 @@ pub struct FramebufferWriter {
     /// the user's scroll view offset. The wheel and PageUp/PageDown move `view`;
     /// drawing a history view repaints cells but never touches the live grid, so
     /// the shell's model (caret, selection, next output) stays where it was.
-    scroll: super::scrollback::Scrollback<CHARS_PER_LINE>,
+    scroll: super::scrollback::Scrollback,
     /// Shadow copy of the screen in ordinary RAM.
     ///
     /// All drawing goes here first, because the framebuffer itself is MMIO: every
@@ -373,6 +380,11 @@ impl FramebufferWriter {
         let height = info.height as usize;
         let pitch = info.pitch as usize;
         let bpp = (info.bpp / 8) as usize;
+        // The text grid is what the screen can hold, not a constant: the model,
+        // the caret and a mouse selection all live in these cells, and a grid
+        // smaller than the framebuffer made the selection stop short of the
+        // screen edge (46% of the height on 2560×1440).
+        let (cols, rows) = console_grid(width, height);
         FramebufferWriter {
             fb_addr,
             width,
@@ -386,12 +398,21 @@ impl FramebufferWriter {
             status_bg: 0x1B_3A5B, // slate blue
             status_fg: 0xE6_F0FF,
             opaque_bg: true,
-            // Bounded by construction: the console never holds more than
-            // `MAX_LINES` text rows, and `text_rows()` is clamped to it, so the
-            // model cannot grow with output volume.
-            grid: alloc::vec![b' '; MAX_LINES * CHARS_PER_LINE],
-            grid_fg: alloc::vec![0xFFFFFF; MAX_LINES * CHARS_PER_LINE],
-            scroll: super::scrollback::Scrollback::new(SCROLLBACK_ROWS),
+            cols,
+            rows,
+            // Bounded by construction: one cell per grid position, and the grid
+            // has exactly `rows * cols` cells, so the model cannot grow with
+            // output volume. History is a separate, byte-budgeted ring below.
+            grid: alloc::vec![b' '; rows * cols],
+            grid_fg: alloc::vec![0xFFFFFF; rows * cols],
+            // History is bounded by BYTES, not by a row count: a wider console
+            // row costs more, and a fixed 512-row ring that held ~256 KiB at 100
+            // columns would hold ~800 KiB at 320. The row count is therefore
+            // derived from the actual width, keeping the documented budget.
+            scroll: super::scrollback::Scrollback::new(
+                cols,
+                (SCROLLBACK_BYTES / (cols * ROW_BYTES_PER_CELL)).max(1),
+            ),
             // Zeroed, matching what the device shows after `clear`. Sized by PITCH,
             // not by width: every offset in this file is `y * pitch + x * bpp`, so a
             // buffer of `width * bpp` per row would be read at the wrong stride
@@ -417,11 +438,11 @@ impl FramebufferWriter {
 
     /// Снять текущую текстовую сетку для shared VT surface.
     pub fn text_snapshot(&self) -> TextSnapshot {
-        let rows = self.text_rows();
-        let mut cells = alloc::vec::Vec::with_capacity(rows * CHARS_PER_LINE);
+        let (cols, rows) = (self.cols, self.rows);
+        let mut cells = alloc::vec::Vec::with_capacity(rows * cols);
         for row in 0..rows {
-            let base = row * CHARS_PER_LINE;
-            for col in 0..CHARS_PER_LINE {
+            let base = row * cols;
+            for col in 0..cols {
                 cells.push((
                     self.grid[base + col],
                     self.grid_fg[base + col],
@@ -430,7 +451,7 @@ impl FramebufferWriter {
             }
         }
         TextSnapshot {
-            cols: CHARS_PER_LINE,
+            cols,
             rows,
             cells,
             cursor: (self.col, self.row),
@@ -505,8 +526,8 @@ impl FramebufferWriter {
 
     /// Record `ch` at grid cell `(col, row)`; out-of-range writes are dropped.
     fn set_cell(&mut self, col: usize, row: usize, ch: u8) {
-        if col < CHARS_PER_LINE && row < MAX_LINES {
-            let idx = row * CHARS_PER_LINE + col;
+        if col < self.cols && row < self.rows {
+            let idx = row * self.cols + col;
             self.grid[idx] = ch;
             self.grid_fg[idx] = self.fg_color;
             // Инкрементальная публикация в /dev/vtconsole0. Пока поверхности
@@ -526,8 +547,8 @@ impl FramebufferWriter {
     /// The character recorded at grid cell `(col, row)`, or a space outside the
     /// grid. Used to restore the glyph a caret was drawn over.
     fn cell_char(&self, col: usize, row: usize) -> u8 {
-        if col < CHARS_PER_LINE && row < MAX_LINES {
-            self.grid[row * CHARS_PER_LINE + col]
+        if col < self.cols && row < self.rows {
+            self.grid[row * self.cols + col]
         } else {
             b' '
         }
@@ -535,8 +556,8 @@ impl FramebufferWriter {
 
     /// The foreground color cell `(col, row)` was drawn in.
     fn cell_fg(&self, col: usize, row: usize) -> u32 {
-        if col < CHARS_PER_LINE && row < MAX_LINES {
-            self.grid_fg[row * CHARS_PER_LINE + col]
+        if col < self.cols && row < self.rows {
+            self.grid_fg[row * self.cols + col]
         } else {
             0xFFFFFF
         }
@@ -555,10 +576,11 @@ impl FramebufferWriter {
         to_col: usize,
         out: &mut alloc::string::String,
     ) {
-        let from = from_col.min(CHARS_PER_LINE);
-        let to = to_col.min(CHARS_PER_LINE);
+        let from = from_col.min(self.cols);
+        let to = to_col.min(self.cols);
+        let row = row.min(self.rows - 1);
         for col in from..to {
-            let ch = self.grid[row.min(MAX_LINES - 1) * CHARS_PER_LINE + col];
+            let ch = self.grid[row * self.cols + col];
             // The grid holds console bytes (printable ASCII, see `write_char`).
             out.push(ch as char);
         }
@@ -586,7 +608,7 @@ impl FramebufferWriter {
                 }
             }
             32..=126 => {
-                if self.col >= CHARS_PER_LINE {
+                if self.col >= self.cols {
                     self.col = 0;
                     self.row += 1;
                     if self.row >= max_rows {
@@ -605,12 +627,13 @@ impl FramebufferWriter {
     }
 
     /// Number of text rows the console may use, leaving room for the bottom
-    /// status bar. Derived from the actual screen height so low-resolution
-    /// modes (e.g. 800×600, where 37 full rows would collide with the status
-    /// bar) reserve a row for it rather than overdrawing or clipping the bar.
+    /// status bar. It is the grid height computed once from the real screen in
+    /// [`FramebufferWriter::with_info`] (`console_layout::console_grid`), so the
+    /// console and a mouse selection reach the bottom of any resolution. The old
+    /// derivation re-computed it here and then clamped to a fixed 37 rows, which
+    /// is what left 54% of a 2560×1440 screen unreachable.
     fn text_rows(&self) -> usize {
-        let avail = self.height.saturating_sub(STATUS_BAR_HEIGHT) / CHAR_HEIGHT;
-        avail.min(MAX_LINES).max(1)
+        self.rows
     }
 
     fn draw_char(&mut self, ch: u8, col: usize, row: usize) {
@@ -806,16 +829,17 @@ impl FramebufferWriter {
         // The model must move with the pixels: a caret or a selection computed
         // from a stale grid would point at the wrong row for the rest of the
         // session. Shift up by one row over the same `rows` the pixels moved.
+        let cols = self.cols;
         for row in 0..rows.saturating_sub(1) {
-            let src = (row + 1) * CHARS_PER_LINE;
-            let dst = row * CHARS_PER_LINE;
-            for col in 0..CHARS_PER_LINE {
+            let src = (row + 1) * cols;
+            let dst = row * cols;
+            for col in 0..cols {
                 self.grid[dst + col] = self.grid[src + col];
                 self.grid_fg[dst + col] = self.grid_fg[src + col];
             }
         }
-        let last = (rows - 1) * CHARS_PER_LINE;
-        for col in 0..CHARS_PER_LINE {
+        let last = (rows - 1) * cols;
+        for col in 0..cols {
             self.grid[last + col] = b' ';
             self.grid_fg[last + col] = self.fg_color;
         }
@@ -830,14 +854,12 @@ impl FramebufferWriter {
     }
 
     /// Copy grid row `row` into an owned history row.
-    fn row_snapshot(&self, row: usize) -> super::scrollback::Row<CHARS_PER_LINE> {
-        let base = row.min(MAX_LINES - 1) * CHARS_PER_LINE;
-        let mut out = super::scrollback::Row::<CHARS_PER_LINE>::blank(self.fg_color);
-        out.chars
-            .copy_from_slice(&self.grid[base..base + CHARS_PER_LINE]);
-        out.fg
-            .copy_from_slice(&self.grid_fg[base..base + CHARS_PER_LINE]);
-        out
+    fn row_snapshot(&self, row: usize) -> super::scrollback::Row {
+        let base = row.min(self.rows - 1) * self.cols;
+        super::scrollback::Row::from_cells(
+            &self.grid[base..base + self.cols],
+            &self.grid_fg[base..base + self.cols],
+        )
     }
 
     /// Paint the current scroll view into the shadow buffer.
@@ -857,13 +879,20 @@ impl FramebufferWriter {
         let bg = self.bg_color;
         for row in 0..rows {
             if row < view {
-                let Some(hist) = self.scroll.view_row(row) else {
+                if self.scroll.view_row(row).is_none() {
                     continue;
-                };
-                let chars = hist.chars;
-                let fg = hist.fg;
+                }
                 for col in 0..cols {
-                    self.paint_cell_with_bg(col, row, chars[col], fg[col], bg, true);
+                    // Copy the two cells out of the history row first: the row is
+                    // borrowed from `self.scroll`, and painting needs `&mut self`.
+                    let (ch, fg) = {
+                        let hist = self.scroll.view_row(row).expect("row checked above");
+                        (
+                            hist.chars.get(col).copied().unwrap_or(b' '),
+                            hist.fg.get(col).copied().unwrap_or(self.fg_color),
+                        )
+                    };
+                    self.paint_cell_with_bg(col, row, ch, fg, bg, true);
                 }
             } else {
                 let grid_row = row - view;
@@ -1002,7 +1031,7 @@ impl FramebufferWriter {
     /// Number of character columns on one text row, and the number of text rows
     /// the console may use (the status bar is excluded).
     pub fn text_grid(&self) -> (usize, usize) {
-        (CHARS_PER_LINE, self.text_rows())
+        (self.cols, self.text_rows())
     }
 
     /// Repaint cell `(col, row)` with `ch`, **without moving the text cursor**.

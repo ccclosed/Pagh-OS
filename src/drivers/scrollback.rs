@@ -29,47 +29,76 @@
 // стабильным, пока сетевой насос печатает INFO-строки в фоне.
 
 use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Одна строка консоли: символы и foreground-цвет, которым был нарисован каждый.
 ///
 /// `fg` — часть строки по той же причине, по которой framebuffer держит `grid_fg`:
 /// пиксели не помнят, как клетка была покрашена, так что re-render (прокрутка,
 /// перерисовка темы) должен уметь вернуть цветной текст.
+///
+/// Ширина — параметр `Scrollback`, а не константа: сетка консоли выводится из
+/// разрешения экрана (`drivers::console_layout`), поэтому одна и та же модель
+/// истории живёт и на 1280×720 (160 колонок), и на 2560×1440 (320).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Row<const W: usize> {
-    pub chars: [u8; W],
-    pub fg: [u32; W],
+pub struct Row {
+    pub chars: Vec<u8>,
+    pub fg: Vec<u32>,
 }
 
-impl<const W: usize> Row<W> {
-    /// A row of spaces drawn in `fg` — what a freshly cleared console row is.
-    pub fn blank(fg: u32) -> Self {
+impl Row {
+    /// A row of `width` spaces drawn in `fg` — what a freshly cleared console row is.
+    pub fn blank(width: usize, fg: u32) -> Self {
         Self {
-            chars: [b' '; W],
-            fg: [fg; W],
+            chars: vec![b' '; width],
+            fg: vec![fg; width],
         }
+    }
+
+    /// Copy one console row into an owned history row.
+    pub fn from_cells(chars: &[u8], fg: &[u32]) -> Self {
+        Self {
+            chars: chars.to_vec(),
+            fg: fg.to_vec(),
+        }
+    }
+
+    /// Number of cells in the row (the console width it was captured at).
+    pub fn width(&self) -> usize {
+        self.chars.len()
     }
 }
 
 /// Bounded scrollback ring plus the scroll view offset.
-pub struct Scrollback<const W: usize> {
-    rows: VecDeque<Row<W>>,
+pub struct Scrollback {
+    /// Console width every retained row was captured at.
+    width: usize,
+    rows: VecDeque<Row>,
     capacity: usize,
     view: usize,
 }
 
-impl<const W: usize> Scrollback<W> {
-    /// Create an empty ring that holds at most `capacity` rows.
+impl Scrollback {
+    /// Create an empty ring of `width`-cell rows that holds at most `capacity` rows.
     ///
     /// Allocation is lazy (the deque grows as output scrolls), so a session that
     /// produces a screenful of text costs nothing; `capacity` only bounds the
-    /// memory a long session can reach.
-    pub fn new(capacity: usize) -> Self {
+    /// memory a long session can reach. A caller that wants a byte budget (the
+    /// console sizes the ring from its real width) divides the budget by
+    /// `width * 5` itself and passes the resulting row count.
+    pub fn new(width: usize, capacity: usize) -> Self {
         Self {
+            width: width.max(1),
             rows: VecDeque::new(),
             capacity: capacity.max(1),
             view: 0,
         }
+    }
+
+    /// Console width the retained rows are captured at.
+    pub fn width(&self) -> usize {
+        self.width
     }
 
     /// Number of history rows currently retained.
@@ -105,7 +134,7 @@ impl<const W: usize> Scrollback<W> {
     /// and the view is clamped — a window that was already at the oldest row can
     /// no longer hold all of its content, and that is the one case where scrolling
     /// up has to advance.
-    pub fn push(&mut self, row: Row<W>) {
+    pub fn push(&mut self, row: Row) {
         if self.rows.len() == self.capacity {
             self.rows.pop_front();
         }
@@ -139,7 +168,7 @@ impl<const W: usize> Scrollback<W> {
     /// `r < v`, and live grid row `r - v` otherwise (the caller supplies those).
     /// Returns `None` when `screen_row` is not part of the history part of the
     /// view, or when no rows are retained.
-    pub fn view_row(&self, screen_row: usize) -> Option<&Row<W>> {
+    pub fn view_row(&self, screen_row: usize) -> Option<&Row> {
         if screen_row >= self.view || self.view == 0 {
             return None;
         }
@@ -172,17 +201,17 @@ impl<const W: usize> Scrollback<W> {
 #[cfg(test)]
 mod tests {
     use super::{Row, Scrollback};
+    use alloc::vec;
 
-    fn row(marker: u8) -> Row<4> {
-        Row {
-            chars: [marker, b' ', b' ', b' '],
-            fg: [0xFFFFFF; 4],
-        }
+    fn row(marker: u8) -> Row {
+        let mut r = Row::blank(4, 0xFFFFFF);
+        r.chars[0] = marker;
+        r
     }
 
     #[test]
     fn starts_empty_and_live() {
-        let sb: Scrollback<4> = Scrollback::new(8);
+        let sb = Scrollback::new(4, 8);
         assert_eq!((sb.len(), sb.view()), (0, 0));
         assert!(sb.is_empty());
         assert!(sb.view_row(0).is_none());
@@ -190,8 +219,23 @@ mod tests {
     }
 
     #[test]
+    fn width_is_carried_with_the_ring() {
+        // The console grid is derived from the framebuffer resolution, so the
+        // ring must hold rows of whatever width the screen produced.
+        let mut sb = Scrollback::new(320, 8);
+        assert_eq!(sb.width(), 320);
+        let mut wide = Row::blank(320, 0x102030);
+        wide.chars[319] = b'x';
+        sb.push(wide);
+        sb.scroll(1);
+        let row = sb.view_row(0).expect("history row");
+        assert_eq!(row.width(), 320);
+        assert_eq!(row.chars[319], b'x');
+    }
+
+    #[test]
     fn push_keeps_live_view_at_the_bottom() {
-        let mut sb: Scrollback<4> = Scrollback::new(8);
+        let mut sb = Scrollback::new(4, 8);
         sb.push(row(b'a'));
         sb.push(row(b'b'));
         assert_eq!((sb.len(), sb.view()), (2, 0));
@@ -201,7 +245,7 @@ mod tests {
 
     #[test]
     fn scroll_clamps_to_retained_rows() {
-        let mut sb: Scrollback<4> = Scrollback::new(8);
+        let mut sb = Scrollback::new(4, 8);
         for c in b"abc" {
             sb.push(row(*c));
         }
@@ -219,7 +263,7 @@ mod tests {
 
     #[test]
     fn view_maps_history_rows_in_order() {
-        let mut sb: Scrollback<4> = Scrollback::new(8);
+        let mut sb = Scrollback::new(4, 8);
         for c in b"abcd" {
             sb.push(row(*c));
         }
@@ -233,7 +277,7 @@ mod tests {
 
     #[test]
     fn capacity_drops_the_oldest_row() {
-        let mut sb: Scrollback<4> = Scrollback::new(2);
+        let mut sb = Scrollback::new(4, 2);
         sb.push(row(b'a'));
         sb.push(row(b'b'));
         sb.push(row(b'c'));
@@ -245,7 +289,7 @@ mod tests {
 
     #[test]
     fn push_anchors_a_scrolled_view_to_the_same_rows() {
-        let mut sb: Scrollback<4> = Scrollback::new(8);
+        let mut sb = Scrollback::new(4, 8);
         for c in b"abc" {
             sb.push(row(*c));
         }
@@ -261,7 +305,7 @@ mod tests {
 
     #[test]
     fn clear_forgets_history_and_view() {
-        let mut sb: Scrollback<4> = Scrollback::new(8);
+        let mut sb = Scrollback::new(4, 8);
         sb.push(row(b'a'));
         sb.scroll(1);
         assert!(sb.clear());
@@ -271,8 +315,16 @@ mod tests {
 
     #[test]
     fn blank_rows_are_spaces() {
-        let r = Row::<4>::blank(0x123456);
-        assert_eq!(r.chars, [b' '; 4]);
-        assert_eq!(r.fg, [0x123456; 4]);
+        let r = Row::blank(4, 0x123456);
+        assert_eq!(r.chars, vec![b' '; 4]);
+        assert_eq!(r.fg, vec![0x123456; 4]);
+        assert_eq!(r.width(), 4);
+    }
+
+    #[test]
+    fn from_cells_copies_exactly_one_row() {
+        let r = Row::from_cells(b"abc ", &[1, 2, 3, 4]);
+        assert_eq!(r.chars, b"abc ".to_vec());
+        assert_eq!(r.fg, vec![1, 2, 3, 4]);
     }
 }
