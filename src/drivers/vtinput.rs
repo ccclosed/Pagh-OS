@@ -99,12 +99,28 @@ pub fn reap_dead_client() {
     }
 }
 
+/// Читает ли stdin этого терминала foreground-программа **этой** сессии.
+///
+/// Один глобальный `FG_PID` — named gap (per-window job control — следующий
+/// этап), но сравнивать его сессию обязательно уже сейчас: клиент окна — сам
+/// foreground-задача boot-shell'а, поэтому без сверки `write` в `/dev/vtinput1`
+/// уходил бы в `STDIN_PENDING` «чужой» программы, а session-shell не получал бы
+/// ввода вовсе (живой симптом: окно рисует баннер и промпт, но не эхоит ни одну
+/// набранную клавишу).
+fn stdin_owned_by(session: usize) -> bool {
+    let fg = crate::drivers::ps2_kbd::FG_PID.load(Ordering::Relaxed);
+    fg != 0
+        && crate::task::compat::compat_exists(fg)
+        && crate::drivers::session::bound_session(fg) == session
+}
+
 /// Перевести VT-байты в скан-коды и разбудить shell. Возвращает `len` — запись
 /// всегда принимается целиком (как `/dev/uinput`-подобный sink).
 pub fn write(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
     }
+    let session = crate::drivers::session::current();
     // Запись от userspace-процесса означает, что клавиатурой владеет VT-клиент:
     // физические байты теперь доставляются в shell только через этот путь.
     // kernel-контекст (selftest) владельцем не становится.
@@ -114,13 +130,12 @@ pub fn write(bytes: &[u8]) -> usize {
     // Пока foreground — Linux-программа (`lxrun`), её stdin читается из
     // `STDIN_PENDING` в io_sys; отдаём байты туда дословно (UTF-8/escape
     // сохраняются). Иначе ввод адресован shell-редактору — переводим в set-1.
-    let fg = crate::drivers::ps2_kbd::FG_PID.load(core::sync::atomic::Ordering::Relaxed);
-    if fg != 0 && crate::task::compat::compat_exists(fg) {
+    if stdin_owned_by(session) {
         crate::arch::x86_64::linux::io_sys::push_stdin_bytes(bytes);
         return bytes.len();
     }
     {
-        let mut parser = parser_for(crate::drivers::session::current()).lock();
+        let mut parser = parser_for(session).lock();
         parser.feed(bytes, &mut |scancode| {
             crate::drivers::ps2_kbd::inject_scancode_from_vt(scancode);
         });
@@ -171,8 +186,7 @@ pub fn write_session(session: usize, bytes: &[u8]) -> usize {
     if crate::task::compat::current_has_compat() {
         note_client(crate::task::scheduler::current_pid());
     }
-    let fg = crate::drivers::ps2_kbd::FG_PID.load(Ordering::Relaxed);
-    if fg != 0 && crate::task::compat::compat_exists(fg) {
+    if stdin_owned_by(session) {
         crate::arch::x86_64::linux::io_sys::push_stdin_bytes(bytes);
         return bytes.len();
     }
