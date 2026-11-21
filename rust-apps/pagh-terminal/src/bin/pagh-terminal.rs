@@ -213,10 +213,38 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("pagh-terminal: {error}");
+            report_fatal(&error);
             ExitCode::from(2)
         }
     }
+}
+
+/// Фатальная ошибка клиента: в stderr или в `--log-file`, если он задан.
+///
+/// Запущенный композитором ребёнок живёт в **фоновой** группе консоли, где
+/// TOSTOP останавливает его первым же `write` в stderr. Без этого сообщение не
+/// увидел бы никто: приложение «молча не стартует». `--log-file` читается из
+/// сырой argv, потому что ошибка может быть и ошибкой разбора аргументов.
+fn report_fatal(error: &str) {
+    use std::io::Write;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let log_file = argv
+        .iter()
+        .position(|arg| arg == "--log-file")
+        .and_then(|index| argv.get(index + 1))
+        .cloned();
+    if let Some(path) = log_file {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            if writeln!(file, "pagh-terminal: {error}").is_ok() {
+                return;
+            }
+        }
+    }
+    eprintln!("pagh-terminal: {error}");
 }
 
 fn run() -> Result<(), String> {

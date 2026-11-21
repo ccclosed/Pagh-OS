@@ -592,6 +592,34 @@ fn log_file_receives_the_diagnostics_instead_of_stderr() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Фатальная ошибка тоже обязана уходить в `--log-file`: у приложения,
+/// запущенного композитором, запись в stderr останавливает его SIGTTOU, и
+/// иначе сбой старта («неизвестный аргумент») не увидел бы никто.
+#[test]
+fn fatal_errors_go_to_the_log_file_when_one_is_given() {
+    let dir = temp_dir("fatal");
+    let log = dir.join("client.log");
+    let out = Command::new(binary())
+        .args(["--no-such-flag"])
+        .arg("--log-file")
+        .arg(&log)
+        .stdout(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "unknown argument must be fatal");
+    let text = std::fs::read_to_string(&log).expect("fatal error must land in the log file");
+    assert!(
+        text.contains("unknown argument") && text.starts_with("pagh-terminal: "),
+        "unexpected log content: {text:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("unknown argument"),
+        "the fatal line must not also hit stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_regular_file_surface_uses_read_fallback_and_reports_a_missing_compositor() {
     let dir = temp_dir("readfallback");
