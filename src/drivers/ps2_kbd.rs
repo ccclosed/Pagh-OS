@@ -153,6 +153,25 @@ pub fn has_scancode_for(session: usize) -> bool {
     inner.head != inner.tail
 }
 
+/// Сбросить кольцо ввода сессии (новая генерация окна).
+///
+/// Новая генерация не должна наследовать недоставленные скан-коды прошлой:
+/// задача прошлой сессии могла выйти посреди пачки (например, на Enter
+/// команды `exit`), и хвост пачки остался в кольце. Новый shell прочитал бы
+/// его как «уже набранное» — а break-коды и обрывки make-кодов могли бы
+/// съесть первую клавишу пользователя. Сброс делает старт окна детерминированным.
+pub fn reset_session(session: usize) {
+    if session == crate::drivers::session_route::BOOT_SESSION {
+        return;
+    }
+    let Some(ring) = SESSION_RINGS.get(session) else {
+        return;
+    };
+    let mut inner = ring.lock();
+    inner.head = 0;
+    inner.tail = 0;
+}
+
 /// Положить скан-код в кольцо сессии (`/dev/vtinput1`; см. [`SESSION_RINGS`]).
 ///
 /// Вытеснение при переполнении — то же, что у физического кольца: ввод окна не

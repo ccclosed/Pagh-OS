@@ -188,7 +188,21 @@ pub fn note_open(session: usize) -> bool {
     if session == session_route::BOOT_SESSION || session >= MAX_SESSIONS {
         return false;
     }
-    if !live(session) && !start(session) {
+    if live(session) {
+        // Переоткрытие в тот же слот снимает возможный запрос выхода. Гонка
+        // реальная и наблюдалась живым клиентом: он закрывает ОБА устройства
+        // (последний close просит reap) и сразу открывает их заново, чтобы
+        // поднять сессию в том же окне. Задача сессии проверяет флаг только на
+        // границе своего цикла, поэтому «close → open» успевает проскочить до
+        // неё; без отмены она выходит уже ПОСЛЕ нового open, и клиент получает
+        // `ENODEV` от ioctl на только что открытой сессии (в его логах —
+        // «surface not up yet … retrying»).
+        //
+        // Отменять безопасно: open — это намерение пользователя продолжать
+        // сессию; если после этого не последует ни одного fd, следующий close
+        // снова поставит флаг.
+        clear_reap(session);
+    } else if !start(session) {
         return false;
     }
     OPEN_FDS.fetch_add(1, Ordering::Relaxed);
@@ -227,6 +241,10 @@ fn start(session: usize) -> bool {
         return false;
     }
     clear_reap(session);
+    // Новая генерация окна начинает с чистого ввода: недоставленный хвост
+    // прошлой пачки и недособранная ESC-последовательность не должны съесть
+    // первые клавиши пользователя (см. `vtinput::reset_session`).
+    crate::drivers::vtinput::reset_session(session);
     PENDING.store(session as u64, Ordering::Relaxed);
     // Инвариант 6: путь спавна идёт с замаскированными прерываниями — тик не
     // должен увидеть задачу раньше, чем её владелец записан (иначе первый же

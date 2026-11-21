@@ -49,6 +49,21 @@ fn parser_for(session: usize) -> &'static Spinlock<KeyParser> {
     &PARSERS[if session < PARSERS.len() { session } else { 0 }]
 }
 
+/// Забыть состояние ввода сессии (выход/переоткрытие окна).
+///
+/// Имя и смысл совпадают с `reset_session` из #167: недособранная
+/// ESC-последовательность не должна переживать генерацию, иначе первые байты
+/// нового окна «достраивали» бы последовательность прошлого. Дополнительно
+/// чистится кольцо скан-кодов сессии (см. [`crate::drivers::ps2_kbd::reset_session`]):
+/// задача прошлой сессии могла выйти посреди пачки.
+pub fn reset_session(session: usize) {
+    if session == crate::drivers::session_route::BOOT_SESSION || session >= PARSERS.len() {
+        return;
+    }
+    parser_for(session).lock().reset();
+    crate::drivers::ps2_kbd::reset_session(session);
+}
+
 /// PID userspace-владельца клавиатуры (последний писавший в `/dev/vtinput`).
 static CLIENT_PID: AtomicU64 = AtomicU64::new(0);
 /// Быстрый признак для IRQ1 (без локов и без `compat_exists`): физические

@@ -1,14 +1,15 @@
 // Derived from TinyGL 0.4.1 (c) 1997-2022 Fabrice Bellard, MIT — see LICENSE-TinyGL.
 //! # `tinygl` — тонкая безопасная обёртка над vendored TinyGL 0.4.1
 //!
-//! **PR3 — текстуры и display lists** поверх FFI/core из PR2. Upstream C 0.4.1
-//! (MIT, Fabrice Bellard) компилируется как есть (один патч `zfeatures.h`, см.
-//! `c_src/PATCHES.md`), а этот крейт даёт безопасный Rust-слой: контекст,
-//! viewport/clear, матрицы (включая stack и `gluPerspective`-эквивалент),
-//! immediate-mode примитивы, depth/cull, `ZB_resize`, текстуры и display
-//! lists. Композитор здесь **не** участвует и не трогается — это headless-ядро;
-//! демо `pagh-gl-demo` и PDP/1 — отдельные PR (спека
-//! `docs/tinygl-port-spec.md`, §9).
+//! **PR3 — текстуры и display lists, PR5 — освещение** поверх FFI/core из PR2.
+//! Upstream C 0.4.1 (MIT, Fabrice Bellard) компилируется как есть (один патч
+//! `zfeatures.h`, см. `c_src/PATCHES.md`), а этот крейт даёт безопасный
+//! Rust-слой: контекст, viewport/clear, матрицы (включая stack и
+//! `gluPerspective`-эквивалент), immediate-mode примитивы, depth/cull,
+//! `ZB_resize`, текстуры, display lists и fixed-function освещение
+//! (`glLightfv`/`glMaterialfv`). Композитор здесь **не** участвует и не
+//! трогается — это headless-ядро; демо `pagh-gl-demo` живёт в отдельном крейте
+//! (спека `docs/tinygl-port-spec.md`).
 //!
 //! Никаких shaders/GLSL/GL 2.0+/FBO/VBO/EGL/GLX/Wayland/Mesa и никакой
 //! аппаратной растеризации — только CPU. Это **не** «порт OpenGL».
@@ -74,6 +75,10 @@
 //!   `glDepthFunc` в 0.4.1 отсутствуют — строго upstream, без форка;
 //! * culling — только `GL_CULL_FACE`/`glCullFace`/`glFrontFace`; режим
 //!   `GL_FRONT_AND_BACK` отбрасывает все треугольники (upstream так);
+//! * освещение — fixed-function `GL_LIGHTING`/`GL_LIGHT0..7` и материал
+//!   front/back; `glColorMaterial`, spot/attenuation и `glLightModel*` в
+//!   безопасный слой не выведены (C их поддерживает), `glShadeModel` —
+//!   smooth/flat;
 //! * **один `Context` на процесс**: `gl_ctx` в TinyGL — глобальный указатель
 //!   (`init.c`), поэтому `Context` не `Send`/`Sync`, а второй живой контекст
 //!   возвращает [`FbError::ContextAlreadyLive`];
@@ -264,6 +269,15 @@ impl Primitive {
 pub enum Capability {
     DepthTest,
     CullFace,
+    /// `GL_LIGHTING`: освещение по нормалям (fixed-function, `light.c`).
+    Lighting,
+    /// `GL_LIGHT0`: разрешить источник 0. Включается **вместе** с
+    /// [`Capability::Lighting`]; без источника геометрия остаётся чёрной
+    /// (только ambient модели).
+    Light0,
+    /// `GL_NORMALIZE`: нормализовать нормаль после modelview (нужно при
+    /// неравномерном `scale`; для юнит-нормалей не обязательно).
+    Normalize,
 }
 
 impl Capability {
@@ -271,6 +285,92 @@ impl Capability {
         match self {
             Capability::DepthTest => ffi::GL_DEPTH_TEST,
             Capability::CullFace => ffi::GL_CULL_FACE,
+            Capability::Lighting => ffi::GL_LIGHTING,
+            Capability::Light0 => ffi::GL_LIGHT0,
+            Capability::Normalize => ffi::GL_NORMALIZE,
+        }
+    }
+}
+
+/// Источник освещения (`GL_LIGHT0..GL_LIGHT7`). Upstream поддерживает 16, но
+/// `GL_MAX_LIGHTS` читается из C; здесь фиксированы восемь — этого достаточно
+/// демо, лишние имена не выдумываем.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Light {
+    Light0,
+    Light1,
+    Light2,
+    Light3,
+    Light4,
+    Light5,
+    Light6,
+    Light7,
+}
+
+impl Light {
+    fn to_gl(self) -> i32 {
+        ffi::GL_LIGHT0 + self as i32
+    }
+}
+
+/// Параметр источника [`Light`] (4 float; `Position` — x,y,z,w).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightParam {
+    Ambient,
+    Diffuse,
+    Specular,
+    Position,
+}
+
+impl LightParam {
+    fn to_gl(self) -> i32 {
+        match self {
+            LightParam::Ambient => ffi::GL_AMBIENT,
+            LightParam::Diffuse => ffi::GL_DIFFUSE,
+            LightParam::Specular => ffi::GL_SPECULAR,
+            LightParam::Position => ffi::GL_POSITION,
+        }
+    }
+}
+
+/// Грань материала (`glMaterialfv`): front/back/front-and-back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialFace {
+    Front,
+    Back,
+    FrontAndBack,
+}
+
+impl MaterialFace {
+    fn to_gl(self) -> i32 {
+        match self {
+            MaterialFace::Front => ffi::GL_FRONT,
+            MaterialFace::Back => ffi::GL_BACK,
+            MaterialFace::FrontAndBack => ffi::GL_FRONT_AND_BACK,
+        }
+    }
+}
+
+/// Параметр материала [`MaterialFace`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialParam {
+    Ambient,
+    Diffuse,
+    Specular,
+    Emission,
+    Shininess,
+    AmbientAndDiffuse,
+}
+
+impl MaterialParam {
+    fn to_gl(self) -> i32 {
+        match self {
+            MaterialParam::Ambient => ffi::GL_AMBIENT,
+            MaterialParam::Diffuse => ffi::GL_DIFFUSE,
+            MaterialParam::Specular => ffi::GL_SPECULAR,
+            MaterialParam::Emission => ffi::GL_EMISSION,
+            MaterialParam::Shininess => ffi::GL_SHININESS,
+            MaterialParam::AmbientAndDiffuse => ffi::GL_AMBIENT_AND_DIFFUSE,
         }
     }
 }
@@ -1094,6 +1194,49 @@ impl<'a> Context<'a> {
     pub fn set_front_face(&self, winding: FrontFace) {
         // SAFETY: режим — GL_CCW/GL_CW, оба разбираются upstream без assert.
         unsafe { ffi::glFrontFace(winding.to_gl()) };
+    }
+
+    // --- освещение (PR5) --------------------------------------------------
+
+    /// `glLightfv`: параметр источника [`Light`]. `Position` — `[x,y,z,w]`,
+    /// где `w == 0` означает направленный источник; upstream умножает
+    /// `POSITION` на **текущую modelview** в момент вызова, поэтому вызывайте
+    /// этот метод до `rotate`/`translate` сцены, если нужен свет в
+    /// координатах глаза.
+    ///
+    /// Значения обязаны быть конечными (NaN/∞ в освещении дают NaN-цвет и
+    /// бессмысленный кадр, а не полезный отказ), поэтому проверка — здесь.
+    pub fn light(&self, light: Light, param: LightParam, values: [f32; 4]) -> Result<(), FbError> {
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(FbError::NonFinite {
+                what: "light parameter",
+            });
+        }
+        // SAFETY: единственный живой gl_ctx создан в new(); light — наш
+        // GL_LIGHT0..7, param — поддерживаемый upstream pname, values — 4
+        // float на стеке вызывающего, живут на время вызова.
+        unsafe { ffi::glLightfv(light.to_gl(), param.to_gl(), values.as_ptr()) };
+        Ok(())
+    }
+
+    /// `glMaterialfv`: параметр материала. Для [`MaterialParam::Shininess`]
+    /// upstream читает только `values[0]`; значения вне `0..=128` не
+    /// клампятся (upstream-поведение) — передавайте осмысленные.
+    pub fn material(
+        &self,
+        face: MaterialFace,
+        param: MaterialParam,
+        values: [f32; 4],
+    ) -> Result<(), FbError> {
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(FbError::NonFinite {
+                what: "material parameter",
+            });
+        }
+        // SAFETY: см. `light`: gl_ctx жив, face/param — константы upstream,
+        // values — 4 float, валидные на время вызова.
+        unsafe { ffi::glMaterialfv(face.to_gl(), param.to_gl(), values.as_ptr()) };
+        Ok(())
     }
 
     // --- текстуры (PR3) ---------------------------------------------------
