@@ -595,6 +595,57 @@ pub fn unmap(virt_addr: u64) -> Result<(), VmError> {
 
 /// Создать новый PML4 для пользовательского процесса.
 /// Копирует ядерные отображения верхней половины из текущего PML4.
+/// Сколько pid'ов региона стеков ядра получают таблицы страниц заранее.
+///
+/// 256 слотов — это ~256 задач за загрузку, с запасом больше любого сценария
+/// (в QEMU-наборе ядра pid'ы не доходят и до 64). Стоимость — один кадр PT на
+/// каждый 2 MiB-блок региона (≈7.9 слотов), то есть ≈33 кадра ≈132 KiB.
+pub const KERNEL_STACK_PREMAPPED_PIDS: u64 = 256;
+
+/// Пред-создать таблицы страниц под регион стеков ядра (см.
+/// [`KERNEL_STACK_PREMAPPED_PIDS`]).
+///
+/// `task::scheduler::kernel_thread_spawn` отображает 64 страницы стека; **первый**
+/// стек в каждом 2 MiB-блоке региона требует нового кадра таблицы страниц (PT).
+/// Этот кадр не возвращается никогда: таблицы верхней половины общие на все
+/// PML4 (новый пользовательский PML4 копирует указатели на те же PDPT/PD/PT),
+/// поэтому освободить опустевшую таблицу нельзя, не пройдя по всем адресным
+/// пространствам.
+///
+/// Без пред-создания спавн задачи «стоит» одного кадра непредсказуемо — ровно
+/// в тот раз, когда pid впервые попадает в новый блок, — и любая проверка,
+/// считающая свободные кадры до/после спавна, начинает зависеть от истории
+/// pid'ов. Так и упал in-QEMU `ring3-fault` во втором проходе `selftest 2`:
+/// его собственный спавн впервые попал в новый 2 MiB-блок. Пред-создание
+/// делает стоимость одноразовой и привязанной к загрузке, а не к конкретному
+/// pid'у.
+///
+/// Листья при этом НЕ отображаются: guard-страница каждого слота остаётся
+/// неотображённой, и переполнение стека по-прежнему ловится page fault'ом.
+pub fn premap_kernel_stack_tables() {
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let walker = PageTableWalker::new();
+    for pid in 0..KERNEL_STACK_PREMAPPED_PIDS {
+        let (_guard, _base, top) = crate::memory::layout::kernel_stack_for_pid(pid);
+        // Один адрес на слот: PT покрывает 2 MiB, а слот меньше; адрес вершины
+        // лежит в том же 2 MiB-блоке, что и весь стек (stride < 2 MiB).
+        let virt = VirtAddr::new(top - 1);
+        let pml4 = walker.root_mut();
+        let Ok(pdpt) = walker.ensure_next(pml4, virt.p4_index(), flags, EntryLevel::Pml4) else {
+            return;
+        };
+        let Ok(pd) = walker.ensure_next(pdpt, virt.p3_index(), flags, EntryLevel::Pdpt) else {
+            return;
+        };
+        if walker
+            .ensure_next(pd, virt.p2_index(), flags, EntryLevel::Pd)
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 pub fn new_user_pml4() -> Result<u64, VmError> {
     let walker = PageTableWalker::new();
 

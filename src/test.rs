@@ -10940,6 +10940,317 @@ mod desktop_b_tests {
     }
 }
 
+// ============================================================================
+// Терминальная kernel-сессия (desktop-вариант B, второй shell): in-QEMU половина.
+// ============================================================================
+//
+// Чистые половины (маршрут «задача → консоль» и арифметика offscreen-поверхности)
+// проверяются host-свойством P66. Здесь — то, что требует настоящего ядра:
+// писатель сессии действительно рисует в **свои** кадры PMM, `fb_print!`
+// маршрутизируется по задаче, а boot-консоль при этом не меняется.
+//
+// NON-DESTRUCTIVE: рутина временно делает текущую задачу владельцем сессии 1,
+// поднимает её offscreen-писателя, проверяет пиксели/поколение/маршрут и
+// возвращает всё назад: писатель погашен, поверхность освобождена (кадры
+// возвращаются в PMM — иначе `selftest 2` увидел бы расходящийся ledger),
+// владелец сброшен. Boot-писатель не трогается вообще.
+mod terminal_session_tests {
+    use crate::drivers::{framebuffer, offscreen, session, session_route};
+    use crate::task::scheduler;
+    /// Методы устройств живут в трейте `VfsNode`.
+    use crate::vfs::VfsNode as _;
+
+    /// Снять текстовую сетку конкретного писателя (не текущей задачи).
+    fn snapshot(writer: &framebuffer::FbWriter) -> Option<alloc::vec::Vec<(u8, u32, u32)>> {
+        writer.with(|w| w.text_snapshot()).map(|s| s.cells)
+    }
+
+    /// Сессия тестов: одно окно (индекс 1), как в контракте `vtfb1`/`vtinput1`.
+    const S: usize = 1;
+
+    /// Подождать до `ms` миллисекунд, пока `cond` не станет истиной.
+    ///
+    /// Тик таймера — 1 кГц, поэтому `sleep_ticks(1)` — это ~1 мс реального
+    /// ожидания с уступкой CPU: сессия успевает выполниться, а набор не жжёт
+    /// процессор в spin-цикле.
+    fn wait_until(ms: u64, cond: impl Fn() -> bool) -> bool {
+        let mut waited = 0u64;
+        while waited < ms {
+            if cond() {
+                return true;
+            }
+            scheduler::sleep_ticks(1);
+            waited += 1;
+        }
+        cond()
+    }
+
+    /// Текстовая модель консоли сессии (не пиксели): по ней видно, что shell
+    /// окна действительно выполнил команду.
+    fn grid_text() -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        if let Some(snap) = framebuffer::writer_for(S).with(|w| w.text_snapshot()) {
+            for row in 0..snap.rows {
+                for col in 0..snap.cols {
+                    let (ch, _, _) = snap.cells[row * snap.cols + col];
+                    out.push(ch as char);
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    fn grid_occurrences(needle: &str) -> usize {
+        grid_text().matches(needle).count()
+    }
+
+    /// Дешёвая контрольная сумма пикселей поверхности (выборка каждые 16 KiB).
+    ///
+    /// Нужна, чтобы отличить «nano нарисовал кадр» от «ничего не произошло»:
+    /// редактор рисует ПИКСЕЛИ и текстовую модель консоли не трогает, поэтому
+    /// сетка тут ничего не докажет.
+    fn surface_checksum() -> u64 {
+        let Some(info) = offscreen::info(S) else {
+            return 0;
+        };
+        let total = crate::drivers::vtfb_abi::pixel_bytes(&info) as usize;
+        let mut sum = 0u64;
+        let mut buf = [0u8; 256];
+        let mut off = 0usize;
+        while off < total {
+            let n = offscreen::read_at(S, off, &mut buf);
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                sum = sum.wrapping_mul(31).wrapping_add(b as u64);
+            }
+            off += 16 * 1024;
+        }
+        sum
+    }
+
+    /// Прибрать сессию после рутины: погасить поверхность только когда задача
+    /// действительно вышла (иначе flush писал бы в освобождённые кадры).
+    fn cleanup() {
+        let gone = wait_until(2000, || !session::live(S));
+        if gone {
+            framebuffer::reset_session(S);
+            offscreen::free(S);
+        }
+    }
+
+    /// Этап 1: offscreen-экземпляр консоли + маршрутизация по задаче.
+    pub fn offscreen_console_and_routing() {
+        let pid = scheduler::current_pid();
+        assert_eq_kernel!(
+            session::current(),
+            session_route::BOOT_SESSION,
+            "task is in the boot session before the test"
+        );
+
+        // Boot-экземпляр — тот же писатель, что и до появления сессий: он готов и
+        // его текстовая модель не должна измениться от работы сессии.
+        let (boot_w, boot_h) = framebuffer::writer_for(0).dimensions();
+        let boot_cells = snapshot(framebuffer::writer_for(0));
+
+        // Сделать ТЕКУЩУЮ задачу владельцем сессии 1: маршрут обязан переехать.
+        session::set_owner(1, pid);
+        assert_eq_kernel!(session::current(), 1, "owner pid routes to its session");
+        assert_kernel!(session::live(1), "session 1 is live once it has an owner");
+
+        // Никаких `assert!`: panic=abort убил бы машину, а набор обязан печатать
+        // FAIL и продолжать (`assert_kernel!`). Если поверхность не поднялась
+        // (например, PMM пуст), дальнейшие проверки бессмысленны, но cleanup ниже
+        // всё равно выполняется.
+        let up = framebuffer::init_session(1);
+        assert_kernel!(up, "offscreen console initializes (PMM has frames)");
+        assert_kernel!(
+            up && framebuffer::writer_for(1).is_ready(),
+            "session writer is ready"
+        );
+
+        // Окно имеет размер экрана по контракту vtfb1; маршрутизированный
+        // `dimensions()` теперь отвечает геометрией сессии.
+        assert_eq_kernel!(
+            framebuffer::dimensions(),
+            (boot_w, boot_h),
+            "session console has the same geometry as boot"
+        );
+
+        // Пиксель: заливка прямоугольника уходит в кадры поверхности, а не в
+        // shadow-буфер boot-консоли. Цвет BGR в памяти (XRGB little-endian).
+        let generation_before = offscreen::generation(1);
+        framebuffer::with(|fb| fb.fill_rect(0, 0, 8, 8, 0x0012_3456));
+        framebuffer::flush();
+        let generation_after = offscreen::generation(1);
+        assert!(
+            generation_after > generation_before,
+            "a session flush bumps the surface generation"
+        );
+        let mut px = [0u8; 3];
+        assert_eq_kernel!(
+            offscreen::read_at(1, 0, &mut px),
+            3,
+            "pixel readback from the session surface"
+        );
+        assert_eq_kernel!(
+            px,
+            [0x56, 0x34, 0x12],
+            "surface holds XRGB red=0x12 green=0x34 blue=0x56"
+        );
+
+        // Текст через `fb_print!` маршрутизируется в сессию: её сетка получает
+        // символ, boot-сетка остаётся байт-в-байт прежней.
+        crate::fb_print!("S");
+        let session_cells = snapshot(framebuffer::writer_for(1)).expect("session snapshot");
+        assert_eq_kernel!(
+            session_cells.first().map(|c| c.0),
+            Some(b'S'),
+            "fb_print! wrote into the session console"
+        );
+        assert_eq_kernel!(
+            snapshot(framebuffer::writer_for(0)),
+            boot_cells,
+            "the boot console model is untouched by session output"
+        );
+
+        // Погасить сессию: писатель снят, кадры возвращены в PMM, владелец сброшен.
+        framebuffer::reset_session(1);
+        assert!(
+            !framebuffer::writer_for(1).is_ready(),
+            "session writer is gone"
+        );
+        session::reset(1);
+        offscreen::free(1);
+        assert_eq_kernel!(
+            session::current(),
+            session_route::BOOT_SESSION,
+            "routing returns to the boot session"
+        );
+        // Boot-консоль после всего этого — прежняя (размер и модель).
+        assert_eq_kernel!(
+            framebuffer::writer_for(0).dimensions(),
+            (boot_w, boot_h),
+            "boot console still reports its geometry"
+        );
+        assert_eq_kernel!(
+            snapshot(framebuffer::writer_for(0)),
+            boot_cells,
+            "boot console exits the test unchanged"
+        );
+    }
+
+    /// Этап 2: жизненный цикл сессии — спавн по первому open, ввод через
+    /// `/dev/vtinput1`, выполнение команды, выход по последнему close и
+    /// повторный open.
+    pub fn session_spawn_input_output_exit_reopen() {
+        assert_kernel!(!session::live(S), "session 1 is not live before the test");
+
+        assert_kernel!(session::note_open(S), "the first open spawns the session");
+        assert_kernel!(session::live(S), "session is live after open");
+        // Баннер печатается через `fb_println!` в поверхность сессии (без
+        // serial-эха): значит, задача действительно запустилась и говорит в своё
+        // окно.
+        assert_kernel!(
+            wait_until(2000, || grid_text().contains("Welcome to pagh OS Shell!")),
+            "session banner reached the session console"
+        );
+
+        let generation_before = offscreen::generation(S);
+
+        // Ввод — через VFS-узел устройства, как это сделал бы композитор:
+        // VT-байты -> KeyParser сессии -> кольцо ввода сессии -> REPL.
+        let input = crate::vfs::desktop_dev::vtinput1();
+        let wrote = input.write(0, b"echo qterm-kernel-ok\n").unwrap_or(0);
+        assert_eq_kernel!(wrote, 21, "vtinput1 accepts the whole VT write");
+
+        // Строка команды появляется в сетке как набранный текст, а её РЕЗУЛЬТАТ —
+        // второй раз: ищем два вхождения, иначе тест доказывал бы только эхо
+        // ввода, а не выполнение команды.
+        assert_kernel!(
+            wait_until(3000, || grid_occurrences("qterm-kernel-ok") >= 2),
+            "the in-session shell executed the command (command line + output)"
+        );
+        assert_kernel!(
+            offscreen::generation(S) > generation_before,
+            "session output bumped the pixel-surface generation"
+        );
+
+        // Последний close — запрос выхода; задача выходит сама на границе цикла.
+        session::note_close(S);
+        assert_kernel!(
+            wait_until(2000, || !session::live(S)),
+            "last close reaps the session"
+        );
+
+        // Повторный open поднимает сессию заново (контракт vtfb1).
+        assert_kernel!(
+            session::note_open(S),
+            "a repeated open respawns the session"
+        );
+        assert_kernel!(session::live(S), "session is live again after reopen");
+        assert_kernel!(
+            wait_until(2000, || grid_text().contains("Welcome to pagh OS Shell!")),
+            "respawned session prints its own banner"
+        );
+        session::note_close(S);
+        assert_kernel!(
+            wait_until(2000, || !session::live(S)),
+            "close reaps the respawned session"
+        );
+        cleanup();
+        // Контракт vtfb1: после выхода сессии устройство отвечает ENODEV
+        // (ioctl/open), пока повторный open не поднимет её заново.
+        assert_kernel!(
+            crate::vfs::desktop_dev::vtfb1().vtfb_info().is_none(),
+            "vtfb1 reports ENODEV (no info) after the session exited"
+        );
+    }
+
+    /// Этап 3: `nano` в окне рисует в offscreen-поверхность и корректно
+    /// возвращает управление shell'у по Esc.
+    pub fn nano_draws_in_session() {
+        assert_kernel!(session::note_open(S), "open for the nano test");
+        assert_kernel!(
+            wait_until(2000, || grid_text().contains("Welcome to pagh OS Shell!")),
+            "session shell is ready before nano"
+        );
+
+        let before = surface_checksum();
+        let input = crate::vfs::desktop_dev::vtinput1();
+        input.write(0, b"nano /tmp/qterm-nano.txt\n");
+        // nano — полноэкранный редактор: он рисует пиксели (заголовок, тело,
+        // футер) через `framebuffer::with`, поэтому доказательство запуска —
+        // изменившееся содержимое поверхности, а не текстовая модель.
+        assert_kernel!(
+            wait_until(3000, || surface_checksum() != before),
+            "nano painted into the session surface"
+        );
+
+        // Файл пуст, поэтому `dirty == false` и одиночный Esc закрывает
+        // редактор (тот же quit-путь, что у пользователя).
+        input.write(0, &[0x1b]);
+        // Доказательство возврата: команда, отправленная ПОСЛЕ Esc, исполняется
+        // shell'ом (появилась в сетке). Если бы nano остался жив, те же байты
+        // ушли бы в его буфер и в сетку не попали.
+        scheduler::sleep_ticks(200);
+        input.write(0, b"echo nano-back-ok\n");
+        assert_kernel!(
+            wait_until(4000, || grid_occurrences("nano-back-ok") >= 2),
+            "Esc closed nano and the shell executed the next command"
+        );
+
+        session::note_close(S);
+        assert_kernel!(
+            wait_until(2000, || !session::live(S)),
+            "close after nano reaps the session"
+        );
+        cleanup();
+    }
+}
+
 pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
     alloc::vec![
         (
@@ -11384,6 +11695,29 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "userbuf::lazy anon read/write through demand paging",
             desktop_b_tests::lazy_anon_user_buffers
+        ),
+        // Терминальная kernel-сессия (desktop-вариант B) — В КОНЦЕ набора, и это
+        // несущий порядок. Рутины поднимают offscreen-писателя (≈1000 кадров
+        // PMM + shadow-буфер в куче) и спавнят kernel-потоки, то есть занимают
+        // новые pid'ы и — при первом попадании стека в новый 2 MiB-слот —
+        // страничные кадры, которые `vmm::unmap` не возвращает по построению.
+        // Ранние PMM-чувствительные рутины (например
+        // `arch::ring-3 #PF kills the task`) сверяют точное число свободных
+        // кадров до/после своего спавна, и сдвинутый ими pid выводил бы их из
+        // равновесия: проверка падала бы на чужом (и вечном) кадре таблицы
+        // страниц, а не на утечке задачи. Последними рутины никого не сдвигают,
+        // а места в PMM здесь с запасом (~111k свободных кадров на 1 GiB).
+        (
+            "terminal-session::offscreen console + per-task routing",
+            terminal_session_tests::offscreen_console_and_routing
+        ),
+        (
+            "terminal-session::spawn / vtinput1 / vtfb1 output / exit / reopen",
+            terminal_session_tests::session_spawn_input_output_exit_reopen
+        ),
+        (
+            "terminal-session::nano draws in the session surface and exits on Esc",
+            terminal_session_tests::nano_draws_in_session
         ),
     ]
 }
