@@ -153,6 +153,49 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
       `check_node_access`/`check_dir_mutation`; изменения ids идут через метод перехода
       `Creds`, никогда не по полям в обработчике.
     Контракт и точный список пробелов: `docs/security-model.md`.
+12. **`inputd` — единственный диспетчер физического ввода.** Производители (PS/2 IRQ1/IRQ12,
+    USB HID) только кладут элемент в кольцо `src/drivers/input_ring.rs`; доставляет его ровно
+    поток `inputd` (`src/drivers/inputd.rs`), который зовёт `ps2_kbd::deliver_physical` и
+    раскладывает байт в `/dev/input/event0`, shell-кольцо и сборщик `ps2_mouse`. Поэтому
+    dedup-правило `vtinput` (и проверка «клиент уже владеет клавиатурой») живёт в одном месте и
+    в одном потоке: IRQ-контекст не зовёт потребителей, иначе символ приходит дважды — двойное
+    эхо, два элемента истории, повтор команды. Дренаж сериализован спинлоком (маскирует `IF`):
+    элемент доставляется один раз и в порядке поступления, переполнение кольца (256) отвергает
+    **новый** элемент и считается в `dropped` (вытеснение старого разорвало бы пару
+    make/break). Boot-меню идёт до потоков и с выключенными прерываниями, поэтому дренирует
+    очередь синхронно после `xhci::poll()`. Один CPU — один `inputd`; SMP не заявляется, и
+    per-CPU очередей здесь быть не должно. Host-свойство — P66.
+13. **`FS.base` пишется на каждой активации задачи: значение compat-состояния или 0.**
+    `activate_task` (`src/task/scheduler.rs`) обязан выставлять регистр при **каждом**
+    переключении. Пропуск (прежнее поведение: «пишем только когда у задачи есть compat-состояние»)
+    оставляет задаче без compat-состояния — kernel-потоку, нативной ring-3 задаче, потоку после
+    `finish_compat_exit` — 32-ТиБ `FS.base` предыдущей compat-задачи, и первое обращение musl к
+    errno/TLS через `%fs:0` уходит в чужое (или уже снятое) адресное пространство: на реальном
+    железе это `[EXC #14] addr=FS.base+0` с `RIP=__errno_location`. Idle пропускается: ring-3
+    кода и `%fs`-относительных инструкций в ядре нет.
+14. **Двойной клик синтезирует клиент, а не PDP/1.** Протокол несёт отдельные press/release;
+    `pagh-ui::client` (`rust-apps/pagh-ui/src/client.rs`) склеивает пару: второй press **левой**
+    кнопки не позже `DOUBLE_CLICK_INTERVAL` (400 мс) после первого и не дальше
+    `DOUBLE_CLICK_SLOP` (4 px по каждой оси) — это `Click::Double`, а третий press начинает
+    новую пару (тройного клика нет). Сервер о двойном клике не знает, поэтому приложение,
+    которое его не обрабатывает, честно видит два обычных клика; менять числа или переносить
+    синтез в протокол — ломать оба клиента (`pagh-files`, `pagh-terminal`) и золотые кадры.
+15. **Обычный запуск desktop — только через `--launch-target`.** Композитор не угадывает
+    приложение: без цели PDP/1 `launch` (type 13) отвечает `ERR_UNSUPPORTED`, а подсказка
+    называет `--launch-target APP=PROGRAM[|ARG…]`. Обычный носитель несёт `/mnt/etc/autorun`
+    (`tools/mkimage.py --autorun` ставит рецепт `rust-apps/pagh-desktop/desktop-autorun`) с
+    реальными целями `files=`/`terminal=`. Демо-клиент `pagh-desktop-demo` и флаги
+    `--spawn-demo`/`--demo-window` — **только тестовые** (`tools/e2e.py desktop --legacy-demo`)
+    и в рецепт не попадают: демо-фолбэк не является обычным путём запуска.
+16. **TinyGL: один `Context` на процесс и плотный буфер.** `rust-apps/tinygl` держит upstream
+    `gl_ctx` глобальным, поэтому второй живой `Context` — `FbError::ContextAlreadyLive`, а не
+    «второй контекст». Поверхность принимается только плотной: `width % 4 == 0`,
+    `pixels.len() == width * height` (то есть `stride == width * 4`; TinyGL не выражает
+    паддинг), сторона `1..=4096` (`MAX_SURFACE_DIM` совпадает с пределом композитора), а
+    `resize` разрешён лишь в площадь не больше исходной ёмкости буфера — рост требует нового
+    `Surface`/`Context`. Ошибки валидации — наши `FbError` **до** входа в C: upstream на
+    невалидном входе уходит в `gl_fatal_error` = `exit(1)` или C-`assert`. Static-pie-гейт —
+    `INTERP` пуст (`tinygl-probe --check-interp`).
 
 ## Философия тестирования
 
@@ -169,7 +212,8 @@ kernel-e2e-legacy -> tools/e2e_*.ps1         # Windows-only legacy harnesses (ne
   другое состояние ядра), делает проходы расходящимися — так нашли ELF-fuzz-рутину,
   вычерпывавшую весь пул.
 - **Linux-compat end-to-end → `selftest_lx`** (фича-гейтед harness'ы) плюс гостевой драйвер
-  `tools/e2e.py` (режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`):
+  `tools/e2e.py` (режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell` и
+  остальные — актуальный список и флаги в `tools/README.md`):
   локальный mini-repo, живой `ppkg update`, bigindex-репро, многомегабайтный TLS-поток через
   `lx_tlsbig`. Harness'ы `tools/e2e_*.ps1` — Windows-only legacy-эквиваленты тех же
   сценариев, см. *Canonical entry points*; новая работа идёт в `tools/e2e.py` (Linux и CI
@@ -239,8 +283,11 @@ critical/high verified security finding или регрессией, блоки�
 - **PATCH** — фиксы, диагностика, доки, тулинг, обновления vendored-зависимостей без
   изменения поведения. Docs-only коммиты (этот файл, README'шки) версию не бампают.
 
-**Текущие версии и недавняя история.** **`dev` currently reads 2.24.0**; **`main` reads 2.22.9** — hotfix раунда 4:
-read-only out-указатель сисколла больше не вешает CPU, FPU/SSE изолированы между
+**Текущие версии и недавняя история.** **`dev` currently reads 2.24.0**; **`main` reads 2.24.0** — это stable-релиз
+`v2.24.0` (2026-11-20) той же линии: `dev` слит в `main` через `--no-ff` (PR #146), поэтому обе
+ветки читают 2.24.0, а `dev` копит следующий релиз на этой версии, пока bump не сделан в PR,
+который его выпускает. `main` до этого читал 2.22.9 — hotfix раунда 4: read-only out-указатель
+сисколла больше не вешает CPU, FPU/SSE изолированы между
 процессами, установщик не разворачивает чужие pre-existing symlink'и, `SFMASK` как в
 Linux, fd-таблица ограничена на всех путях. До него 2.22.8 — перевод комментариев и
 документации на русский; 2.22.7 — USB-клавиатура/мышь на реальном xHCI (boot-протокол,
@@ -273,6 +320,21 @@ host-тесты ABI (`fb_abi`, `input_event`, `cmsg`) + шесть in-QEMU routi
 `desktop-b::*` (fb ioctl/mmap/пиксель, event0 read/poll, memfd coherence,
 MAP_SHARED после fork, SCM_RIGHTS fd passing, SCM_RIGHTS truncation/errors).
 Пробелы: DMA-BUF/GPU, Wayland, EV_ABS/touch, fb modeset.
+
+**`dev` после stable `v2.24.0`** (версия та же, bump не делался — эти изменения тоже состояние `dev`):
+`inputd`/`netd` — диспетчер физического ввода вынесен в kernel-поток (`ps` печатает `[inputd]`,
+`[netd]`); `FS.base` пишется на каждой активации задачи и равен 0 без compat-состояния;
+двойной клик синтезирует клиент `pagh-ui` (400 мс / 4 px), протокол его не несёт; голое имя
+программы в shell и `lxrun` ищется по `PATH` (execvp-семантика), а `mount`/`umount` остаются
+честными заглушками до `mount(2)`; рендер — предкомпонованное кольцо тени окна, widget-damage
+со статическим слоем и `opt-level=3` для кода рендера терминала/Files, `row-store`-заливки;
+Files подписывает устройства «Системный диск (/)»/«Диск данных (/mnt)»; вендорен TinyGL 0.4.1
+(PR1 — build-probe, PR2 — FFI-core, headless: desktop-демо нет); терминальная kernel-сессия
+stage 1 — `/dev/vtfb1` + `/dev/vtinput1` (offscreen-экран и ввод сессии,
+`docs/terminal-session.md`), привязка окна к ней по умолчанию — открытый PR #147; USB mass
+storage (S1 и UX-спека) — открытые ветки, в `dev` его нет.
+Проверка состояния (2026-11-21, `origin/dev` = `7e8c4e07`): `python3 tools/host_tests.py` —
+850 passed / 0 failed, нумерованные свойства `p01`–`p67`.
 Предыдущая версия `dev`:
 
 **`dev` до 2.24.0** (2.23.0) — USB-тетеринг телефона: нативный RNDIS поверх xHCI.
@@ -350,7 +412,8 @@ user-out вне `with_current_compat` — `rt_sigprocmask`/`sigaltstack` с read
 документированной парой `lib64 -> usr/lib64`, всё остальное — `UnsafePath` до записи
 (атомарный preflight всего пакета); (4) `SFMASK` = TF|DF|IF|IOPL|AC|NT как в Linux; (5)
 `FD_TABLE_LIMIT` принуждается на `alloc`/`pipe`/`set`, `pipe()` → `EMFILE`, `dup2`/`dup3`
-на `newfd >= 1024` → `EBADF`. Host-тесты: 561/0.
+на `newfd >= 1024` → `EBADF`. Host-тесты на момент релиза: 561/0 (историческое число
+2.22.9; актуальное состояние `dev` — в блоке выше).
 
 **2.22.8** = перевод комментариев и документации на русский по всему дереву, без
 изменений поведения. Переведена проза `//!`/`///`/`//` в `src/vfs`, `src/fs`,
@@ -360,8 +423,8 @@ user-out вне `with_current_compat` — `rt_sigprocmask`/`sigaltstack` с read
 `docs/**` — тоже. Удалён task/round/field/photo-нарратив, audit-ID сведены к
 `SECURITY.md`, длинные эссе сжаты; `R…`/`P…`/`§`/`REQ`/тест-ссылки, код,
 идентификаторы, строки, пути и `SAFETY`-маркеры сохранены. Добавлен
-`COMMENT_STYLE.md`. Функциональных изменений нет: host-tests 556/0, USB e2e,
-selftest и CI зелёные.
+`COMMENT_STYLE.md`. Функциональных изменений нет: host-tests 556/0 (на момент 2.22.8),
+USB e2e, selftest и CI зелёные.
 
 Сжатая история предыдущих релизов (подробности — `CHANGELOG.md`): 2.22.6 — четыре high
 раунда 3 (ring-3 исключения, `F_DUPFD` cap, epoll/signalfd deadlock, installer spelling);
@@ -437,7 +500,10 @@ slice 4; 2.10.0 — procfs slice 3; 2.9.x — правда о памяти и `/
   исправлены в 2.18.2. **Не проверено: реальное железо** (следующий полевой тест его
   прогонит); нигде не реализованы: хабы (только корневые порты), изохронные передачи,
   teardown слота при отключении и USB mass storage — поэтому disk image загрузочного
-  носителя монтируется как RAM-диск, а не читается со флешки. USB-RNDIS (тетеринг
+  носителя монтируется как RAM-диск, а не читается со флешки. USB mass storage остаётся
+  **незавершённой работой**: stage S1 и UX-спека живут в открытых ветках, в `dev` их нет,
+  и описывать их как готовые нельзя — механика (bulk-only транспорт, RAM-диск как первый
+  носитель) и честные границы появятся здесь только после merge. USB-RNDIS (тетеринг
   телефона) добавлен в 2.23.0: он использует тот же xHCI-контроллер, поддерживает
   INITIALIZE/QUERY/SET/keepalive и bulk-пару, но не опрашивает interrupt-IN
   уведомления и не разбирает hot-unplug; реальное железо не проверено.
@@ -468,4 +534,11 @@ slice 4; 2.10.0 — procfs slice 3; 2.9.x — правда о памяти и `/
   узлы (`/dev`, `/proc`) не могут сохранить владельца и держат исторический per-process
   override для `stat` (ramfs `/tmp` с фазы 2 хранит `mode`/`owner` на узле); SMEP —
   единственная аппаратная митигация (SMAP/KPTI отсутствуют). `access(2)` проверяет real
-  ids; `stat` сообщает реальные метаданные inode.
+  ids; `stat` сообщает реальные метаданные inode.- **В работе, а не в `dev`** (не описывайте как готовое): USB mass storage (stage S1 и
+  UX-спека — открытые ветки) и всё, что от него зависит (чтение флешки вместо RAM-диска);
+  привязка терминального окна к kernel-сессии по умолчанию (открытый PR #147 — до него окно
+  запускает собственный shell-потомок через pipe'ы, `--mirror-vt` остаётся диагностикой);
+  PTY/полный job control и per-window `^Z`/`fg`/`bg` (управляющий терминал один, его
+  держит boot-shell — `docs/terminal-session.md` §6); TinyGL desktop-демо и GL-клиент
+  композитора (в дереве только headless FFI-core `rust-apps/tinygl`); SMP (один CPU, один
+  `inputd`, один планировщик). Эти границы названы в подсистемных README, а не спрятаны.
