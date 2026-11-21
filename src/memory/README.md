@@ -13,7 +13,7 @@
 | `pmm.rs` | Physical Memory Manager — битовый аллокатор кадров 4 KiB + счётчики COW |
 | `cow.rs` | Чистый (host-testable) учёт владения COW-кадрами: счётчик шарящих адресных пространств, `CowRefs` |
 | `pat.rs` | Чистая (host-testable) политика PAT/write-combining: CPUID-бит PAT, кодирование `IA32_PAT` (entry 4/5 = WC), флаги WC/fallback листа `/dev/fb0`, сохранение кэш-политики в `mprotect` |
-| `vmm.rs` | Virtual Memory Manager — 4-уровневый paging, map/unmap/translate, единый release листов, clone/fork/drop user-space, MMIO, управление CR3 |
+| `vmm.rs` | Virtual Memory Manager — 4-уровневый paging, map/unmap/translate, единый release листов, clone/fork/drop user-space, MMIO, управление CR3. `premap_kernel_stack_tables()` (шаг загрузки после `heap`) заранее создаёт PT региона стеков ядра: таблицы верхней половины общие на все PML4 и не освобождаются, поэтому иначе первый стек в каждом 2 MiB-блоке непредсказуемо «стоил» бы одного кадра при спавне задачи |
 | `heap.rs` | Ядровая куча, `#[global_allocator]` (обёртка над `good_memory_allocator` с маскировкой прерываний) |
 
 ## Ключевые символы
