@@ -1717,13 +1717,32 @@ fn respawn_kernel_session(
     // close после `open` новой сессии попросил бы её выйти (ENODEV на ioctl).
     forwarder.close().map_err(VtFbError::Io)?;
     frame.close_source()?;
+    diag.line("restart: devices closed, reopening input");
     forwarder.respawn().map_err(VtFbError::Io)?;
-    let info = frame.respawn()?;
-    diag.line(&format!(
-        "kernel session restarted in the same window ({}x{}, stride {}, generation {})",
-        info.width, info.height, info.stride, info.generation
-    ));
-    Ok(())
+    diag.line("restart: input reopened, reopening the surface");
+    // Новая сессия спавнится первым `open`; её задача может успеть выполниться
+    // на другом ядре/тике, поэтому сбой ioctl повторяем — но только пока это
+    // именно ENODEV (иначе это настоящая ошибка устройства).
+    let mut last = VtFbError::Ended;
+    for attempt in 0..3 {
+        match frame.respawn() {
+            Ok(info) => {
+                diag.line(&format!(
+                    "kernel session restarted in the same window \
+                     ({}x{}, stride {}, generation {})",
+                    info.width, info.height, info.stride, info.generation
+                ));
+                return Ok(());
+            }
+            Err(error) if error.is_ended() && attempt < 2 => {
+                diag.line(&format!("restart: surface not up yet ({error}), retrying"));
+                std::thread::sleep(Duration::from_millis(100));
+                last = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last)
 }
 
 /// Получить текущий холст окна (общий mmap или локальный fallback).
