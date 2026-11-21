@@ -14,8 +14,9 @@ use pagh_files::screenshots;
 use pagh_files::{Command, FilesApp, HostVfs, APP_NAME};
 use pagh_ui::canvas::Canvas;
 use pagh_ui::client::{close_name, error_name, DesktopClient, Incoming, ShmFrame};
-use pagh_ui::damage::{DamageTracker, DEFAULT_TILE};
+use pagh_ui::damage::{Damage, DamageTracker, DEFAULT_TILE};
 use pagh_ui::geom::{Rect, Size};
+use pagh_ui::layer::StaticLayer;
 use pagh_ui::protocol::close_reason;
 use pagh_ui::Color;
 
@@ -134,17 +135,39 @@ fn run_compositor(
     } else {
         None
     };
-    let mut tracker =
-        DamageTracker::new(Rect::new(0, 0, window_size.w, window_size.h), DEFAULT_TILE);
+    // Статическая основа кадра — фон, панель, боковая панель, строка
+    // состояния — рисуется один раз на размер/тему и живёт в `StaticLayer`.
+    // Инкрементальный кадр возвращает её пиксели в повреждённых
+    // прямоугольниках и перерисовывает только динамику (см. `FilesApp`).
+    // Порядок пикселей основы — как у кадра: для shm это XRGB8888/RGB565
+    // (пишется прямо в mmap), иначе восстановление прямоугольника было бы
+    // конвертацией по пикселю.
+    let pixel_order = shm
+        .as_ref()
+        .map(|frame| frame.canvas.pixel_order())
+        .unwrap_or(pagh_ui::canvas::PixelOrder::Rgba8888);
+    let mut base = StaticLayer::with_order(window_size, pixel_order);
+    base.rebuild(|canvas| app.draw_base(canvas));
+    // Отладка/фолбэк: `PAGH_DAMAGE_TRACKER=1` возвращает старый путь — полный
+    // кадр + хеши тайлов по всему канвасу. Им проверяют виджетный damage (если
+    // списки расходятся, приложение что-то не пометило) и страхуются на
+    // нестандартном рендере.
+    let mut tracker = std::env::var_os("PAGH_DAMAGE_TRACKER")
+        .map(|_| DamageTracker::new(Rect::new(0, 0, window_size.w, window_size.h), DEFAULT_TILE));
+    // Первый кадр, resize и expose — полные (docs/desktop-render-spec.md §4 C2).
+    let mut force_full = true;
     let mut dirty = true;
 
     // Переключиться на полный кадр: отпустить shm-поколение (если было) и
     // выделить обычный RGBA-холст.
+    #[allow(clippy::too_many_arguments)]
     fn use_fallback(
         client: &mut DesktopClient,
         shm: &mut Option<ShmFrame>,
         fallback: &mut Option<Canvas>,
-        tracker: &mut DamageTracker,
+        tracker: &mut Option<DamageTracker>,
+        base: &mut StaticLayer,
+        force_full: &mut bool,
         size: Size,
         background: Color,
     ) {
@@ -152,7 +175,11 @@ fn run_compositor(
             let _ = client.release_shm(&frame);
         }
         *fallback = Some(Canvas::filled(size.w, size.h, background));
-        tracker.resize(Rect::new(0, 0, size.w, size.h));
+        base.invalidate();
+        if let Some(tracker) = tracker.as_mut() {
+            tracker.resize(Rect::new(0, 0, size.w, size.h));
+        }
+        *force_full = true;
     }
 
     loop {
@@ -201,13 +228,20 @@ fn run_compositor(
                         None => false,
                     };
                     if resized {
-                        tracker.resize(Rect::new(0, 0, size.w, size.h));
+                        // Новая поверхность — новая основа и полный кадр.
+                        base = StaticLayer::with_order(size, pixel_order);
+                        if let Some(tracker) = tracker.as_mut() {
+                            tracker.resize(Rect::new(0, 0, size.w, size.h));
+                        }
+                        force_full = true;
                     } else {
                         use_fallback(
                             &mut client,
                             &mut shm,
                             &mut fallback,
                             &mut tracker,
+                            &mut base,
+                            &mut force_full,
                             size,
                             app.theme.palette.window,
                         );
@@ -230,6 +264,8 @@ fn run_compositor(
                             &mut shm,
                             &mut fallback,
                             &mut tracker,
+                            &mut base,
+                            &mut force_full,
                             window_size,
                             app.theme.palette.window,
                         );
@@ -262,36 +298,82 @@ fn run_compositor(
             continue;
         }
         dirty = false;
-        let needs_full_frame;
+        let mut needs_full_frame = force_full;
         if let Some(frame) = shm.as_mut() {
-            app.draw(&mut frame.canvas);
-            let damage = tracker.update(&frame.canvas);
-            match client.commit_shm(frame, damage) {
-                Ok(()) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                    // Поколение устарело (сервер прислал release, но мы его
-                    // ещё не прочитали): переходим на полный кадр.
-                    use_fallback(
-                        &mut client,
-                        &mut shm,
-                        &mut fallback,
-                        &mut tracker,
-                        window_size,
-                        app.theme.palette.window,
-                    );
+            if !needs_full_frame {
+                // Виджетный damage: приложение уже знает, что изменилось
+                // (строка списка, кнопка панели, поле), — хешировать кадр не
+                // нужно. Рисуем только эти прямоугольники.
+                let damage = app.take_damage();
+                if damage.is_full() {
                     needs_full_frame = true;
+                } else {
+                    app.draw_incremental(&mut frame.canvas, &base, damage.rects());
+                    match client.commit_shm(frame, &damage) {
+                        Ok(()) => {
+                            force_full = false;
+                            continue;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                            // Поколение устарело (сервер прислал release, но мы
+                            // его ещё не прочитали): переходим на полный кадр.
+                            needs_full_frame = true;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
-                Err(error) => return Err(error.into()),
             }
         } else {
             needs_full_frame = true;
         }
         if needs_full_frame {
+            let mut stale_generation = false;
+            if let Some(frame) = shm.as_mut() {
+                if !base.is_valid() {
+                    base.rebuild(|canvas| app.draw_base(canvas));
+                }
+                app.draw(&mut frame.canvas);
+                // Полный кадр уже включает всё накопленное — не копим его в
+                // следующий инкрементальный.
+                app.take_damage();
+                let damage = match tracker.as_mut() {
+                    Some(tracker) => tracker.update(&frame.canvas).clone(),
+                    None => Damage::full(frame.canvas.rect()),
+                };
+                match client.commit_shm(frame, &damage) {
+                    Ok(()) => {
+                        force_full = false;
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        stale_generation = true;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if stale_generation {
+                use_fallback(
+                    &mut client,
+                    &mut shm,
+                    &mut fallback,
+                    &mut tracker,
+                    &mut base,
+                    &mut force_full,
+                    window_size,
+                    app.theme.palette.window,
+                );
+            }
+            // Legacy-путь: сервер без ShmSurface (нет welcome-бита 2) получает
+            // полный RGBA-кадр, как до этого изменения.
             let canvas = fallback.get_or_insert_with(|| {
                 Canvas::filled(window_size.w, window_size.h, app.theme.palette.window)
             });
             app.draw(canvas);
             client.commit(window, canvas)?;
+            app.take_damage();
+            // `force_full` остаётся включённым: legacy-путь всё равно рисует
+            // полный кадр, но если композитор снова предложит shm-поверхность,
+            // первый кадр на ней обязан быть полным.
         }
     }
 }

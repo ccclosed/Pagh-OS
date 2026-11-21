@@ -13,18 +13,23 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use pagh_terminal::cell::{CELL_WIDE, CELL_WIDE_CONT};
 use pagh_terminal::client::{close_name, error_name, Event, SurfaceClient};
 use pagh_terminal::demo::{self, DemoShell};
+use pagh_terminal::font::{CELL_H, CELL_W};
 use pagh_terminal::keys::{self, KeyModes};
 use pagh_terminal::protocol::{buttons, InputEvent};
 use pagh_terminal::render::{
-    render_screen, render_screen_into_cleared, render_window, Canvas, RenderOptions, Theme,
-    VIEWPORT_PADDING,
+    render_screen, render_screen_into, render_screen_into_cleared, render_window, Canvas,
+    RenderOptions, Theme, VIEWPORT_PADDING,
 };
-use pagh_terminal::screen::SelectionMode;
+use pagh_terminal::screen::{CursorStyle, SelectionMode};
 use pagh_terminal::session::{self, ShellSession};
 use pagh_terminal::vtconsole::VtConsoleReader;
 use pagh_terminal::Terminal;
+use pagh_terminal::{Attrs, Cell, Screen};
+use pagh_ui::damage::Damage;
+use pagh_ui::geom::Rect;
 
 const VERSION: &str = "0.1.0";
 
@@ -214,6 +219,290 @@ fn run_headless(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+// ───────────────────── виджетный damage терминала ─────────────────────
+//
+// Терминал не хеширует кадр: он знает, какие клетки изменились, потому что
+// сравнивает сетку с прошлым кадром. Damage — это отрезки клеток, и
+// перерисовываются только они. Полный кадр остаётся для первого кадра,
+// resize/expose, прокрутки (меняются все строки), выделения (оверлей не виден
+// в клетках) и крупных правок.
+
+/// Горизонтальный отрезок клеток одной строки — минимальная перерисовка.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CellRun {
+    y: usize,
+    x0: usize,
+    x1: usize,
+}
+
+/// Клетка строки представления; строки короче сетки дополняются пустыми.
+fn line_cell(line: &[Cell], x: usize) -> Cell {
+    line.get(x).copied().unwrap_or_default()
+}
+
+impl CellRun {
+    /// Отрезок вокруг изменённых клеток `start..end` с запасом на сглаживание.
+    ///
+    /// Широкий глиф занимает две клетки (16 px) и рисуется из ведущей, а
+    /// курсивный вынос доходит на 1–2 px вправо, поэтому отрезок расширяется
+    /// на две клетки в обе стороны, а широкая пара всегда попадает целиком.
+    /// Лишние клетки перерисовываются тем же содержимым, что и в полном кадре,
+    /// поэтому кадр остаётся пиксель-в-пиксель.
+    fn around(line: &[Cell], y: usize, start: usize, end: usize, cols: usize) -> CellRun {
+        let mut x0 = start.min(cols.saturating_sub(1));
+        let mut x1 = end.max(start + 1).min(cols);
+        while x0 > 0 && line_cell(line, x0).flags & CELL_WIDE_CONT != 0 {
+            x0 -= 1;
+        }
+        while x1 < cols && line_cell(line, x1 - 1).flags & CELL_WIDE != 0 {
+            x1 += 1;
+        }
+        CellRun {
+            y,
+            x0: x0.saturating_sub(2),
+            x1: (x1 + 2).min(cols),
+        }
+    }
+
+    /// Прямоугольник этого отрезка в координатах клиентской поверхности.
+    fn rect(self) -> Rect {
+        Rect::new(
+            VIEWPORT_PADDING as i32 + self.x0 as i32 * CELL_W as i32,
+            VIEWPORT_PADDING as i32 + self.y as i32 * CELL_H as i32,
+            (self.x1 - self.x0) as i32 * CELL_W as i32,
+            CELL_H as i32,
+        )
+    }
+}
+
+/// Что перерисовать в следующем кадре.
+#[derive(Debug)]
+enum FrameDamage {
+    /// Первый кадр, resize/expose, прокрутка, выделение, крупная правка.
+    Full,
+    Runs(Vec<CellRun>),
+}
+
+/// Когда изменилась четверть клеток, дешевле нарисовать весь кадр.
+const FULL_REDRAW_SHARE: usize = 4;
+
+/// Снимок отрисованного кадра: сетка и всё, что влияет на её вид.
+struct FrameSnapshot {
+    cols: usize,
+    rows: usize,
+    cells: Vec<Cell>,
+    cursor: (usize, usize),
+    cursor_visible: bool,
+    cursor_style: CursorStyle,
+    cursor_blink: bool,
+    view_offset: usize,
+    scrollback: usize,
+    selected: bool,
+    focused: bool,
+    blink_on: bool,
+    show_scrollbar: bool,
+}
+
+impl FrameSnapshot {
+    fn capture(screen: &Screen, opts: &RenderOptions) -> FrameSnapshot {
+        let cols = screen.cols();
+        let rows = screen.rows();
+        let mut cells = Vec::with_capacity(cols * rows);
+        for y in 0..rows {
+            let line = screen.view_line(y);
+            for x in 0..cols {
+                cells.push(line_cell(line, x));
+            }
+        }
+        FrameSnapshot {
+            cols,
+            rows,
+            cells,
+            cursor: (screen.cursor.x, screen.cursor.y),
+            cursor_visible: screen.cursor.visible,
+            cursor_style: screen.cursor.style,
+            cursor_blink: screen.cursor_blink,
+            view_offset: screen.view_offset(),
+            scrollback: screen.scrollback_len(),
+            selected: screen.selection().is_some(),
+            focused: opts.focused,
+            blink_on: opts.blink_on,
+            show_scrollbar: opts.show_scrollbar,
+        }
+    }
+
+    /// Сравнить с текущим экраном и вернуть повреждённые отрезки клеток.
+    fn damage(&self, screen: &Screen, opts: &RenderOptions) -> FrameDamage {
+        let cols = screen.cols();
+        let rows = screen.rows();
+        // Пока выделение есть, его оверлей живёт вне клеток: двигается он или
+        // исчезает — перерисовываем кадр целиком (как и раньше).
+        if self.cols != cols
+            || self.rows != rows
+            || self.view_offset != screen.view_offset()
+            || self.scrollback != screen.scrollback_len()
+            || self.selected
+            || screen.selection().is_some()
+            || self.show_scrollbar != opts.show_scrollbar
+        {
+            return FrameDamage::Full;
+        }
+        let mut runs: Vec<CellRun> = Vec::new();
+        let mut changed = 0usize;
+        for y in 0..rows {
+            let line = screen.view_line(y);
+            let mut x = 0;
+            while x < cols {
+                if line_cell(line, x) == self.cells[y * cols + x] {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                x += 1;
+                while x < cols && line_cell(line, x) != self.cells[y * cols + x] {
+                    x += 1;
+                }
+                changed += x - start;
+                runs.push(CellRun::around(line, y, start, x, cols));
+            }
+        }
+        // Курсор не входит в клетки: переезд, мигание и потеря фокуса
+        // повреждают только его клетку.
+        if self.cursor != (screen.cursor.x, screen.cursor.y)
+            || self.cursor_visible != screen.cursor.visible
+            || self.cursor_style != screen.cursor.style
+            || self.cursor_blink != screen.cursor_blink
+            || self.focused != opts.focused
+            || self.blink_on != opts.blink_on
+        {
+            for (x, y) in [self.cursor, (screen.cursor.x, screen.cursor.y)] {
+                if x < cols && y < rows {
+                    let line = screen.view_line(y);
+                    runs.push(CellRun::around(line, y, x, x + 1, cols));
+                }
+            }
+        }
+        // Смена фазы мигания гасит и зажигает клетки с атрибутом BLINK.
+        if self.blink_on != opts.blink_on {
+            let mut blinked = 0usize;
+            for y in 0..rows {
+                let line = screen.view_line(y);
+                for x in 0..cols {
+                    if line_cell(line, x).attrs.contains(Attrs::BLINK) {
+                        blinked += 1;
+                        if blinked > 128 {
+                            return FrameDamage::Full;
+                        }
+                        runs.push(CellRun::around(line, y, x, x + 1, cols));
+                    }
+                }
+            }
+        }
+        if changed * FULL_REDRAW_SHARE > cols * rows {
+            return FrameDamage::Full;
+        }
+        FrameDamage::Runs(runs)
+    }
+}
+
+/// Перерисовать отрезки поверх уже готового кадра.
+///
+/// Каждый отрезок рисуется как самостоятельный экран из одной строки: это
+/// тот же рендер, что и в полном кадре, поэтому результат совпадает
+/// пиксель-в-пиксель, а стоит O(клеток отрезка). Здесь нужен полный
+/// [`render_screen_into`], а не `_cleared` из #164: область отрезка держит
+/// пиксели прошлого кадра, а не заливку `theme.bg`, поэтому фон каждой клетки
+/// обязан быть перерисован.
+fn render_runs(
+    canvas: &mut Canvas,
+    screen: &Screen,
+    theme: &Theme,
+    opts: &RenderOptions,
+    runs: &[CellRun],
+) {
+    let mut sub_opts = opts.clone();
+    // Скроллбар живёт в правом поле и в damage клеток не входит.
+    sub_opts.show_scrollbar = false;
+    for run in runs {
+        let width = run.x1.saturating_sub(run.x0);
+        if width == 0 {
+            continue;
+        }
+        let line = screen.view_line(run.y);
+        let cells: Vec<Cell> = (run.x0..run.x1).map(|x| line_cell(line, x)).collect();
+        let cursor_here =
+            screen.cursor.y == run.y && screen.cursor.x >= run.x0 && screen.cursor.x < run.x1;
+        let cursor = if cursor_here {
+            (screen.cursor.x - run.x0, 0)
+        } else {
+            (0, 0)
+        };
+        let mut sub = Screen::from_cells(
+            width,
+            1,
+            cells,
+            cursor,
+            cursor_here && screen.cursor.visible,
+            screen.cursor.style,
+        );
+        sub.cursor_blink = screen.cursor_blink;
+        // Реверс экрана (DECSCNM) — состояние экрана, а не клетки: суб-экран
+        // обязан его унаследовать, иначе частичный кадр разойдётся с полным.
+        sub.reverse_video = screen.reverse_video;
+        render_screen_into(
+            canvas,
+            VIEWPORT_PADDING + run.x0 * CELL_W,
+            VIEWPORT_PADDING + run.y * CELL_H,
+            &sub,
+            theme,
+            &sub_opts,
+        );
+    }
+}
+
+/// Проводной damage из перерисованных отрезков.
+fn runs_damage(runs: &[CellRun], width: usize, height: usize) -> Damage {
+    let mut damage = Damage::new(Rect::new(0, 0, width as i32, height as i32));
+    for run in runs {
+        damage.add(run.rect());
+    }
+    damage
+}
+
+/// Нарисовать кадр и вернуть его damage (полный или только изменившиеся клетки).
+fn paint_frame(
+    canvas: &mut Canvas,
+    screen: &Screen,
+    theme: &Theme,
+    opts: &RenderOptions,
+    prev: &mut Option<FrameSnapshot>,
+) -> Damage {
+    let damage = match prev.as_ref().map(|snapshot| snapshot.damage(screen, opts)) {
+        None | Some(FrameDamage::Full) => {
+            // #164 (opt-level/row-store): фон заливается один раз, а
+            // `render_screen_into_cleared` пропускает клетки с bg == theme.bg —
+            // пиксель-в-пиксель то же, что полный `render_screen_into`, без
+            // второй заливки каждой клетки.
+            canvas.fill(theme.bg);
+            render_screen_into_cleared(
+                canvas,
+                VIEWPORT_PADDING,
+                VIEWPORT_PADDING,
+                screen,
+                theme,
+                opts,
+            );
+            Damage::full(Rect::new(0, 0, canvas.width as i32, canvas.height as i32))
+        }
+        Some(FrameDamage::Runs(runs)) => {
+            render_runs(canvas, screen, theme, opts, &runs);
+            runs_damage(&runs, canvas.width, canvas.height)
+        }
+    };
+    *prev = Some(FrameSnapshot::capture(screen, opts));
+    damage
+}
+
 fn run_client(args: &Args, socket: &str) -> Result<(), String> {
     let mut client = SurfaceClient::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
     let welcome = client
@@ -247,10 +536,8 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
     } else {
         None
     };
-    let mut tracker = pagh_ui::damage::DamageTracker::new(
-        pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32),
-        pagh_ui::damage::DEFAULT_TILE,
-    );
+    // Снимок прошлого кадра: damage считается по разнице клеток, без хешей.
+    let mut prev_frame: Option<FrameSnapshot> = None;
     let mut dirty = true;
     let mut dragging = false;
     let mut blink_on = true;
@@ -267,19 +554,18 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
             render_opts.blink_on = blink_on;
             let mut needs_full_frame = false;
             if let Some(frame) = shm.as_mut() {
-                frame.canvas.fill(theme.bg);
-                render_screen_into_cleared(
+                let damage = paint_frame(
                     &mut frame.canvas,
-                    VIEWPORT_PADDING,
-                    VIEWPORT_PADDING,
                     &shell.terminal.screen,
                     &theme,
                     &render_opts,
+                    &mut prev_frame,
                 );
-                let damage = tracker.update(&frame.canvas);
-                match client.commit_shm(frame, damage) {
+                match client.commit_shm(frame, &damage) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        // Поколение устарело: следующий кадр — полный.
+                        prev_frame = None;
                         needs_full_frame = true;
                     }
                     Err(error) => return Err(format!("commit_shm: {error}")),
@@ -303,7 +589,7 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                     &render_opts,
                 );
                 client.commit(canvas).map_err(|e| format!("commit: {e}"))?;
-                tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                prev_frame = None;
             }
             dirty = false;
         }
@@ -336,14 +622,14 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                         Some(frame) => client.resize_shm(frame, width, height).unwrap_or(false),
                         None => false,
                     };
-                    if resized {
-                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
-                    } else {
+                    prev_frame = None;
+                    // Новая поверхность (resize_shm) уже означает полный кадр;
+                    // иначе уходим на обычный холст, как legacy-клиент.
+                    if !resized {
                         if let Some(stale) = shm.take() {
                             let _ = client.release_shm(&stale);
                         }
                         fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
-                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
                     }
                     dirty = true;
                 }
@@ -360,7 +646,7 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                             let _ = client.release_shm(&stale);
                         }
                         fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
-                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                        prev_frame = None;
                         dirty = true;
                     }
                 }
@@ -697,10 +983,9 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
     } else {
         None
     };
-    let mut tracker = pagh_ui::damage::DamageTracker::new(
-        pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32),
-        pagh_ui::damage::DEFAULT_TILE,
-    );
+    // Снимок прошлого кадра: damage — разница клеток, без хешей канваса.
+    let mut prev_frame: Option<FrameSnapshot> = None;
+    let render_opts = RenderOptions::default();
     // Ядро игнорирует SO_RCVTIMEO, поэтому «чтение с таймаутом» здесь означало бы
     // вечную блокировку на простое и никогда не прочитанный вывод shell'а.
     client
@@ -761,14 +1046,14 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                         Some(frame) => client.resize_shm(frame, width, height).unwrap_or(false),
                         None => false,
                     };
-                    if resized {
-                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
-                    } else {
+                    prev_frame = None;
+                    // Новая поверхность (resize_shm) уже означает полный кадр;
+                    // иначе уходим на обычный холст, как legacy-клиент.
+                    if !resized {
                         if let Some(stale) = shm.take() {
                             let _ = client.release_shm(&stale);
                         }
                         fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
-                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
                     }
                     dirty = true;
                 }
@@ -785,7 +1070,7 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                             let _ = client.release_shm(&stale);
                         }
                         fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
-                        tracker.resize(pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32));
+                        prev_frame = None;
                         dirty = true;
                     }
                 }
@@ -845,17 +1130,14 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
         let now = Instant::now();
         if dirty && now.duration_since(last_commit) >= Duration::from_millis(40) {
             if let Some(frame) = shm.as_mut() {
-                frame.canvas.fill(theme.bg);
-                render_screen_into_cleared(
+                let damage = paint_frame(
                     &mut frame.canvas,
-                    VIEWPORT_PADDING,
-                    VIEWPORT_PADDING,
                     &terminal.screen,
                     &theme,
-                    &RenderOptions::default(),
+                    &render_opts,
+                    &mut prev_frame,
                 );
-                let damage = tracker.update(&frame.canvas);
-                match client.commit_shm(frame, damage) {
+                match client.commit_shm(frame, &damage) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                         // Поколение устарело (композитор пересоздал поверхность):
@@ -864,7 +1146,7 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                             let _ = client.release_shm(&stale);
                         }
                         fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
-                        dirty = true;
+                        prev_frame = None;
                     }
                     Err(error) => return Err(format!("commit_shm: {error}")),
                 }
@@ -876,9 +1158,10 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                     VIEWPORT_PADDING,
                     &terminal.screen,
                     &theme,
-                    &RenderOptions::default(),
+                    &render_opts,
                 );
                 commit_blocking(&mut client, canvas)?;
+                prev_frame = None;
             }
             dirty = false;
             last_commit = Instant::now();
@@ -1057,4 +1340,216 @@ Environment: PAGH_DESKTOP_SOCKET overrides the default socket path
 ({}).",
         pagh_terminal::client::DEFAULT_SOCKET
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(cols: usize, rows: usize) -> (usize, usize) {
+        (
+            VIEWPORT_PADDING * 2 + cols * CELL_W,
+            VIEWPORT_PADDING * 2 + rows * CELL_H,
+        )
+    }
+
+    fn screen_canvas(cols: usize, rows: usize, theme: &Theme) -> Canvas {
+        let (width, height) = grid(cols, rows);
+        Canvas::new(width, height, theme.bg)
+    }
+
+    /// Полный кадр в отдельной поверхности (эталон для сравнения).
+    fn full_frame(
+        screen: &Screen,
+        theme: &Theme,
+        opts: &RenderOptions,
+        cols: usize,
+        rows: usize,
+    ) -> Canvas {
+        let mut canvas = screen_canvas(cols, rows, theme);
+        let mut prev = None;
+        let damage = paint_frame(&mut canvas, screen, theme, opts, &mut prev);
+        assert!(damage.is_full(), "первый кадр обязан быть полным");
+        canvas
+    }
+
+    fn terminal_with(cols: usize, rows: usize, text: &[u8]) -> Terminal {
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.feed(text);
+        terminal
+    }
+
+    #[test]
+    fn first_frame_is_full_and_idle_frame_is_empty() {
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let terminal = terminal_with(40, 8, b"hello");
+        let mut canvas = screen_canvas(40, 8, &theme);
+        let mut prev = None;
+        assert!(paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev).is_full());
+        // Ничего не менялось — повреждений нет, кадр не перерисовывается.
+        let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        assert!(
+            damage.is_empty(),
+            "простой кадр не должен ничего повреждать"
+        );
+    }
+
+    #[test]
+    fn typing_damages_one_cell_and_matches_full_frame() {
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let mut terminal = terminal_with(80, 24, b"$ ls");
+        let (width, height) = grid(80, 24);
+        let mut canvas = screen_canvas(80, 24, &theme);
+        let mut prev = None;
+        paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+
+        terminal.feed(b" -l");
+        let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        assert!(!damage.is_full(), "ввод символа не повод для полного кадра");
+        // Клетка + запас на сглаживание: единицы клеток, а не экран.
+        let window = width as i64 * height as i64;
+        assert!(
+            damage.area() * 100 < window,
+            "ввод повредил {} из {window} px",
+            damage.area()
+        );
+        let reference = full_frame(&terminal.screen, &theme, &opts, 80, 24);
+        assert!(
+            canvas == reference,
+            "частичный кадр разошёлся с полным после ввода"
+        );
+    }
+
+    #[test]
+    fn cursor_blink_damages_only_the_cursor_cell() {
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let terminal = terminal_with(80, 24, b"$ echo hello");
+        let (_, _) = grid(80, 24);
+        let mut canvas = screen_canvas(80, 24, &theme);
+        let mut prev = None;
+        paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+
+        // Мигание — это opts.blink_on, а не содержимое клеток.
+        let mut blinked = opts.clone();
+        blinked.blink_on = false;
+        let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &blinked, &mut prev);
+        assert!(
+            !damage.is_full(),
+            "мигание курсора не полноэкранное событие"
+        );
+        assert!(
+            // Курсор + две клетки запаса с каждой стороны = 5 клеток.
+            damage.area() <= 6 * (CELL_W * CELL_H) as i64,
+            "мигание повредило {} px (клетка {} px)",
+            damage.area(),
+            CELL_W * CELL_H
+        );
+        let reference = full_frame(&terminal.screen, &theme, &blinked, 80, 24);
+        assert!(
+            canvas == reference,
+            "частичный кадр разошёлся с полным при мигании"
+        );
+    }
+
+    #[test]
+    fn scrolling_and_selection_ask_for_a_full_frame() {
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        // Прокрутка возможна только при непустой истории.
+        let text: Vec<u8> = (0..24)
+            .flat_map(|i| format!("line {i}\r\n").into_bytes())
+            .collect();
+        let mut terminal = terminal_with(40, 8, &text);
+        assert!(
+            terminal.screen.scrollback_len() > 0,
+            "нет истории для прокрутки"
+        );
+        let mut canvas = screen_canvas(40, 8, &theme);
+        let mut prev = None;
+        paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+
+        terminal.screen.scroll_view(1);
+        let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        assert!(
+            damage.is_full(),
+            "прокрутка меняет все строки — полный кадр"
+        );
+
+        terminal.screen.scroll_view(-1);
+        paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        terminal
+            .screen
+            .begin_selection_view(0, 0, SelectionMode::Char);
+        let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        assert!(damage.is_full(), "выделение — оверлей вне клеток");
+    }
+
+    #[test]
+    fn reverse_video_survives_a_partial_frame() {
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let mut terminal = terminal_with(40, 8, b"one\r\ntwo");
+        terminal.screen.reverse_video = true;
+        let mut canvas = screen_canvas(40, 8, &theme);
+        let mut prev = None;
+        paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        terminal.feed(b" three");
+        let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        assert!(!damage.is_full());
+        let reference = full_frame(&terminal.screen, &theme, &opts, 40, 8);
+        assert!(
+            canvas == reference,
+            "реверс экрана потерялся в частичном кадре"
+        );
+    }
+
+    #[test]
+    fn wide_glyph_run_includes_both_cells() {
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let mut terminal = terminal_with(20, 4, b"ab");
+        let mut canvas = screen_canvas(20, 4, &theme);
+        let mut prev = None;
+        paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        // Широкий символ (CJK) занимает две клетки.
+        terminal.feed("世".as_bytes());
+        let damage = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        assert!(!damage.is_full());
+        let reference = full_frame(&terminal.screen, &theme, &opts, 20, 4);
+        assert!(
+            canvas == reference,
+            "половина широкого глифа потерялась в частичном кадре"
+        );
+    }
+
+    /// Честные счётчики для PR: клетка против окна.
+    #[test]
+    fn event_cost_counters() {
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let mut terminal = terminal_with(80, 24, b"$ ls");
+        let (width, height) = grid(80, 24);
+        let mut canvas = screen_canvas(80, 24, &theme);
+        let mut prev = None;
+        paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+
+        terminal.feed(b"x");
+        let typing = paint_frame(&mut canvas, &terminal.screen, &theme, &opts, &mut prev);
+        let mut blinked = opts.clone();
+        blinked.blink_on = false;
+        let blink = paint_frame(&mut canvas, &terminal.screen, &theme, &blinked, &mut prev);
+        eprintln!(
+            "terminal damage: window {}x{} = {} px; typing {} px; blink {} px",
+            width,
+            height,
+            width * height,
+            typing.area(),
+            blink.area()
+        );
+        assert!(typing.area() * 100 < (width * height) as i64);
+        assert!(blink.area() * 100 < (width * height) as i64);
+    }
 }
