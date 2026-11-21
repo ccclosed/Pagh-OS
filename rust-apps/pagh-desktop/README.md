@@ -189,6 +189,9 @@ Shell/serial продолжают работать; после выхода desk
 
 ## Frame time: замерочный harness (`--bench`)
 
+Дизайн-обоснование волн A–C (write-combined fb0, damage-only present, кэши слоёв,
+`ShmSurface`) — [`docs/desktop-render-spec.md`](../../docs/desktop-render-spec.md).
+
 Оптимизация рендера начинается с цифры, поэтому в бинарь встроен замер:
 `--bench` прогоняет четыре сценария нагрузки **тем же** путём, что и сервер
 (`Compositor::render` → `Backend::present`), и печатает frame time в serial.
