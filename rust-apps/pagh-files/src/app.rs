@@ -13,10 +13,12 @@
 use pagh_ui::canvas::Canvas;
 use pagh_ui::chrome;
 use pagh_ui::color::Color;
+use pagh_ui::damage::Damage;
 use pagh_ui::event::{Event, Key, Modifiers, MouseButton};
 use pagh_ui::font::{self, TextAlign};
 use pagh_ui::geom::{Insets, Point, Rect, Size};
 use pagh_ui::icon::{self, Icon};
+use pagh_ui::layer::StaticLayer;
 use pagh_ui::layout;
 use pagh_ui::menu::{self, Menu, MenuLayout};
 use pagh_ui::theme::Theme;
@@ -119,7 +121,7 @@ enum Focus {
 }
 
 /// Счётчики для строки состояния.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct Status {
     dirs: u64,
     files: u64,
@@ -209,6 +211,9 @@ pub struct FilesApp {
     /// Пояснение к пустой области содержимого вместо «Папка пуста» — сейчас
     /// это только виртуальная «Сеть» без бэкенда.
     notice: Option<String>,
+    /// Накопленный виджетный damage текущего события (см.
+    /// [`FilesApp::take_damage`] и [`FilesApp::draw_incremental`]).
+    damage: Damage,
 }
 
 impl FilesApp {
@@ -250,6 +255,7 @@ impl FilesApp {
             message: None,
             error: None,
             notice: None,
+            damage: Damage::new(Rect::new(0, 0, size.w, size.h)),
         };
         // Устройства — только те точки монтирования, что разрешаются в этой
         // ФС; каталоги пользователя доводим до существующих (см. PlaceKind).
@@ -957,6 +963,39 @@ impl FilesApp {
         }
     }
 
+    /// Прямоугольник элемента без сборки виджета.
+    ///
+    /// `item_rect` строит `Grid` (клонирует подписи значков) — это нормально
+    /// для тестов, но damage считается на каждом событии, поэтому здесь только
+    /// геометрия (`pagh_ui::layout::grid`), без аллокаций строк.
+    fn entry_rect(&self, layout: &AppLayout, count: usize, index: usize) -> Option<Rect> {
+        match self.view {
+            ViewMode::Grid => {
+                let area = self.scrolled_area(layout.grid_area);
+                layout::grid(
+                    area,
+                    self.grid_cols(layout.grid_area),
+                    self.grid_cell(layout.grid_area),
+                    Size::new(8, 8),
+                    count as i32,
+                )
+                .get(index)
+                .copied()
+            }
+            ViewMode::List => {
+                if index >= count {
+                    return None;
+                }
+                Some(Rect::new(
+                    layout.grid_area.x,
+                    layout.grid_area.y + LIST_HEADER + index as i32 * LIST_ROW - self.scroll,
+                    layout.grid_area.w,
+                    LIST_ROW,
+                ))
+            }
+        }
+    }
+
     /// Выделить элемент по индексу.
     pub fn select(&mut self, index: Option<usize>) {
         self.selected = index;
@@ -992,17 +1031,77 @@ impl FilesApp {
 
     // ───────────────────────── отрисовка ─────────────────────────
 
-    /// Нарисовать клиентскую область Files.
+    /// Нарисовать клиентскую область Files целиком.
     ///
     /// Композитор рисует вокруг неё заголовок окна, рамку и панель; клиент не
     /// знает про `v`/`^`/`x` и не рисует их.
+    ///
+    /// Кадр — это ровно два прохода: статическая основа
+    /// ([`FilesApp::draw_base`]) и динамика ([`FilesApp::draw_dynamic`]).
+    /// Деление не косметическое: damage-кадр восстанавливает основу из
+    /// [`StaticLayer`]-кэша и гоняет только динамику, обрезанную повреждёнными
+    /// прямоугольниками, поэтому полный кадр обязан оставаться этой парой
+    /// проходов (golden-тесты держат пиксель-в-пиксель).
     pub fn draw(&self, canvas: &mut Canvas) {
+        self.draw_base(canvas);
+        self.draw_dynamic(canvas);
+    }
+
+    /// Статическая основа кадра: фон, панель, боковая панель, строка состояния.
+    ///
+    /// Только заливки и линии — ничего, что зависит от наведения, выделения,
+    /// текста или прокрутки. `StaticLayer` вызывает это один раз на
+    /// размер/тему; damage-кадры берут пиксели основы из кэша
+    /// ([`StaticLayer::restore`]), а не перерисовывают их.
+    pub fn draw_base(&self, canvas: &mut Canvas) {
+        let palette = &self.theme.palette;
         let layout = self.layout();
-        canvas.fill(self.window_rect(), self.theme.palette.window);
-        self.draw_toolbar(canvas, &layout);
-        self.draw_sidebar(canvas, &layout);
-        self.draw_content(canvas, &layout);
-        self.draw_statusbar(canvas, &layout);
+        canvas.fill(self.window_rect(), palette.window);
+        canvas.fill(layout.toolbar, palette.toolbar);
+        canvas.hline(
+            layout.toolbar.bottom() - 1,
+            layout.toolbar.x,
+            layout.toolbar.right(),
+            palette.separator,
+        );
+        canvas.fill(layout.sidebar, palette.sidebar);
+        canvas.vline(
+            layout.sidebar.right() - 1,
+            layout.sidebar.y,
+            layout.sidebar.bottom(),
+            palette.sidebar_border,
+        );
+        canvas.fill(layout.content, palette.window);
+        canvas.fill(layout.status, palette.status);
+        canvas.hline(
+            layout.status.y,
+            layout.status.x,
+            layout.status.right(),
+            palette.separator,
+        );
+    }
+
+    /// Динамика поверх основы (текст, иконки, подсветки, меню, диалог).
+    ///
+    /// При обычном кадре клип — вся поверхность, и рисуется всё. В
+    /// damage-кадре клип — повреждённый прямоугольник, поэтому секции, с ним
+    /// не пересекающиеся, пропускаются целиком: стоимость прохода
+    /// O(damage), а не O(окно).
+    pub fn draw_dynamic(&self, canvas: &mut Canvas) {
+        let layout = self.layout();
+        let clip = canvas.clip();
+        if clip.intersects(layout.toolbar) {
+            self.draw_toolbar(canvas, &layout);
+        }
+        if clip.intersects(layout.sidebar) {
+            self.draw_sidebar(canvas, &layout);
+        }
+        if clip.intersects(layout.content) {
+            self.draw_content(canvas, &layout);
+        }
+        if clip.intersects(layout.status) {
+            self.draw_statusbar(canvas, &layout);
+        }
         if self.menu.is_some() {
             self.draw_menu(canvas);
         }
@@ -1011,24 +1110,57 @@ impl FilesApp {
         }
     }
 
+    /// Инкрементальный кадр: вернуть основу в повреждённых прямоугольниках и
+    /// перерисовать в них только динамику.
+    ///
+    /// `layer` — кэш [`FilesApp::draw_base`] для текущего размера. Если основа
+    /// невалидна (resize/первый кадр), кадр рисуется целиком; вызывающий по
+    /// [`StaticLayer::is_valid`] обычно решает это раньше и зовёт
+    /// [`FilesApp::draw`] сам.
+    ///
+    /// Возвращает число перерисованных прямоугольников (для счётчиков/тестов).
+    pub fn draw_incremental(
+        &self,
+        canvas: &mut Canvas,
+        layer: &StaticLayer,
+        damage: &[Rect],
+    ) -> usize {
+        if !layer.is_valid() {
+            self.draw(canvas);
+            return 0;
+        }
+        let mut painted = 0usize;
+        for rect in damage {
+            if !layer.restore(canvas, *rect) {
+                self.draw(canvas);
+                return 0;
+            }
+            canvas.with_clip(*rect, |canvas| self.draw_dynamic(canvas));
+            painted += 1;
+        }
+        painted
+    }
+
+    /// Забрать накопленный damage (после вызова список пуст).
+    ///
+    /// Возвращается в координатах клиентской поверхности окна.
+    pub fn take_damage(&mut self) -> Damage {
+        let bounds = self.window_rect();
+        if self.damage.bounds() != bounds {
+            return Damage::full(bounds);
+        }
+        std::mem::replace(&mut self.damage, Damage::new(bounds))
+    }
+
+    /// Текущий (не забранный) damage — для тестов и отладочных счётчиков.
+    pub fn damage(&self) -> &Damage {
+        &self.damage
+    }
+
     fn draw_toolbar(&self, canvas: &mut Canvas, layout: &AppLayout) {
         let palette = &self.theme.palette;
-        canvas.fill(
-            Rect::new(
-                layout.toolbar.x,
-                layout.toolbar.y,
-                layout.toolbar.w,
-                layout.toolbar.h,
-            ),
-            palette.toolbar,
-        );
-        canvas.hline(
-            layout.toolbar.bottom() - 1,
-            layout.toolbar.x,
-            layout.toolbar.right(),
-            palette.separator,
-        );
-
+        // Фон панели и разделитель рисует `draw_base` (статический слой):
+        // здесь только то, что зависит от состояния — кнопки, поле пути, поиск.
         // Назад / вперёд.
         for (button, rect, enabled) in [
             (ToolbarButton::Back, layout.back, self.can_go_back()),
@@ -1186,13 +1318,8 @@ impl FilesApp {
 
     fn draw_sidebar(&self, canvas: &mut Canvas, layout: &AppLayout) {
         let palette = &self.theme.palette;
-        canvas.fill(layout.sidebar, palette.sidebar);
-        canvas.vline(
-            layout.sidebar.right() - 1,
-            layout.sidebar.y,
-            layout.sidebar.bottom(),
-            palette.sidebar_border,
-        );
+        // Фон и правую границу рисует `draw_base`; здесь пункты, их глифы и
+        // готовые иконки — всё, что меняется от наведения и выделения.
         let mut list = self.sidebar.clone();
         list.selected = self.sidebar_selected;
         list.hovered = self.sidebar_hover;
@@ -1202,6 +1329,7 @@ impl FilesApp {
         // списка всё равно несёт `Icon` того же смысла: он резервирует место
         // под глиф и служит запасным вариантом, если PNG не декодировался.
         let icon_size = self.theme.metrics.icon_size;
+        let clip = canvas.clip();
         for (id, rect) in &list_layout.items {
             let Some(place) = self.places.iter().find(|place| place.id == *id) else {
                 continue;
@@ -1212,6 +1340,9 @@ impl FilesApp {
                 icon_size,
                 icon_size,
             );
+            if !clip.intersects(*rect) {
+                continue;
+            }
             let selected = self.sidebar_selected == Some(*id);
             let tint = if selected {
                 palette.sidebar_text_selected
@@ -1239,7 +1370,9 @@ impl FilesApp {
 
     fn draw_content(&self, canvas: &mut Canvas, layout: &AppLayout) {
         let palette = &self.theme.palette;
-        canvas.fill(layout.content, palette.window);
+        // Фон области — в `draw_base`; содержимое (шапка списка, строки, сетка,
+        // скроллбар) рисуется под клипом области, чтобы не заезжать в соседние
+        // секции при частичной перерисовке.
         canvas.with_clip(layout.content, |canvas| {
             let area = layout.grid_area;
             if let Some(error) = &self.error {
@@ -1275,6 +1408,7 @@ impl FilesApp {
                     let grid = self.grid_widget(area);
                     let cells = grid.draw(canvas, &self.theme, self.scrolled_area(area));
                     // Векторные глифы ячеек заменяем готовыми иконками.
+                    let clip = canvas.clip();
                     for (index, cell) in cells.iter().enumerate() {
                         let Some(entry) = self.entries.get(index) else {
                             continue;
@@ -1285,6 +1419,11 @@ impl FilesApp {
                             GRID_ICON_WIDTH,
                             GRID_ICON_HEIGHT,
                         );
+                        // Ячейка вне повреждённой области уже пропущена
+                        // `Grid::draw`; её готовую иконку тоже не рисуем.
+                        if !clip.intersects(*cell) {
+                            continue;
+                        }
                         // `Grid::draw` пропускает ячейки, которые не влезают по
                         // высоте, — вместе с их векторным глифом. Там закрывать
                         // нечего; иначе мы нарисовали бы подсветку, которой
@@ -1384,6 +1523,11 @@ impl FilesApp {
                 LIST_ROW,
             );
             if row.bottom() < area.y + LIST_HEADER || row.y > area.bottom() {
+                continue;
+            }
+            // Строка вне повреждённой области (клип = damage) не рисуется:
+            // так перерисовка одной строки не стоит прохода по всему списку.
+            if !canvas.clip().intersects(row) {
                 continue;
             }
             if self.selected == Some(index) {
@@ -1567,10 +1711,202 @@ impl FilesApp {
         button.draw(canvas, theme, button_rect, ButtonState::default());
     }
 
+    // ───────────────────────── виджетный damage ─────────────────────────
+
+    /// Снимок всего, что читает отрисовка.
+    ///
+    /// Событие меняет состояние через десятки путей (навигация, меню, поиск,
+    /// клавиши), поэтому damage считается не по местам мутаций, а по разнице
+    /// снимков «до» и «после»: забыть обновить damage в отдельной ветке
+    /// невозможно. [`FilesApp::record_damage`] переводит разницу в
+    /// прямоугольники виджетов.
+    fn draw_state(&self) -> DrawState {
+        DrawState {
+            size: self.size,
+            toolbar_hover: self.toolbar_hover,
+            sidebar_hover: self.sidebar_hover,
+            sidebar_selected: self.sidebar_selected,
+            selected: self.selected,
+            hovered: self.hovered,
+            list_hover: self.list_hover,
+            scroll: self.scroll,
+            view: self.view,
+            sort: self.sort,
+            search_visible: self.search_visible,
+            focus: self.focused(),
+            path: self.path.text(),
+            search: self.search.text(),
+            entries: entries_signature(&self.entries),
+            status: self.status,
+            message: self.message.clone(),
+            error: self.error.clone(),
+            notice: self.notice.clone(),
+            location: self.location_label(),
+            history: (self.can_go_back(), self.can_go_forward()),
+            menu: self.menu_state(),
+            dialog: self.dialog.is_some(),
+        }
+    }
+
+    fn menu_state(&self) -> Option<MenuState> {
+        let open = self.menu.as_ref()?;
+        Some(MenuState {
+            origin: open.origin,
+            hovered: open.hovered,
+            submenu_open: open.submenu_open,
+            submenu_hovered: open.submenu_hovered,
+            model: menu_signature(&open.model),
+        })
+    }
+
+    /// Превратить разницу снимков в damage-прямоугольники.
+    ///
+    /// Список намеренно консервативен: лучше перерисовать чуть больше, чем
+    /// оставить устаревший пиксель. Полный кадр спека (§4 C2) разрешает для
+    /// первого кадра, resize/смены темы, expose и открытия/закрытия popup —
+    /// здесь это размер, меню и диалог.
+    fn record_damage(&mut self, before: &DrawState, after: &DrawState) {
+        if before == after {
+            return;
+        }
+        let layout = self.layout();
+        if before.size != after.size {
+            self.damage = Damage::full(Rect::new(0, 0, after.size.w, after.size.h));
+            return;
+        }
+        // Popup: открытие/закрытие (и смена подменю) — полный кадр.
+        if before.menu.is_some() != after.menu.is_some()
+            || before.dialog != after.dialog
+            || matches!(
+                (&before.menu, &after.menu),
+                (Some(b), Some(a)) if b.submenu_open != a.submenu_open
+            )
+        {
+            self.damage.add_full();
+            return;
+        }
+        // Меню открыто: наведение внутри. Сдвиг origin или содержимого — это
+        // фактически новое popup, тоже полный кадр.
+        if let (Some(b), Some(a)) = (&before.menu, &after.menu) {
+            if b != a {
+                if b.origin != a.origin || b.model != a.model {
+                    self.damage.add_full();
+                    return;
+                }
+                if let Some((root, submenu)) = self.menu_layouts() {
+                    self.damage.add(root.rect.expand(MENU_SHADOW));
+                    if let Some(submenu) = submenu {
+                        self.damage.add(submenu.rect.expand(MENU_SHADOW));
+                    }
+                }
+            }
+        }
+        // Содержимое: список/сетка, пустое состояние, прокрутка, навигация,
+        // фильтр поиска.
+        if before.entries != after.entries
+            || before.view != after.view
+            || before.sort != after.sort
+            || before.scroll != after.scroll
+            || before.error != after.error
+            || before.notice != after.notice
+            || before.location != after.location
+            || before.search != after.search
+            || before.search_visible != after.search_visible
+        {
+            self.damage.add(layout.content);
+            self.damage.add(layout.status);
+        }
+        // Навигация меняет и текст пути (когда поле не в фокусе).
+        if before.location != after.location {
+            self.damage.add(layout.path_field);
+        }
+        // Выделение и наведение в содержимом — ровно затронутые строки/ячейки.
+        if before.selected != after.selected
+            || before.hovered != after.hovered
+            || before.list_hover != after.list_hover
+        {
+            let count = self.entries.len();
+            for index in [
+                before.selected,
+                after.selected,
+                before.hovered,
+                after.hovered,
+                before.list_hover,
+                after.list_hover,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(rect) = self.entry_rect(&layout, count, index) {
+                    self.damage.add(rect);
+                }
+            }
+        }
+        // Боковая панель: наведение и выбранный пункт.
+        if before.sidebar_hover != after.sidebar_hover
+            || before.sidebar_selected != after.sidebar_selected
+        {
+            for id in [
+                before.sidebar_hover,
+                after.sidebar_hover,
+                before.sidebar_selected,
+                after.sidebar_selected,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(rect) = sidebar_item_rect(&layout, id) {
+                    self.damage.add(rect);
+                }
+            }
+        }
+        // Панель инструментов: наведение на кнопки и доступность стрелок.
+        if before.toolbar_hover != after.toolbar_hover || before.history != after.history {
+            let mut buttons = [after.toolbar_hover, before.toolbar_hover];
+            if before.history != after.history {
+                buttons[0] = Some(ToolbarButton::Back);
+                buttons[1] = Some(ToolbarButton::Forward);
+            }
+            for button in buttons.into_iter().flatten() {
+                self.damage.add(toolbar_button_rect(&layout, button));
+            }
+        }
+        // Поле поиска появляется/исчезает — поле пути меняет ширину, поэтому
+        // перерисовываем всю панель (32 px высоты, дешевле, чем считать заново
+        // раскладку полей).
+        if before.search_visible != after.search_visible {
+            self.damage.add(layout.toolbar);
+        } else {
+            if before.path != after.path || before.focus != after.focus {
+                self.damage.add(layout.path_field);
+            }
+            if before.search != after.search || before.focus != after.focus {
+                if let Some(rect) = layout.search_field {
+                    self.damage.add(rect);
+                }
+            }
+        }
+        // Строка состояния: счётчики, сообщение, путь.
+        if before.status != after.status || before.message != after.message {
+            self.damage.add(layout.status);
+        }
+    }
+
     // ───────────────────────── события ─────────────────────────
 
     /// Обработать одно событие; вернуть команды наружу.
+    ///
+    /// До и после разбора снимается [`DrawState`]: разница — виджетный damage
+    /// текущего события ([`FilesApp::take_damage`]).
     pub fn handle_event(&mut self, event: &Event) -> Vec<Command> {
+        let before = self.draw_state();
+        let commands = self.dispatch_event(event);
+        let after = self.draw_state();
+        self.record_damage(&before, &after);
+        commands
+    }
+
+    fn dispatch_event(&mut self, event: &Event) -> Vec<Command> {
         match event {
             Event::MouseMove { pos } => {
                 self.on_mouse_move(*pos);
@@ -2209,6 +2545,133 @@ fn legacy_icon(glyph: FluentIcon) -> Icon {
 /// глиф, поэтому площадку под ним надо закрыть этим фоном: иначе
 /// полупрозрачные края растра лягут поверх векторного контура и получится
 /// двойная обводка. В подробном списке векторного глифа нет — там `None`.
+/// Снимок отрисованного состояния (см. [`FilesApp::draw_state`]).
+///
+/// Поля — ровно то, что читает отрисовка кадра; всё остальное (VFS, буфер
+/// обмена, история строк) на пиксели не влияет.
+#[derive(Clone, PartialEq, Eq)]
+struct DrawState {
+    size: Size,
+    toolbar_hover: Option<ToolbarButton>,
+    sidebar_hover: Option<u32>,
+    sidebar_selected: Option<u32>,
+    selected: Option<usize>,
+    hovered: Option<usize>,
+    list_hover: Option<usize>,
+    scroll: i32,
+    view: ViewMode,
+    sort: SortMode,
+    search_visible: bool,
+    focus: Focus,
+    path: String,
+    search: String,
+    entries: u64,
+    status: Status,
+    message: Option<String>,
+    error: Option<String>,
+    notice: Option<String>,
+    location: String,
+    history: (bool, bool),
+    menu: Option<MenuState>,
+    dialog: bool,
+}
+
+/// Открытое меню в снимке: положение, наведение и подпись содержимого.
+#[derive(Clone, PartialEq, Eq)]
+struct MenuState {
+    origin: Point,
+    hovered: Option<usize>,
+    submenu_open: Option<usize>,
+    submenu_hovered: Option<usize>,
+    model: u64,
+}
+
+/// Запас вокруг меню: `menu::draw` кладёт мягкую тень радиусом 18 px.
+const MENU_SHADOW: i32 = 20;
+
+/// Прямоугольник пункта боковой панели по id.
+fn sidebar_item_rect(layout: &AppLayout, id: u32) -> Option<Rect> {
+    layout
+        .sidebar_list
+        .items
+        .iter()
+        .find(|(item_id, _)| *item_id == id)
+        .map(|(_, rect)| *rect)
+}
+
+/// Прямоугольник кнопки панели инструментов.
+fn toolbar_button_rect(layout: &AppLayout, button: ToolbarButton) -> Rect {
+    match button {
+        ToolbarButton::Back => layout.back,
+        ToolbarButton::Forward => layout.forward,
+        ToolbarButton::Search => layout.search_button,
+        ToolbarButton::Kebab => layout.kebab,
+    }
+}
+
+/// FNV-1a: дешёвая подпись содержимого вместо сравнения копий.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn byte(&mut self, byte: u8) {
+        self.0 = (self.0 ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.byte(*byte);
+        }
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// Подпись отрисованного содержимого каталога.
+///
+/// Хешируются только поля, которые попадают в пиксели (`draw_list`,
+/// `draw_content`): имя, вид, размер, дата. Сравнение подписей — O(имена), а
+/// не O(2,7 МиБ пикселей), как у [`pagh_ui::damage::DamageTracker`].
+fn entries_signature(entries: &[DirEntry]) -> u64 {
+    let mut hash = Fnv::new();
+    for entry in entries {
+        hash.bytes(entry.name.as_bytes());
+        hash.byte(entry.is_dir() as u8);
+        hash.bytes(entry.kind.label().as_bytes());
+        hash.u64(entry.size);
+        hash.u64(entry.modified);
+    }
+    hash.finish()
+}
+
+/// Подпись содержимого меню (подписи, доступность, подменю).
+fn menu_signature(menu: &Menu) -> u64 {
+    let mut hash = Fnv::new();
+    for entry in &menu.entries {
+        match entry.label() {
+            Some(label) => {
+                hash.byte(1);
+                hash.bytes(label.as_bytes());
+            }
+            None => hash.byte(2),
+        }
+        hash.byte(entry.is_enabled() as u8);
+        if let Some(submenu) = entry.submenu_of() {
+            hash.u64(menu_signature(submenu));
+        }
+    }
+    hash.finish()
+}
+
 fn draw_entry_icon(
     canvas: &mut Canvas,
     entry: &DirEntry,
@@ -2298,8 +2761,11 @@ fn clamp_menu_origin(theme: &Theme, menu: &Menu, origin: Point, bounds: Rect) ->
 /// ФС-бэкенда в Files нет, поэтому она открывается пустой с честным
 /// «Нет сетевых ресурсов» (см. [`FilesApp::reload`]), без фальшивого листинга.
 ///
-/// Устройства — реальные точки монтирования Pagh: `/` — корень VFS, `/mnt` —
-/// смонтированный ext2 (см. `boot.rs`); пункт, которого нет в VFS, отсеивает
+/// Устройства — реальные точки монтирования Pagh, подписанные по-человечески
+/// и всегда вместе с путём, чтобы их нельзя было спутать ни с разделами
+/// Windows («Basic data partition»), ни с демо-путями: `/` — «Системный диск
+/// (/)» (корень VFS), `/mnt` — «Диск данных (/mnt)» (смонтированный ext2, см.
+/// `boot.rs`). Пункт, которого нет в VFS, отсеивает
 /// [`FilesApp::prune_missing_devices`]. Ни `/boot`, ни `/mnt/basic` в дереве
 /// ядра не существуют, поэтому их здесь нет.
 fn default_places(home: &str) -> Vec<Place> {
@@ -2369,14 +2835,14 @@ fn default_places(home: &str) -> Vec<Place> {
         },
         Place {
             id: 10,
-            label: "root".to_string(),
+            label: "Системный диск (/)".to_string(),
             glyph: FluentIcon::Drive,
             path: "/".to_string(),
             kind: PlaceKind::Device,
         },
         Place {
             id: 11,
-            label: "Basic data partition".to_string(),
+            label: "Диск данных (/mnt)".to_string(),
             glyph: FluentIcon::Drive,
             path: "/mnt".to_string(),
             kind: PlaceKind::Device,
@@ -2443,6 +2909,13 @@ mod tests {
             button: MouseButton::Left,
         });
         place.path
+    }
+
+    fn entry_index(app: &FilesApp, name: &str) -> usize {
+        app.entries()
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("нет записи {name:?}"))
     }
 
     fn temp_home(tag: &str) -> std::path::PathBuf {
@@ -2727,14 +3200,140 @@ mod tests {
         );
     }
 
-    /// Смонтированный `/mnt` показывается и открывается.
+    /// Смонтированный `/mnt` показывается подписанным по-человечески и
+    /// открывает настоящий листинг этой точки монтирования — не пустую
+    /// заглушку и не прежний каталог.
     #[test]
     fn mounted_device_opens() {
-        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
-        assert!(app.places().iter().any(|place| place.path == "/mnt"));
-        let path = click_place(&mut app, "Basic data partition");
+        let mut vfs = FakeVfs::new();
+        vfs.file_with_contents("/mnt/маркер.txt", b"disk")
+            .expect("файл на диске данных");
+        let mut app = FilesApp::new(Box::new(vfs), SIZE);
+
+        let place = app
+            .places()
+            .iter()
+            .find(|place| place.path == "/mnt")
+            .expect("устройство /mnt");
+        assert_eq!(place.kind, PlaceKind::Device);
+        assert_eq!(place.label, "Диск данных (/mnt)");
+
+        let path = click_place(&mut app, "Диск данных (/mnt)");
         assert_eq!(path, "/mnt");
         assert_eq!(app.cwd(), "/mnt");
         assert!(app.error().is_none(), "{:?}", app.error());
+        let names: Vec<&str> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(names.contains(&"маркер.txt"), "листинг /mnt: {names:?}");
+        assert!(names.contains(&"basic"), "листинг /mnt: {names:?}");
+    }
+
+    /// Двойной клик по каталогу в сетке — настоящая навигация: меняется cwd,
+    /// перечитывается содержимое, история позволяет вернуться.
+    #[test]
+    fn double_click_directory_in_grid_changes_cwd() {
+        let mut vfs = FakeVfs::new();
+        vfs.file_with_contents("/home/user/Documents/план.txt", b"ok")
+            .expect("файл в Documents");
+        let mut app = FilesApp::new(Box::new(vfs), SIZE);
+        assert_eq!(app.cwd(), "/home/user");
+
+        let index = entry_index(&app, "Documents");
+        let rect = app.item_rect(index).expect("ячейка Documents");
+        app.handle_event(&Event::DoubleClick { pos: rect.center() });
+
+        assert_eq!(app.cwd(), "/home/user/Documents");
+        assert_eq!(app.title(), "Документы — Files");
+        assert!(app.can_go_back());
+        let names: Vec<&str> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["план.txt"]);
+    }
+
+    /// Enter по выделенному каталогу навигирует: выделение ставится обычным
+    /// кликом, открытие идёт тем же `open_entries`, что и двойной клик.
+    #[test]
+    fn enter_on_selected_directory_navigates() {
+        let mut vfs = FakeVfs::new();
+        vfs.file_with_contents("/home/user/Documents/план.txt", b"ok")
+            .expect("файл в Documents");
+        let mut app = FilesApp::new(Box::new(vfs), SIZE);
+
+        let index = entry_index(&app, "Documents");
+        let rect = app.item_rect(index).expect("ячейка Documents");
+        app.handle_event(&Event::MouseDown {
+            pos: rect.center(),
+            button: MouseButton::Left,
+        });
+        assert_eq!(
+            app.selected().map(|entry| entry.name.as_str()),
+            Some("Documents")
+        );
+
+        app.handle_event(&Event::Key {
+            key: Key::Enter,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        });
+        assert_eq!(app.cwd(), "/home/user/Documents");
+        let names: Vec<&str> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["план.txt"]);
+    }
+
+    /// Корень VFS («Системный диск (/)») тоже открывает реальный листинг:
+    /// маркер, созданный в корне, виден, а записи домашнего каталога — нет.
+    #[test]
+    fn system_disk_opens_root_listing() {
+        let mut vfs = FakeVfs::new();
+        vfs.mkdir_all("/srv").expect("каталог в корне");
+        let mut app = FilesApp::new(Box::new(vfs), SIZE);
+
+        let path = click_place(&mut app, "Системный диск (/)");
+        assert_eq!(path, "/");
+        assert_eq!(app.cwd(), "/");
+        assert!(app.error().is_none(), "{:?}", app.error());
+        let names: Vec<&str> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(names.contains(&"srv"), "листинг /: {names:?}");
+        assert!(names.contains(&"mnt"), "листинг /: {names:?}");
+        assert!(!names.contains(&"Documents"), "листинг /: {names:?}");
+    }
+
+    /// Подпись устройства несёт путь монтирования, поэтому пункт нельзя
+    /// спутать ни с разделом Windows, ни с демо-каталогом.
+    #[test]
+    fn device_labels_carry_mount_paths() {
+        let app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        let devices: Vec<(&str, &str)> = app
+            .places()
+            .iter()
+            .filter(|place| place.kind == PlaceKind::Device)
+            .map(|place| (place.label.as_str(), place.path.as_str()))
+            .collect();
+        assert_eq!(
+            devices,
+            [("Системный диск (/)", "/"), ("Диск данных (/mnt)", "/mnt"),]
+        );
+        for (label, path) in devices {
+            assert!(
+                label.contains(&format!("({path})")),
+                "подпись {label:?} не содержит путь {path:?}"
+            );
+            assert_ne!(label, "root");
+            assert_ne!(label, "Basic data partition");
+        }
     }
 }

@@ -348,38 +348,75 @@ fn run_autorun() {
 }
 
 pub fn shell_main() -> ! {
+    shell_main_session(crate::drivers::session_route::BOOT_SESSION)
+}
+
+/// Главный цикл shell указанной консольной сессии.
+///
+/// `session == 0` — boot/shell-консоль на Limine-scanout: поведение ровно прежнее
+/// (serial-баннер, `tty::init_shell`, autorun). `session >= 1` — терминальное окно
+/// desktop'а: та же самая машина REPL (decoder/history/editor/caret/selection/
+/// Tab/scrollback), но экземпляр консоли, кольцо ввода и `cwd` — этой сессии
+/// ([`crate::drivers::session`], [`crate::drivers::framebuffer::writer_for`],
+/// [`path`]). Команды не меняются: они по-прежнему зовут `fb_print!`/`kprint!`,
+/// а маршрут по задаче решает, чей это экран.
+///
+/// Чего у окна СОЗНАТЕЛЬНО нет (честные границы, см. `docs/terminal-session.md`):
+/// serial-эха баннера (окно — не лог), `tty::init_shell` (управляющий терминал
+/// один, и владеет им boot-shell; per-window job control — следующий этап) и
+/// autorun (файл — boot-сценарий, второй прогон запустил бы те же команды).
+pub(crate) fn shell_main_session(session: usize) -> ! {
+    let boot = session == crate::drivers::session_route::BOOT_SESSION;
     // Консоль — управляющий терминал, и shell — его владелец по умолчанию:
     // записать собственную группу процессов сейчас, чтобы `lxrun` мог передать
     // терминал ребёнку и вернуть обратно (контроль доступа терминала сравнивает
     // pgid процесса с этим).
-    crate::drivers::tty::init_shell(crate::task::scheduler::current_pid());
+    //
+    // Только boot-сессия: `tty` — один управляющий терминал на ядро, и окно не
+    // должно переписывать его foreground-группу (per-window tty/job control —
+    // отдельный этап; до него окно делит терминал с boot-shell, что названо в
+    // документации).
+    if boot {
+        crate::drivers::tty::init_shell(crate::task::scheduler::current_pid());
+    }
 
     // Приветственный баннер — имя ОС + подсказка `help`, в обеих консолях, до
     // первого промпта и без заметной задержки (R10.1, R10.2, R10.3).
-    crate::kprintln!();
-    crate::kprintln!("========================================");
-    crate::kprintln!("   Welcome to pagh OS Shell!");
-    crate::kprintln!("========================================");
-    crate::kprintln!("Type 'help' for available commands");
-    crate::kprintln!("input: {}", crate::drivers::input_summary());
-    if !crate::drivers::any_keyboard() {
-        crate::kprintln!("warning: no keyboard detected (USB device count above, PS/2 absent)");
+    if boot {
+        crate::kprintln!();
+        crate::kprintln!("========================================");
+        crate::kprintln!("   Welcome to pagh OS Shell!");
+        crate::kprintln!("========================================");
+        crate::kprintln!("Type 'help' for available commands");
+        crate::kprintln!("input: {}", crate::drivers::input_summary());
+        if !crate::drivers::any_keyboard() {
+            crate::kprintln!("warning: no keyboard detected (USB device count above, PS/2 absent)");
+        }
+        crate::kprintln!();
     }
-    crate::kprintln!();
 
+    // Баннер окна — только в его собственную поверхность: serial — общий лог
+    // ядра, и второй экземпляр строки приветствия в нём был бы шумом, который
+    // контракт прямо запрещает.
     crate::fb_println!();
     crate::fb_println!("========================================");
     crate::fb_println!("   Welcome to pagh OS Shell!");
     crate::fb_println!("========================================");
     crate::fb_println!("Type 'help' for available commands");
-    crate::fb_println!("input: {}", crate::drivers::input_summary());
+    if boot {
+        crate::fb_println!("input: {}", crate::drivers::input_summary());
+    } else {
+        crate::fb_println!("terminal session {} (kernel shell)", session);
+    }
     crate::fb_println!();
 
     // Опциональный одноразовый autorun: если `/mnt/etc/autorun` существует, его
     // первая строка исполняется как набранная команда (бедняцкий rc.local —
     // удобно для воспроизводимых тестовых команд вроде `lxrun ... git clone ...`).
     // Удалите файл, чтобы отключить.
-    run_autorun();
+    if boot {
+        run_autorun();
+    }
 
     // Состояние на весь сеанс: decoder хранит состояние Shift/0xE0 между
     // промптами; history накапливает вызванные строки.
@@ -419,6 +456,10 @@ pub fn shell_main() -> ! {
     let mut status_cache: Option<(alloc::string::String, alloc::string::String)> = None;
 
     loop {
+        // Окно, чей последний fd закрыт (или команда `exit`), выходит здесь —
+        // на границе цикла, когда задача не держит чужих ресурсов.
+        crate::drivers::session::check_reap(session);
+
         // Смена темы инвалидирует всё нарисованное: *модель* хранит цвет на
         // клетку (`grid_fg`), и это цвет, актуальный в момент записи клетки.
         // Перерисовать пиксели недостаточно — клетки надо напечатать заново через
@@ -456,7 +497,15 @@ pub fn shell_main() -> ! {
             // процесс уже завершился, вернуть прямой PS/2-путь: иначе физические
             // клавиши остались бы «съеденными» закрытым окном. Проверка дешёвая
             // (атомик) и троттлится внутри; пока владелец жив — no-op.
-            crate::drivers::vtinput::reap_dead_client();
+            //
+            // Только boot-сессия: защёлка владельца — про физическую клавиатуру,
+            // а окно ею не владеет (его ввод идёт через `/dev/vtinput1`).
+            if boot {
+                crate::drivers::vtinput::reap_dead_client();
+            }
+            // Окно просыпается на каждом тике и здесь же замечает закрытие:
+            // иначе оно осталось бы жить после исчезновения клиента.
+            crate::drivers::session::check_reap(session);
 
             // Тик таймера будит shell каждую миллисекунду, но работа есть,
             // только если изменилось что-то, что может менять экран: пришёл
@@ -870,9 +919,14 @@ fn caret_cell(editor: &editor::LineEditor) -> Option<caret::Cell> {
     caret::Caret::cell_for(console_cell, editor, cols)
 }
 
-/// Попробовать прочитать сканкод с клавиатуры.
+/// Попробовать прочитать сканкод клавиатуры **текущей консольной сессии**.
+///
+/// Один helper на boot-shell, `nano`, `paint` и `read_secret` (ввод пароля):
+/// `ps2_kbd::take_scancode` маршрутизирует по задаче — физическое PS/2-кольцо для
+/// boot-сессии, кольцо `/dev/vtinput1` для окна. Поэтому редакторы не знают о
+/// двух источниках и работают в обеих сессиях.
 pub(super) fn try_read_scancode() -> Option<u8> {
-    crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char())
+    crate::drivers::ps2_kbd::take_scancode()
 }
 
 /// Показывает ли консоль историю вместо живого низа.
