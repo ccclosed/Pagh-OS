@@ -195,10 +195,8 @@ fn execute_command(cmd: &str) {
     let window = session != crate::drivers::session_route::BOOT_SESSION;
     if window {
         crate::drivers::serial::diag_line(&format!(
-            "[DIAG] window session={} command={} tick={}",
-            session,
-            name,
-            crate::task::scheduler::ticks()
+            "[DIAG] window session={} command={}",
+            session, name
         ));
     }
     dispatch_command(name, args, &parts);
