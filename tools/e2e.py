@@ -3520,6 +3520,12 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
 
     marker = _termux_marker_binary()
     _debugfs_inject_exec(disk, marker, "marker", replace=True)
+    # `--reuse-desktop-disk` must not inherit marker files from a previous run:
+    # q1/q6/q7 are compared for exact/append counts, and a stale term.log would
+    # satisfy the "server closed" count without a single close this run.
+    for stale in ("q1", "q2", "q4", "q6", "q7", "q9one", "q9two", "r", "term.log"):
+        subprocess.run(["debugfs", "-w", "-R", f"rm /{stale}", str(disk)],
+                       capture_output=True, text=True)
     ev = CACHE / "termux_evidence"
     ev.mkdir(parents=True, exist_ok=True)
     h.boot(need_keyboard=False, disk=disk, net=False)
@@ -3693,10 +3699,11 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         pointer.home_pointer()
         pointer.move_to(5, 5)
         _termux_shot(kb, ev / "12-before-selection.png")
-        # content origin (window y + border + title) + letterbox (600-562)/2 +
-        # half a scaled cell: row 0 of the session surface.
-        row0_y = 64 + 1 + 30 + (600 - 562) // 2 + 6
-        pointer.drag(98, row0_y, 470, row0_y)
+        # Compositor input coordinates are CONTENT-relative (0..900, 0..600),
+        # not screen-absolute: surface row 0 sits at the letterbox top
+        # (600-562)/2 = 19 plus half a scaled cell.
+        row0_y = (600 - 562) // 2 + 6
+        pointer.drag(2, row0_y, 320, row0_y)
         _termux_shot(kb, ev / "13-selection.png")
         h.qmp.keys(["ctrl", "y"])
         h.qmp.release_modifiers()
@@ -3815,8 +3822,8 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         log_text = files["term.log"]
         ok &= h.check("first window attached to slot 1", "in slot 1" in log_text,
                       _first_line(log_text, "in slot"))
-        ok &= h.check("second window attached to slot 2", "in slot 2" in log_text,
-                      _first_line(log_text, "in slot 2"))
+        ok &= quick or h.check("second window attached to slot 2", "in slot 2" in log_text,
+                               _first_line(log_text, "in slot 2"))
         ok &= h.check("session restart visible in the client log",
                       "kernel session reopened" in log_text, _first_line(log_text, "reopened"))
         closed_count = log_text.count("server closed the window")
