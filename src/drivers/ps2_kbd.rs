@@ -208,7 +208,12 @@ pub fn inject_scancode(byte: u8) {
 /// USB HID) только кладёт байт в очередь.
 pub(crate) fn deliver_physical(byte: u8) {
     crate::drivers::evdev::feed_scancode(byte);
-    if !crate::drivers::vtinput::client_active() {
+    // Второй источник, которому байт уже адресован, — сфокусированное
+    // терминальное окно: композитор отдаёт клавиши только ему, а клиент
+    // возвращает их через `/dev/vtinput{N}`. Прямой путь в boot-кольцо при
+    // этом обязан молчать, иначе ввод окна дублировался бы в boot-shell
+    // (этап 4: «ввод не уходит в boot VT»).
+    if !crate::drivers::vtinput::client_active() && !crate::drivers::vtinput::session_focused() {
         push_to_ring(byte);
     }
 }

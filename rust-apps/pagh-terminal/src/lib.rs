@@ -13,9 +13,12 @@
 //!   surface, Linux-keyboard-to-VT input encoding.
 //! * [`vtconsole`] — parser for the proposed kernel VT console shared text
 //!   surface (ABI v1, see `TERMINAL.md`).
+//! * [`kernelsession`] — kernel shell-session surface (`/dev/vtfb1` pixels +
+//!   `/dev/vtinput1` keys): the default windowed mode.  Safe half only; the
+//!   mmap/ioctl glue lives in the binary, so this runs on host mocks.
 //! * [`demo`] — built-in demo shell and deterministic screenshot generator.
 //! * [`session`] / [`sh`] — a real shell child behind two pipes for the terminal
-//!   window, and the minimal userspace shell it runs (boot-VT mirror is opt-in).
+//!   window, and the minimal userspace shell it runs (fallback/test mode).
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +27,7 @@ pub mod client;
 pub mod demo;
 pub mod font;
 pub mod font_index;
+pub mod kernelsession;
 pub mod keys;
 pub mod parser;
 pub mod png;
