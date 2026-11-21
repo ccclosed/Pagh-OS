@@ -172,6 +172,18 @@ pub struct ServerOptions {
     /// пока ни одно окно не запущено (тот же флаг, что у `spawn_demo`).
     /// `None`/`""` — выключено.
     pub autostart: Option<String>,
+    /// Живые стенные часы панели (`--clock now`).
+    ///
+    /// Иначе панель показывает время, зафиксированное при старте: `HH:MM`
+    /// содержит только минуты, поэтому «часы идут» — это перерисовка
+    /// маленького `clock_rect` на смене минуты, а не кадр в секунду.
+    pub live_clock: bool,
+    /// Файл посекундной статистики кадров (`--frame-stats PATH`).
+    ///
+    /// Строка на секунду, включая секунды с `frames=0`: пропуск кадра из-за
+    /// того, что композитор не планировался, виден как `gap_max_ms`, а не
+    /// маскируется средней длительностью кадра.
+    pub frame_stats: Option<PathBuf>,
 }
 
 impl Default for ServerOptions {
@@ -197,6 +209,8 @@ impl Default for ServerOptions {
             launch_targets: Vec::new(),
             frame_log_every: 0,
             autostart: None,
+            live_clock: false,
+            frame_stats: None,
             net: NetChoice::Auto,
         }
     }
@@ -270,6 +284,10 @@ enum Incoming {
         detail: String,
     },
     Command(ServerCommand),
+    /// Сетевой сэмпл из фонового треда (см. `spawn_net_poller`).
+    Net(NetInfo),
+    /// `/proc/net/dev` не дал интерфейса — фоновый тред сообщает один раз.
+    NetUnavailable,
 }
 
 struct ClientConn {
@@ -457,10 +475,10 @@ pub struct Server {
     demo_started: bool,
     demo_window_created: bool,
     exit_due: Option<Instant>,
-    /// Следующий опрос сети (раз в секунду): счётчики и `SIOCGIF*`.
-    net_due: Instant,
-    /// Предыдущий сэмпл для дельты скоростей; `None` — это первый.
-    net_prev: Option<NetInfo>,
+    /// Сетевой опрос идёт в фоновом треде, а не в кадре: чужой `Instant` здесь
+    /// больше не нужен — только факт, что первая строка `net …` уже напечатана.
+    /// (Раньше `net_due`/`net_prev` жили тут, и `poll_network` блокировал
+    /// главный цикл на время `/proc/net/dev` + четырёх `SIOCGIF*`.)
     /// Стартовая строка `pagh-desktop: net ...` печатается один раз (e2e).
     net_logged: bool,
     selfcheck_due: Option<Instant>,
@@ -469,6 +487,20 @@ pub struct Server {
     counters: Arc<RenderCounters>,
     shm: std::collections::HashMap<u32, crate::shm::ShmBinding>,
     next_shm_generation: u32,
+    /// Следующий опрос живых часов панели (`--clock now`).
+    clock_due: Instant,
+    /// Базовая точка живых часов: (Instant старта, секунды UNIX на старте).
+    ///
+    /// Кадр не читает RTC: в Pagh `CLOCK_REALTIME` — это port-I/O к CMOS, и
+    /// вызов из цикла стоил десятки миллисекунд паузы (измерено под TCG:
+    /// inter-frame gap подскакивал до ~80 мс дважды в секунду). Один снимок на
+    /// старте плюс монотонный `Instant` дают ту же минуту без syscall'а.
+    clock_base: (Instant, u64),
+    /// Посекундный лог кадров (`--frame-stats`), если запрошен.
+    stats: Option<FrameStatsLog>,
+    /// Момент последнего presented-кадра: разрыв между кадрами — метрика
+    /// голодания композитора.
+    last_present: Option<Instant>,
     /// Выборка frame time (мс) для периодической строки `frame-stats`.
     frame_samples: crate::timing::Samples,
     /// Выборки стадий текущего окна логирования.
@@ -482,6 +514,106 @@ pub struct Server {
     damage_since_log: u64,
     opaque_since_log: u64,
     blended_since_log: u64,
+}
+
+/// Посекундный лог кадров `--frame-stats PATH`.
+///
+/// Открывается один раз (truncate), пишется построчно и сбрасывается на диск
+/// сразу: файл — свидетельство о прогоне, а не буфер, который потеряется при
+/// убийстве композитора. Секунды, в которые композитор не исполнял главный
+/// цикл, выводятся пустыми (`frames=0`) с расписанием `t=`, поэтому разрыв в
+/// файле читается как «здесь не рисовали», а не «здесь лог потерялся».
+struct FrameStatsLog {
+    file: std::fs::File,
+    started: Instant,
+    /// Дедлайн следующей строки (ровно `started + N секунд`).
+    due: Instant,
+    bucket: crate::framestats::FrameBucket,
+    /// Итоги за весь прогон для финальной строки `summary`.
+    total_frames: u64,
+    total_ms: f64,
+    total_max_ms: f64,
+}
+
+impl FrameStatsLog {
+    fn open(path: Option<PathBuf>, now: Instant) -> Option<Self> {
+        let path = path?;
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("pagh-desktop: frame-stats {}: {err}", path.display());
+                return None;
+            }
+        };
+        Some(FrameStatsLog {
+            file,
+            started: now,
+            due: now + Duration::from_secs(1),
+            bucket: crate::framestats::FrameBucket::new(),
+            total_frames: 0,
+            total_ms: 0.0,
+            total_max_ms: 0.0,
+        })
+    }
+
+    fn write_line(&mut self, line: &str) {
+        use std::io::Write as _;
+        let _ = writeln!(self.file, "{line}");
+        let _ = self.file.flush();
+    }
+
+    /// Записать строку текущего интервала и (если цикл проспал больше секунды)
+    /// пустые строки за пропущенные: `t=` остаётся расписанием, а не временем
+    /// пробуждения.
+    fn tick(&mut self, now: Instant) {
+        if now < self.due {
+            return;
+        }
+        // Наверстать пропущенные секунды (ограниченно: час простоя не должен
+        // порождать мегабайты пустых строк).
+        let mut emitted = 0u32;
+        while now >= self.due && emitted < 3600 {
+            let t = self.due.duration_since(self.started).as_secs_f64();
+            let line = self.bucket.line(t);
+            self.write_line(&line);
+            self.total_frames += self.bucket.frames();
+            self.total_ms += self.bucket.frames() as f64 * self.bucket.avg_ms();
+            if self.bucket.max_ms() > self.total_max_ms {
+                self.total_max_ms = self.bucket.max_ms();
+            }
+            self.bucket.clear();
+            self.due += Duration::from_secs(1);
+            emitted += 1;
+        }
+    }
+
+    fn finish(&mut self, now: Instant) {
+        // Последний неполный интервал не теряется.
+        let t = self.due.duration_since(self.started).as_secs_f64();
+        let line = self.bucket.line(t);
+        self.write_line(&line);
+        self.total_frames += self.bucket.frames();
+        self.total_ms += self.bucket.frames() as f64 * self.bucket.avg_ms();
+        if self.bucket.max_ms() > self.total_max_ms {
+            self.total_max_ms = self.bucket.max_ms();
+        }
+        let avg = if self.total_frames == 0 {
+            0.0
+        } else {
+            self.total_ms / self.total_frames as f64
+        };
+        let elapsed = now.duration_since(self.started).as_secs_f64();
+        self.write_line(&format!(
+            "summary t={elapsed:.1} frames={} fps={:.1} avg_ms={avg:.3} max_ms={:.3}",
+            self.total_frames,
+            if elapsed > 0.0 {
+                self.total_frames as f64 / elapsed
+            } else {
+                0.0
+            },
+            self.total_max_ms
+        ));
+    }
 }
 
 fn open_backend(options: &ServerOptions) -> io::Result<OutputBackend> {
@@ -643,6 +775,7 @@ impl Server {
         let (tx, rx) = channel();
         let compositor = Compositor::new(width, height);
         let now = Instant::now();
+        let options_frame_stats = options.frame_stats.clone();
         let exit_due = options
             .exit_after_ms
             .map(|ms| now + Duration::from_millis(ms));
@@ -669,8 +802,6 @@ impl Server {
             demo_started: false,
             demo_window_created: false,
             exit_due,
-            net_due: now,
-            net_prev: None,
             net_logged: false,
             selfcheck_due,
             selfcheck_done: false,
@@ -678,6 +809,10 @@ impl Server {
             counters: Arc::new(RenderCounters::default()),
             shm: std::collections::HashMap::new(),
             next_shm_generation: 1,
+            clock_due: now,
+            clock_base: (now, crate::demo::unix_now()),
+            stats: FrameStatsLog::open(options_frame_stats, now),
+            last_present: None,
             frame_samples: crate::timing::Samples::with_capacity(256),
             render_samples: crate::timing::Samples::with_capacity(256),
             blend_samples: crate::timing::Samples::with_capacity(256),
@@ -745,18 +880,19 @@ impl Server {
         // 60 Hz: один present на интервал, несколько commit'ов в одной итерации
         // цикла сливаются в один damage-набор.
         const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-        /// Период опроса `/proc/net/dev` + `SIOCGIF*`: счётчики ядра меняются
-        /// на пакетном масштабе, а панели нужна скорость за секунду.
-        const NET_POLL: Duration = Duration::from_millis(1000);
+        self.spawn_net_poller();
         let mut next_frame = Instant::now();
         loop {
             if !self.running.load(Ordering::SeqCst) {
                 break;
             }
-            let net_now = Instant::now();
-            if net_now >= self.net_due {
-                self.net_due = net_now + NET_POLL;
-                self.poll_network();
+            // Часы панели и посекундный лог кадров идут по стене главного
+            // цикла, а не по presented-кадрам: секунда без кадра обязана
+            // оставить след, иначе «композитор не планировался» выглядит как
+            // «лог не писался».
+            self.poll_clock();
+            if let Some(stats) = self.stats.as_mut() {
+                stats.tick(Instant::now());
             }
             self.poll_input();
             self.accept_pending();
@@ -823,35 +959,88 @@ impl Server {
         }
     }
 
-    /// Опросить ядро и отдать реальные сетевые данные композитору (этап U).
+    /// Обновить часы панели, если сменилась минута (`--clock now`).
     ///
-    /// `/proc/net/dev` даёт байтовые/пакетные счётчики, `SIOCGIFADDR`/
-    /// `SIOCGIFNETMASK`/`SIOCGIFFLAGS`/`SIOCGIFHWADDR` — адрес, маску, флаги и
-    /// MAC. Скорости — дельта счётчиков по времени, поэтому первый сэмпл всегда
-    /// 0 Б/с: истории ещё нет, и выдумывать её нельзя. `set_network_info`
-    /// добавляет damage только при изменении, так что секундный опрос не
-    /// превращается в непрерывную перерисовку панели.
-    fn poll_network(&mut self) {
+    /// `HH:MM` меняется раз в минуту, поэтому опрос идёт раз в 500 мс, а
+    /// damage — только `panel::clock_rect`: обновление часов не перерисовывает
+    /// рабочий стол и не зависит от того, пришёл ли кадр от клиента.
+    fn poll_clock(&mut self) {
+        if !self.options.live_clock {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.clock_due {
+            return;
+        }
+        self.clock_due = now + Duration::from_millis(500);
+        let (base_at, base_unix) = self.clock_base;
+        let (time, date) =
+            crate::demo::format_unix(base_unix + now.saturating_duration_since(base_at).as_secs());
+        let (shown_time, shown_date) = self.compositor.clock_text();
+        if shown_time != time || shown_date != date {
+            self.compositor.set_clock(time, date);
+        }
+    }
+
+    /// Запустить фоновый опрос сети (раз в секунду).
+    ///
+    /// Раньше `poll_network` вызывался прямо в главном цикле и на время
+    /// `/proc/net/dev` + четырёх `SIOCGIF*` останавливал кадры. Измерение
+    /// (`--frame-stats`) показало inter-frame gap 60 мс ровно раз в секунду —
+    /// и всё это время курсор не мог сдвинуться. Опрос — обычные syscall'ы,
+    /// которым нечего делать на пути кадра, поэтому они уходят в тред, а кадр
+    /// только применяет готовый сэмпл из того же канала, что и клиенты.
+    ///
+    /// Скорости — дельта счётчиков по времени, поэтому первый сэмпл всегда
+    /// 0 Б/с: истории ещё нет, и выдумывать её нельзя.
+    fn spawn_net_poller(&self) {
         if self.options.net == NetChoice::None {
             return;
         }
-        let Some(mut info) = netinfo::read() else {
-            if !self.net_logged {
-                self.net_logged = true;
-                if !self.options.quiet {
-                    println!("pagh-desktop: net unavailable (/proc/net/dev: no eth0)");
+        let tx = self.incoming_tx.clone();
+        let running = self.running.clone();
+        thread::spawn(move || {
+            let mut prev: Option<NetInfo> = None;
+            while running.load(Ordering::SeqCst) {
+                match netinfo::read() {
+                    Some(mut info) => {
+                        if let Some(prev) = &prev {
+                            let (rx, tx_rate) = netinfo::rates(prev, &info);
+                            info.rx_rate = rx;
+                            info.tx_rate = tx_rate;
+                        }
+                        prev = Some(info.clone());
+                        if tx.send(Incoming::Net(info)).is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        if tx.send(Incoming::NetUnavailable).is_err() {
+                            break;
+                        }
+                    }
+                }
+                // Одна секунда кусками по 100 мс: выключение сервера не должно
+                // ждать целый период опроса.
+                for _ in 0..10 {
+                    if !running.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
                 }
             }
-            return;
-        };
-        if let Some(prev) = &self.net_prev {
-            let (rx, tx) = netinfo::rates(prev, &info);
-            info.rx_rate = rx;
-            info.tx_rate = tx;
-        }
-        if !self.net_logged {
+        });
+    }
+
+    /// Одна строка о сети в serial — при первом сэмпле (или первом отказе).
+    fn log_net_once(&mut self, info: Option<&NetInfo>) {
+        if self.net_logged || self.options.quiet {
             self.net_logged = true;
-            if !self.options.quiet {
+            return;
+        }
+        self.net_logged = true;
+        match info {
+            Some(info) => {
                 let addr = match (info.ip, info.prefix) {
                     (Some(ip), Some(prefix)) => format!("{ip}/{prefix}"),
                     (Some(ip), None) => ip.to_string(),
@@ -867,9 +1056,8 @@ impl Server {
                     info.iface, addr, state
                 );
             }
+            None => println!("pagh-desktop: net unavailable (/proc/net/dev: no eth0)"),
         }
-        self.net_prev = Some(info.clone());
-        self.compositor.set_network_info(Some(info));
     }
 
     /// Создать одно демонстрационное окно без AF_UNIX-клиента (QEMU e2e).
@@ -1151,6 +1339,17 @@ impl Server {
                 true
             }
             Incoming::Command(command) => self.handle_command(command),
+            Incoming::Net(info) => {
+                self.log_net_once(Some(&info));
+                self.compositor.set_network_info(Some(info));
+                true
+            }
+            Incoming::NetUnavailable => {
+                self.log_net_once(None);
+                // Нет данных — честное состояние панели, а не «отключено».
+                self.compositor.set_network_info(None);
+                true
+            }
         }
     }
 
@@ -1831,7 +2030,29 @@ impl Server {
     fn note_frame_timing(&mut self, frame_start: u64, damage_rects: u64) {
         let stages = crate::timing::take_frame();
         let total = crate::timing::now_cycles().saturating_sub(frame_start);
-        self.frame_samples.push(crate::timing::cycles_to_ms(total));
+        let frame_ms = crate::timing::cycles_to_ms(total);
+        // Inter-frame gap: how long the compositor went *unscheduled* between
+        // two presents. Measured from wall time, so a 2 s freeze is visible even
+        // when both neighbouring frames were cheap to draw.
+        let now = Instant::now();
+        if let (Some(stats), Some(prev)) = (self.stats.as_mut(), self.last_present) {
+            stats
+                .bucket
+                .note_gap(now.duration_since(prev).as_secs_f64() * 1000.0);
+        }
+        self.last_present = Some(now);
+        if let Some(stats) = self.stats.as_mut() {
+            stats.bucket.record(frame_ms, damage_rects);
+        }
+        // `--frame-log-every 0` (the default) must not accumulate samples: the
+        // old code pushed every frame and only cleared them when a log line was
+        // due, so a long-running compositor grew this Vec at frame rate.
+        if self.options.frame_log_every == 0 {
+            self.frames_since_log += 1;
+            self.damage_since_log += damage_rects;
+            return;
+        }
+        self.frame_samples.push(frame_ms);
         self.render_samples.push(stages.render_ms());
         self.blend_samples.push(stages.blend_ms());
         self.copy_samples.push(stages.copy_ms());
@@ -1957,6 +2178,9 @@ impl Server {
 
     fn cleanup(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        if let Some(mut stats) = self.stats.take() {
+            stats.finish(Instant::now());
+        }
         for client in &self.clients {
             shutdown_stream(&client.writer);
         }
@@ -2281,7 +2505,10 @@ mod tests {
             "--launch-target terminal=",
             "--autostart files",
         ] {
-            assert!(active.contains(needle), "в рецепте нет {needle:?}: {active}");
+            assert!(
+                active.contains(needle),
+                "в рецепте нет {needle:?}: {active}"
+            );
         }
         for banned in ["--spawn-demo", "--demo-window", "--demo-binary"] {
             assert!(

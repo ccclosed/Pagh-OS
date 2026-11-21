@@ -410,6 +410,15 @@ impl Compositor {
         self.drag
     }
 
+    /// Текущий текст часов панели (`HH:MM`, `DD.MM.YYYY`).
+    ///
+    /// Нужен серверу, чтобы не добавлять damage, когда минута не сменилась:
+    /// `set_clock` безусловно повреждает `clock_rect`, а секундный опрос без
+    /// этой проверки держал бы панель в вечной перерисовке.
+    pub fn clock_text(&self) -> (&str, &str) {
+        (&self.panel.time, &self.panel.date)
+    }
+
     pub fn set_clock(&mut self, time: impl Into<String>, date: impl Into<String>) {
         self.panel.time = time.into();
         self.panel.date = date.into();
