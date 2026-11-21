@@ -62,6 +62,8 @@ struct MockFb {
     failure: Option<&'static str>,
     /// Сколько `poll()`-ов отдать кадр до отказа (0 — отказ сразу).
     fail_after: usize,
+    /// Сколько раз источник переоткрывали (`ENODEV` -> respawn).
+    respawned: usize,
 }
 
 impl MockFb {
@@ -72,6 +74,7 @@ impl MockFb {
             polls: 0,
             failure: None,
             fail_after: 0,
+            respawned: 0,
         }
     }
 
@@ -95,6 +98,17 @@ impl FrameSource for MockFb {
         }
     }
 
+    fn respawn(&mut self) -> Result<(), VtFbError> {
+        // Ядро поднимает новую сессию на первом open: свежий счётчик generation.
+        self.respawned += 1;
+        self.polls = 0;
+        self.failure = None;
+        self.fail_after = 0;
+        self.info.generation = 1;
+        self.pixels = solid_pixels(&self.info, (0, 0, 0));
+        Ok(())
+    }
+
     fn with_pixels(&mut self, f: &mut dyn FnMut(&[u8])) -> Result<(), VtFbError> {
         if self.failure == Some("short") {
             let short = self.pixels.len() / 2;
@@ -109,11 +123,17 @@ impl FrameSource for MockFb {
 /// Куда «устройство ввода» складывает байты в тестах.
 struct MockInput {
     written: Vec<u8>,
+    respawns: usize,
 }
 
 impl InputSink for MockInput {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.written.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn respawn(&mut self) -> io::Result<()> {
+        self.respawns += 1;
         Ok(())
     }
 }
@@ -237,8 +257,8 @@ fn session_end_is_reported_honestly_and_not_masked() {
     match frame.draw_if_changed(&mut canvas, &theme) {
         Err(error) if error.is_ended() => {
             assert!(
-                error.message().contains("relaunch"),
-                "сообщение обязано говорить, как переподключиться: {}",
+                error.message().contains("press Enter"),
+                "сообщение обязано говорить, как переподключиться в этом окне: {}",
                 error.message()
             );
         }
@@ -334,6 +354,7 @@ fn read_fallback_tracks_generation_on_a_plain_file() {
 fn keys_become_vt_bytes_for_the_kernel_input() {
     let mut forwarder = KeyForwarder::new(MockInput {
         written: Vec::new(),
+        respawns: 0,
     });
     use pagh_terminal::keys::evdev;
     // PDP/1 modifier bits (same wire values as `protocol::mods`).
@@ -541,6 +562,47 @@ fn missing_kernel_devices_fall_back_to_the_pipe_shell_session() {
         out.status
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Завершившаяся сессия поднимается заново в ТОМ ЖЕ кадре/окне: клиент
+/// переоткрывает устройство, а не создаёт второе окно (`duplicate window`).
+#[test]
+fn a_finished_session_restarts_in_the_same_frame() {
+    let mut fb = MockFb::new(info(2, 2, 10), (0, 0, 0));
+    fb.failure = Some("ended");
+    // open() = poll #1, первый кадр = #2, отказ — на следующем.
+    fb.fail_after = 2;
+    let mut frame = KernelFrame::open(fb).expect("open");
+    let theme = Theme::default();
+    let mut canvas = Canvas::new(2, 2, theme.bg);
+    assert!(frame.draw_if_changed(&mut canvas, &theme).is_ok());
+    match frame.draw_if_changed(&mut canvas, &theme) {
+        Err(error) if error.is_ended() => {}
+        other => panic!("expected Ended, got {other:?}"),
+    }
+
+    let info = frame.respawn().expect("respawn in the same window");
+    assert_eq!(info.generation, 1, "новая сессия начинает счёт заново");
+    assert_eq!(
+        frame.draw_if_changed(&mut canvas, &theme).unwrap(),
+        Draw::Drawn { generation: 1 },
+        "после respawn кадр рисуется в том же холсте"
+    );
+}
+
+/// Переоткрытие ввода после `ENODEV`: пишем уже в новую сессию.
+#[test]
+fn input_device_is_reopened_for_the_new_session() {
+    let mut forwarder = KeyForwarder::new(MockInput {
+        written: Vec::new(),
+        respawns: 0,
+    });
+    use pagh_terminal::keys::evdev;
+    forwarder.handle_key(evdev::KEY_H, true, 0).expect("write");
+    forwarder.respawn().expect("reopen input");
+    assert_eq!(forwarder.sink().respawns, 1);
+    forwarder.handle_key(evdev::KEY_A, true, 0).expect("write");
+    assert_eq!(forwarder.sink().written, b"ha");
 }
 
 /// Диагностика режима должна уметь уходить в файл: desktop запускает клиента

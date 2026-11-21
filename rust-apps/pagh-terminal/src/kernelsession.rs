@@ -182,8 +182,8 @@ impl VtFbError {
         match self {
             VtFbError::Io(error) => format!("device I/O error: {error}"),
             VtFbError::Ended => {
-                "the kernel shell session ended (ENODEV). The kernel starts a new one on the \
-                 next open — relaunch the window to reconnect."
+                "the kernel shell session ended (ENODEV). The next open starts a new one — \
+                 press Enter in the window to restart the session there."
                     .to_string()
             }
             VtFbError::BadInfo(what) => format!("kernel framebuffer contract violation: {what}"),
@@ -227,11 +227,24 @@ pub trait FrameSource {
     /// буфера, а у read-fallback он есть, и оба обязаны выглядеть одинаково для
     /// безопасного кода lib-крейта (`#![forbid(unsafe_code)]`).
     fn with_pixels(&mut self, f: &mut dyn FnMut(&[u8])) -> Result<(), VtFbError>;
+
+    /// Переоткрыть поверхность после `ENODEV` — ядро спавнит новую сессию на
+    /// первом `open`. Устройство переоткрывается, а окно клиента остаётся тем
+    /// же: перезапуск сессии не должен требовать нового окна (иначе композитор
+    /// получает `duplicate window` на тот же id).
+    fn respawn(&mut self) -> Result<(), VtFbError> {
+        Err(VtFbError::Ended)
+    }
 }
 
 /// Приёмник VT-байтов ввода (в бою — `/dev/vtinput1`).
 pub trait InputSink {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Переоткрыть устройство после `ENODEV` (новая сессия ядра).
+    fn respawn(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<T: FrameSource + ?Sized> FrameSource for Box<T> {
@@ -285,6 +298,17 @@ impl FrameSource for ReadFrameSource {
         Ok(self.info)
     }
 
+    fn respawn(&mut self) -> Result<(), VtFbError> {
+        // Свежий open — это и есть respawn: ядро поднимает сессию на первом
+        // open устройства, а старый fd остался от завершившейся сессии.
+        let file = File::open(&self.path)?;
+        let mut header = [0u8; INFO_LEN];
+        read_exact_at(&file, &mut header, 0)?;
+        self.file = file;
+        self.info = VtFbInfo::parse(&header)?;
+        Ok(())
+    }
+
     fn with_pixels(&mut self, f: &mut dyn FnMut(&[u8])) -> Result<(), VtFbError> {
         // Один связный снимок: заголовок и пиксели читаются из offset 0 в
         // одном проходе, поэтому geometry/generation принадлежат тем же
@@ -307,12 +331,14 @@ impl FrameSource for ReadFrameSource {
 /// `InputSink` поверх обычного файла (`/dev/vtinput1`).
 pub struct FileInput {
     file: File,
+    path: PathBuf,
 }
 
 impl FileInput {
     pub fn open(path: impl AsRef<Path>) -> io::Result<FileInput> {
-        let file = OpenOptions::new().write(true).open(path)?;
-        Ok(FileInput { file })
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new().write(true).open(&path)?;
+        Ok(FileInput { file, path })
     }
 }
 
@@ -320,6 +346,11 @@ impl InputSink for FileInput {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         // Без flush: это символьное устройство, `write` уже отдал байты ядру.
         self.file.write_all(bytes)
+    }
+
+    fn respawn(&mut self) -> io::Result<()> {
+        self.file = OpenOptions::new().write(true).open(&self.path)?;
+        Ok(())
     }
 }
 
@@ -458,6 +489,18 @@ impl<S: FrameSource> KernelFrame<S> {
         self.full = true;
     }
 
+    /// Поднять новую сессию ядра на месте той, что завершилась (`ENODEV`).
+    ///
+    /// Окно клиента не пересоздаётся: переоткрывается только устройство, поэтому
+    /// композитор не видит второго `create` и `duplicate window` невозможен.
+    pub fn respawn(&mut self) -> Result<VtFbInfo, VtFbError> {
+        self.source.respawn()?;
+        self.last_generation = None;
+        self.full = true;
+        self.info = self.source.poll()?;
+        Ok(self.info)
+    }
+
     /// Перерисовать окно, если ядро опубликовало новый кадр.
     pub fn draw_if_changed(
         &mut self,
@@ -544,6 +587,11 @@ impl<S: InputSink> KeyForwarder<S> {
 
     pub fn sink(&self) -> &S {
         &self.sink
+    }
+
+    /// Переоткрыть устройство ввода для новой сессии.
+    pub fn respawn(&mut self) -> io::Result<()> {
+        self.sink.respawn()
     }
 }
 

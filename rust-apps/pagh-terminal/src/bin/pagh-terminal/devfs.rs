@@ -95,6 +95,8 @@ struct MmapSurface {
     /// Держим fd открытым: закрытие `fd` при живом отображении — законно, но
     /// повторный ioctl `generation` делается по этому же fd.
     file: File,
+    /// Путь нужен для `respawn`: после `ENODEV` сессию поднимает новый `open`.
+    path: String,
     base: *mut u8,
     len: usize,
     info: VtFbInfo,
@@ -139,6 +141,7 @@ impl MmapSurface {
         Ok((
             MmapSurface {
                 file,
+                path: path.to_string(),
                 base: base as *mut u8,
                 len,
                 info,
@@ -160,6 +163,47 @@ impl FrameSource for MmapSurface {
         }
         self.info = info;
         Ok(info)
+    }
+
+    fn respawn(&mut self) -> Result<(), VtFbError> {
+        // Ядро поднимает новую сессию на первом `open` устройства, а прежний fd
+        // относится к завершившейся. Порядок: сначала новый open + mmap (если он
+        // не удался, старое отображение не тронуто), затем снять старое и
+        // подменить поля — окно клиента при этом не меняется, второго `create`
+        // композитор не увидит.
+        let file = File::open(&self.path)?;
+        let info = query_info(&file)?;
+        let len = info.pixels_len();
+        if len == 0 {
+            return Err(VtFbError::BadInfo(
+                "the kernel reported a zero-byte framebuffer",
+            ));
+        }
+        // SAFETY: PROT_READ+MAP_SHARED на fd, который живёт в `file`;
+        // MAP_FAILED проверяется до любого чтения (как в `new`).
+        let base = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ,
+                MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if base as isize == -1 {
+            return Err(VtFbError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: старое отображение создано в `new`/`respawn` и до сих пор не
+        // снималось.
+        unsafe {
+            munmap(self.base as *mut c_void, self.len);
+        }
+        self.file = file; // старый fd закрывается здесь
+        self.base = base as *mut u8;
+        self.len = len;
+        self.info = info;
+        Ok(())
     }
 
     fn with_pixels(&mut self, f: &mut dyn FnMut(&[u8])) -> Result<(), VtFbError> {

@@ -34,8 +34,8 @@ use pagh_terminal::client::{close_name, error_name, Event, ShmFrame, SurfaceClie
 use pagh_terminal::demo::{self, DemoShell};
 use pagh_terminal::font::{CELL_H, CELL_W};
 use pagh_terminal::kernelsession::{
-    is_missing_device, is_session_end, render_notice, Draw, FileInput, KernelFrame, KeyForwarder,
-    VtFbError,
+    is_missing_device, is_session_end, render_notice, Draw, FileInput, FrameSource, KernelFrame,
+    KeyForwarder, VtFbError,
 };
 use pagh_terminal::keys::{self, KeyModes};
 use pagh_terminal::protocol::{buttons, InputEvent};
@@ -1450,6 +1450,10 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     let mut dirty = true;
     let mut last_commit = Instant::now();
     let mut input_error_reported = false;
+    // Сессия завершилась (`exit` -> ENODEV): окно осталось, ждём Enter, чтобы
+    // переоткрыть устройство и поднять новую сессию в ЭТОМ же окне.
+    let mut awaiting_respawn = false;
+    let mut notice_pending = false;
     // `--vt-trace` (или переменная окружения) печатает каждый отрисованный
     // кадр: в гостевой консоли это serial-доказательство того, что generation
     // растёт с выводом сессии, а не «кадр застыл».
@@ -1458,7 +1462,15 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     loop {
         // 1. Кадр сессии: перерисовываем окно только когда ядро опубликовало
         //    новый generation — иначе простой не жжёт CPU на блит.
-        {
+        if awaiting_respawn && notice_pending {
+            let canvas = canvas_mut(&mut shm, &mut fallback);
+            render_notice(canvas, &theme, ENDED_NOTICE);
+            notice_pending = false;
+            dirty = true;
+        }
+        if awaiting_respawn {
+            // Кадр не блитится: поверхность принадлежала завершившейся сессии.
+        } else {
             let canvas = canvas_mut(&mut shm, &mut fallback);
             match frame.draw_if_changed(canvas, &theme) {
                 Ok(Draw::Drawn { generation }) => {
@@ -1469,14 +1481,13 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                 }
                 Ok(Draw::Unchanged) => {}
                 Err(VtFbError::Ended) => {
-                    return end_kernel_session(
-                        &mut client,
-                        &mut shm,
-                        &mut diag,
-                        &theme,
-                        width,
-                        height,
-                        ENDED_NOTICE,
+                    // Честная плашка и ожидание Enter: сессия ядра закончилась,
+                    // но окно — нет. Это и есть respawn без второго окна.
+                    awaiting_respawn = true;
+                    notice_pending = true;
+                    diag.line(
+                        "kernel session ended (the shell exited); window kept, \
+                         press Enter to restart the session",
                     );
                 }
                 Err(error) => {
@@ -1597,6 +1608,45 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     code,
                     pressed,
                     modifiers,
+                }) if awaiting_respawn => {
+                    // Любая клавиша (в первую очередь Enter) — просьба поднять
+                    // новую сессию: переоткрываем vtinput1 и vtfb1. Старые fd
+                    // принадлежали завершившейся сессии, поэтому open спавнит
+                    // новую, а окно остаётся тем же.
+                    let _ = code;
+                    let _ = modifiers;
+                    if pressed {
+                        match respawn_kernel_session(&mut frame, &mut forwarder, &mut diag) {
+                            Ok(()) => {
+                                awaiting_respawn = false;
+                                notice_pending = false;
+                                dirty = true;
+                            }
+                            Err(error) => {
+                                let message = error.message();
+                                diag.line(&format!("cannot restart the session: {message}"));
+                                let _ = end_kernel_session(
+                                    &mut client,
+                                    &mut shm,
+                                    &mut diag,
+                                    &theme,
+                                    width,
+                                    height,
+                                    &[
+                                        "[kernel session] the session ended and could not be restarted",
+                                        "",
+                                        message.as_str(),
+                                    ],
+                                );
+                                return Err(message);
+                            }
+                        }
+                    }
+                }
+                Event::Input(InputEvent::Key {
+                    code,
+                    pressed,
+                    modifiers,
                 }) => match forwarder.handle_key(code, pressed, modifiers) {
                     Ok(_) => {}
                     Err(error) if is_session_end(&error) => {
@@ -1641,12 +1691,35 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
 }
 
 /// Что показать в окне, когда `exit` в сессии ядра завершил её (`ENODEV`).
+///
+/// Окно при этом НЕ закрывается: Enter переоткрывает устройство, ядро поднимает
+/// новую сессию, и она продолжается в том же окне. Именно поэтому respawn не
+/// создаёт второе окно и не упирается в `duplicate window`.
 const ENDED_NOTICE: &[&str] = &[
     "[kernel session] the shell session has ended.",
     "",
-    "The kernel starts a fresh session on the next open, so relaunch",
-    "pagh-terminal to reconnect. Nothing is simulated in the meantime.",
+    "Press Enter to start a new session in this window.",
+    "The window itself stays: no second window is created.",
 ];
+
+/// Поднять новую сессию ядра в том же окне: переоткрыть ввод и поверхность.
+///
+/// Ядро спавнит сессию на первом `open` любого из двух устройств; клиент не
+/// создаёт второй `create`, поэтому композитор не может ответить
+/// `duplicate window`.
+fn respawn_kernel_session(
+    frame: &mut KernelFrame<Box<dyn FrameSource>>,
+    forwarder: &mut KeyForwarder<FileInput>,
+    diag: &mut Diag,
+) -> Result<(), VtFbError> {
+    forwarder.respawn().map_err(VtFbError::Io)?;
+    let info = frame.respawn()?;
+    diag.line(&format!(
+        "kernel session restarted in the same window ({}x{}, stride {}, generation {})",
+        info.width, info.height, info.stride, info.generation
+    ));
+    Ok(())
+}
 
 /// Получить текущий холст окна (общий mmap или локальный fallback).
 fn canvas_mut<'a>(
