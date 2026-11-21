@@ -70,7 +70,7 @@ layers:
    alongside them). The full list is `all_tests()` in `src/test.rs`. Run it from the shell
    with `selftest`; results print over serial as `ok`/`FAIL` lines.
 2. **Host property tests** (`host-tests/`) — `proptest` for logic that extracts cleanly to
-   the host. The numbered modules are `p01`–`p56` (one file per property under
+   the host. The numbered modules are `p01`–`p67` (one file per property under
    `host-tests/src/properties/`), plus named ones (`tty_job`, `kill_target`, `ext2_links`,
    `procfs_*`, …), covering the kernel core plus the
    Linux-compat ABI and the `apt`/`deb`/`tar` pipeline. A separate, workspace-excluded
