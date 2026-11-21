@@ -11,34 +11,38 @@
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Bootloader: Limine" src="https://img.shields.io/badge/boot-Limine-purple.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
-  <a href="https://github.com/ccclosed/Pagh-OS/releases/tag/2.18.12-demo"><img alt="Try it: bootable demo image" src="https://img.shields.io/badge/try%20it-bootable%20demo%20image-brightgreen.svg"></a>
+  <a href="https://github.com/ccclosed/Pagh-OS/releases/tag/2.24.0-demo"><img alt="Try it: bootable demo image" src="https://img.shields.io/badge/try%20it-bootable%20demo%20image-brightgreen.svg"></a>
 </p>
 
 <p align="center">
   <a href="docs/demo.mp4"><img src="docs/demo.gif" width="960" alt="pagh booting in QEMU: the shell, the paint app drawing a house, the nano+ editor and the settings panel with live themes"></a>
   <br>
-  <sub><i>24 с реальной загрузки QEMU/OVMF, записанные с framebuffer — boot, shell, paint, nano+, темы. <a href="docs/demo.mp4">MP4</a></i></sub>
+  <sub><i>24 с реальной загрузки QEMU/OVMF, записанные с framebuffer — boot, shell, paint, nano+, темы
+  (запись 2.18.12: консольный вариант A; desktop-вариант B — <a href="docs/desktop-b.md">docs/desktop-b.md</a>). <a href="docs/demo.mp4">MP4</a></i></sub>
 </p>
 
 <p align="center">
   <b>Попробовать одной командой — тулчейн Rust не нужен:</b><br>
   <code>tar xzf pagh-demo-x86_64.tar.gz &amp;&amp; cd pagh-demo-x86_64 &amp;&amp; ./run.sh</code><br>
-  <sub>скачайте загрузочный образ из <a href="https://github.com/ccclosed/Pagh-OS/releases/tag/2.18.12-demo">релиза demo bundle</a> · нужны <code>qemu-system-x86_64</code> + OVMF · <code>Ctrl+Alt+G</code> отпускает мышь, затем <code>quit</code></sub>
+  <sub>образ — из <a href="https://github.com/ccclosed/Pagh-OS/releases/tag/2.24.0-demo">demo-релиза 2.24.0</a>
+  (GitHub <b>Pre-release</b>: демо-канал нестабилен и Latest не занимает — Latest остаётся за stable <code>vX.Y.Z</code>) ·
+  внутри desktop-вариант B стартует сам · нужны <code>qemu-system-x86_64</code> + OVMF · <code>Ctrl+Alt+G</code> отпускает мышь, затем <code>quit</code></sub>
 </p>
 
 ### Что уже работает
 
 - **Загрузка:** Limine/UEFI → консоль framebuffer 1280×800 с цветным prompt'ом и статус-строкой.
 - **Shell:** редактирование строки, история, tab completion, прокрутка консоли (колесо мыши / PageUp / PageDown), `ls`/`ls -l`/`tree`/`chmod`/`chown`/`df`/`free`/`date`/`head`/`tail`/`wc`/`grep`/`ifconfig`/`ps`, файловые операции ext2, `selftest`.
-- **GUI-приложения:** управляемый мышью `paint` (инструменты фигур, 16-цветная палитра, размеры кисти, undo, сохранение в ext2), полноэкранный редактор `nano+` и `settings` с живыми цветовыми темами и обоями.
+- **GUI-приложения (вариант A, в ядре):** управляемый мышью `paint` (инструменты фигур, 16-цветная палитра, размеры кисти, undo, сохранение в ext2), полноэкранный редактор `nano+` и `settings` с живыми цветовыми темами и обоями.
+- **Desktop-вариант B:** ядро отдаёт примитивы, экран рисует userspace-композитор — `/dev/fb0` (takeover scanout-буфера + `FBIOGET_*SCREENINFO` + `mmap(MAP_SHARED)`), `/dev/input/event0` (24-байтные `input_event`), `memfd_create`/`ftruncate` + общий `MAP_SHARED`, `sendmsg`/`recvmsg` с `SCM_RIGHTS`. Приложения — `pagh-desktop` (композитор, панель, меню, damage-only коммит), `pagh-files` (файловый менеджер) и `pagh-terminal` (VT100-терминал) по протоколу PDP/1; живой кадр доказан E2E. Детали и честные границы — [`docs/desktop-b.md`](docs/desktop-b.md).
 - **Хранилище:** ext2-совместимая read/write файловая система с журналом write-ahead-log, на реальном virtio-blk или NVMe-диске (или RAM-диске с загрузочного носителя).
 - **Сеть:** стек TCP/IP поверх e1000 или USB-RNDIS (USB-тетеринг телефона): DHCP/ARP/TCP/UDP; `ifconfig` показывает живой lease, `/proc/net/dev` — живые байтовые/пакетные счётчики `eth0`, а `SIOCGIFADDR`/`SIOCGIFFLAGS`/`SIOCGIFHWADDR`/`SIOCGIFNETMASK`/`SIOCGIFMTU`/`SIOCGIFINDEX`/`SIOCGIFNAME`/`SIOCGIFCONF` на `AF_INET`-сокете отдают userspace те же адрес/маску/флаги/MAC из ядра.
 - **Процессы:** вытесняющий планировщик ~1 кГц, ring-3 пользовательские процессы, `SYSCALL`/`int 0x80`.
 
-*Не показано в демо выше (реализовано, но не задействовано в этой записи):* `apt`-подобный
-менеджер пакетов Debian по HTTPS/TLS с проверенными через OpenPGP метаданными, слой
-совместимости с Linux-x86_64-бинарниками и CPython 3.16, а также восстановление после
-краша ext2 WAL (`fscrash`). См. глубокие доки ниже.
+*Не показано в демо выше (реализовано, но не задействовано в этой записи):* `ppkg`-менеджер
+пакетов Debian по HTTPS/TLS с проверенными через OpenPGP метаданными, слой
+совместимости с Linux-x86_64-бинарниками и CPython 3.16, восстановление после
+краша ext2 WAL (`fscrash`), а также desktop-вариант B (пункт выше). См. глубокие доки ниже.
 
 **Сборка и запуск из исходников** (Rust nightly с `rust-src`, QEMU + OVMF; Limine
 скачивается автоматически):
@@ -50,6 +54,7 @@ git clone https://github.com/ccclosed/Pagh-OS && cd Pagh-OS
 
 **Глубокие доки:** [Быстрый старт](#быстрый-старт) · [Вывод загрузки](#вывод-загрузки) ·
 [Команды shell](#команды-shell) · [Графика и paint](#графика-и-приложение-paint) ·
+[Desktop-вариант B](#desktop-вариант-b-экран-рисует-userspace) ·
 [Архитектура](#архитектура) · [Корректность и тесты](#свойства-корректности-и-тестирование) ·
 [Linux-бинарники и пакеты](#linux-бинарники-и-пакеты-debian) · [Модель безопасности](SECURITY.md) ·
 [Участие в проекте](CONTRIBUTING.md)
@@ -72,7 +77,7 @@ minimize/maximize/close и кнопкой на панели задач). Он т
 ELF-бинарники — статически слинкованные или динамически слинкованные против glibc (вплоть
 до CPython 3.16) —** в ring 3 через слой совместимости с Linux-сисколлами (`fork`/`clone` +
 потоки, `epoll`/`eventfd`, unix-сокеты и VT100-совместимый терминал с raw-mode `termios`),
-включает **`apt`-подобный менеджер пакетов**, который скачивает и ставит Debian-пакеты
+включает **`ppkg`** — `apt`-подобный менеджер пакетов, который скачивает и ставит Debian-пакеты
 `.deb` по имени через HTTP/HTTPS, и умеет **устанавливать базовый glibc + Python userland**
 на свой ext2-диск по запросу из shell (`ppkg update` + `ppkg install python3`) — сама
 загрузка никогда не останавливается, чтобы что-то спросить.
@@ -307,12 +312,13 @@ IDEMPOTENCY`, когда прогонов больше одного); экран
   `/proc/<pid>/{fd,fdinfo}/<n>` и per-thread представление `/proc/<pid>/task/<tid>/` (с
   `/proc/self/task`); `/proc/<pid>/fdinfo/<n>` сообщает реальные `pos`/`flags`/`mnt_id`/`ino`
   дескриптора.
-- **Пакеты:** `apt` по имени (`update`/`install`/`show`/`list`/`setmirror`), который
+- **Пакеты:** `ppkg` по имени (`update`/`install`/`show`/`list`/`setmirror`; внутренние модули
+  остались `pkg::apt*`, команда `apt` удалена), который
   скачивает Debian-индекс `Packages` по HTTP/HTTPS, потоково разжимает gzip/xz/zstd в
   компактный in-RAM arena-индекс, разрешает зависимости и ставит `.deb` на ext2 `/mnt`
   (tar-симлинки/hardlink'и создаются настоящими ссылками на ext2).
 - **Провижининг:** идемпотентный first-boot flow засеивает `/mnt`; userland glibc + CPython
-  ставится через `apt` (fallback декодирования индекса gz→xz, честная диагностика
+  ставится через `ppkg` (fallback декодирования индекса gz→xz, честная диагностика
   декодирования, прогресс на serial) по запросу из shell (`ppkg update` + `ppkg install
   python3`). Загрузка больше не останавливается, чтобы спросить: консольный вопрос без
   таймаута — не то, что загрузка может себе позволить.
@@ -466,7 +472,7 @@ soft-float и никогда не трогает векторные регист
 исполняемый в ring 3 через сисколл `SYS_WRITE`. DHCP-lease асинхронно получает поток
 сетевого poll'а после включения прерываний, поэтому он появляется после prompt'а. На
 свежем диске загрузка только засеивает скелет файлов (release-метаданные, `/etc`, пример);
-userland glibc + `python3` ставится по запросу из shell командами `ppkg update` + `apt
+userland glibc + `python3` ставится по запросу из shell командами `ppkg update` + `ppkg
 install python3` (прогресс на serial; зеркало лога во framebuffer приостанавливается).
 Prompt показывает текущий рабочий каталог и рендерится в цвете на framebuffer (serial
 остаётся простым текстом).
@@ -590,6 +596,47 @@ Linux ELF: `fastfetch` работает без префикса `lxrun`. Вст�
   clear (`x`), maximize (`m`) и сохранение/загрузка canvas в `/mnt/paint.img` (`s`/`g`)
   через ext2 FS.
 - **Выход:** кнопка close, `Esc` или `q` возвращает в shell.
+
+### Desktop-вариант B: экран рисует userspace
+
+Второй, и на `dev` основной, вариант — ядро-примитивы под **свой** композитор. Kernel-консоль
+остаётся (вариант A), но `pagh-desktop` забирает экран и рисует кадры сам:
+
+```sh
+# обычный носитель несёт /mnt/etc/autorun с настоящими целями запуска
+lxrun /mnt/pd --backend fbdev --input evdev \
+  --launch-target files=/mnt/pagh-files|--socket|{socket} \
+  --launch-target terminal=/mnt/pagh-terminal|--socket|{socket} --autostart files
+```
+
+- **Экран.** `/dev/fb0` — Limine scanout: первый `open`/`mmap(MAP_SHARED)` останавливает
+  kernel-консольный flush (takeover; serial-логи идут), `FBIOGET_VSCREENINFO` (0x4600)/
+  `FBIOGET_FSCREENINFO` (0x4602) отдают `fb_var/fix_screeninfo`, fb-листья помечены MMIO-битом
+  и никогда не возвращаются в PMM. **Ввод** — `/dev/input/event0`: evdev-подобный поток
+  24-байтных `input_event` из PS/2 и USB HID (blocking/`O_NONBLOCK`/`poll`/`select`).
+- **Кадры между процессами.** `memfd_create` + `ftruncate` (76/77) + `mmap(MAP_SHARED)` дают
+  общие физические страницы (не COW), `sendmsg`/`recvmsg` (46/47) несут `SCM_RIGHTS`, поэтому
+  клиент передаёт композитору свой `memfd`, а по сокету идут только damage-прямоугольники.
+- **Терминал — kernel-сессия (stage 1).** `/dev/vtfb1` + `/dev/vtinput1` — offscreen-экран и
+  ввод **второй** kernel-shell сессии (тот же REPL, реестр команд, редактор, scrollback,
+  `nano+`, `paint`), плюс `/dev/vtconsole0` + `/dev/vtinput` — общая поверхность boot-VT.
+  Привязка окна к сессии по умолчанию (`feat/terminal-kernel-client`) ещё в открытом PR;
+  до неё окно запускает собственный shell-потомок через pipe'ы. Контракт и границы —
+  [`docs/terminal-session.md`](docs/terminal-session.md).
+- **Двойной клик** синтезирует клиент (`pagh-ui`): второй press левой кнопки ≤400 мс и ≤4 px —
+  `Click::Double`; протокол PDP/1 о двойном клике не знает.
+- **Files** подписывает устройства по роли: «Системный диск (/)», «Диск данных (/mnt)».
+- **Производительность кадра.** Тень окна — предкомпонованное кольцо (`shadow_cache`), у Files
+  widget-damage поверх статического слоя (`copy_rect`) вместо хэширования всего холста, код
+  рендера терминала/Files собирается `opt-level=3`, заливки — построчно (`row-store`). Замеры и
+  их дата — в [`rust-apps/pagh-desktop/README.md`](rust-apps/pagh-desktop/README.md).
+- **CPU-OpenGL subset.** `rust-apps/tinygl` вендорит TinyGL 0.4.1 (MIT) и оборачивает его
+  безопасным FFI: PR1 — build-probe с эталонным пиксельным дайджестом, PR2 — FFI-core
+  (матрицы, примитивы, depth/cull, `ZB_resize`). Это **headless**-библиотека: desktop-демо и
+  GL-клиента композитора пока нет (см. `rust-apps/tinygl/README.md`).
+- **Чего ещё нет** (не заявляется): PTY/full job control и per-window `^Z`/`fg`/`bg`, USB mass
+  storage (stage S1 и UX-спека — в работе), DMA-BUF/GPU/Wayland, EV_ABS/touch, fb modeset,
+  SMP. Приёмка живого пути — `python3 tools/e2e.py desktop`.
 
 ### Проверка сети с хоста
 
@@ -797,7 +844,9 @@ arch::cpu       gdt/idt         memory      apic      drivers      fs / net    v
 src/
 ├── lib.rs              # crate attrs, Limine request statics, global cells, panic handler, _start
 ├── boot.rs             # boot orchestrator: ordered, fallible init steps (incl. storage + net)
+├── boot_menu.rs        # disk menu (the only place a partition can be formatted)
 ├── log.rs              # leveled logging facade (error!/warn!/info!/debug!/trace!)
+├── logfile.rs          # rotating on-disk log mirror (flush thread)
 ├── provision.rs        # idempotent first-boot seeding (release metadata, /etc, examples)
 ├── test.rs             # in-kernel test/self-test harness (Properties P1–P29)
 ├── selftest_lx.rs      # boot-time Linux-compat + apt self-tests (features lx_selftest/lx_livetest/lx_bigindex/lx_tlsbig)
@@ -832,14 +881,27 @@ src/
 │   ├── pmm.rs          # bitmap physical frame allocator (single Spinlock; contiguous alloc)
 │   ├── vmm.rs          # 4-level paging, PageTableWalker, map_mmio, VmError
 │   └── heap.rs         # global allocator: IRQ-safe wrapper over galloc (O(1)-binned)
-├── drivers/
+├── drivers/            # полный список файлов и контрактов — src/drivers/README.md
 │   ├── mod.rs          # device registry (block/char/console traits, sector_count)
 │   ├── serial.rs       # 16550 UART (byte-accurate writes)
-│   ├── ps2_kbd.rs      # PS/2 keyboard (IRQ1)
+│   ├── ps2_kbd.rs      # PS/2 keyboard (IRQ1) + per-session rings
 │   ├── ps2_mouse.rs    # PS/2 mouse (IRQ12): packet assembler + absolute cursor state
+│   ├── inputd.rs       # the ONE physical-input dispatcher thread (+ input_ring.rs queue)
+│   ├── input_event.rs  # evdev codes/decoder; evdev.rs exposes /dev/input/event0
 │   ├── cursor.rs       # trailing-free software arrow cursor (save/restore under-pixels)
 │   ├── framebuffer.rs  # framebuffer console + 2D primitives (rect/line/circle/blit) + status bar
+│   ├── fb_surface.rs   # offscreen per-session surface (+ offscreen.rs) and fb_abi.rs (/dev/fb0)
+│   ├── session.rs      # task -> console session routing (+ session_route.rs, pure)
 │   ├── vt.rs           # ANSI/VT-100 terminal emulator on the framebuffer (CSI, charsets, ONLCR)
+│   ├── vtfb_abi.rs     # /dev/vtfb1 + /dev/vtinput1 ABI (+ vt_keys.rs, vtinput.rs, vtsurface.rs)
+│   ├── scrollback.rs   # console history ring (wheel/PageUp), pure model
+│   ├── tty.rs          # controlling terminal: foreground process group
+│   ├── e1000.rs        # Intel e1000 NIC (polled)
+│   ├── memdisk.rs      # Limine module -> RAM block device
+│   ├── nvme.rs         # polled NVMe (PRP lists, four commands in flight; nvme_prp.rs)
+│   ├── xhci.rs         # xHCI controller (root ports, hub policy in xhci_hub.rs)
+│   ├── usb_hid.rs      # HID boot-protocol keyboards/mice (report decoding in usb_hid_report.rs)
+│   ├── usb_rndis.rs    # USB tethering (RNDIS; descriptor scan in usb_desc.rs)
 │   ├── pci/            # PCI config-space access + bus enumeration
 │   └── virtio/         # virtio HAL (DMA frames + bounce buffers) + virtio-blk (write-through cache)
 ├── fs/
@@ -876,9 +938,11 @@ src/
 ├── sync/
 │   └── spinlock.rs     # IRQ-safe spinlock (built on arch::cpu)
 ├── task/
-│   ├── scheduler.rs    # round-robin scheduler, TCB, idle task
+│   ├── scheduler.rs    # round-robin scheduler, TCB, idle task, FS.base per activation
 │   ├── switch.rs       # context-switch asm, kernel-thread trampoline, timer IRQ stub
 │   ├── process.rs      # ring-3 user process creation + embedded test ELF
+│   ├── fpu.rs          # FPU/SSE context (frame_uses_fp policy)
+│   ├── as_refs.rs      # pure address-space ownership policy (ready/stopped/reap)
 │   ├── compat.rs       # per-process Linux compat state registry (fds, vm regions)
 │   ├── fd.rs           # per-process file-descriptor table (VFS-backed)
 │   ├── fd_alloc.rs     # pure fd-number bookkeeping (lowest-free ≥ 3, EBADF)
@@ -887,6 +951,9 @@ src/
 ├── vfs/
 │   ├── mod.rs          # VfsNode trait, root, lookup_path, mount_at, /dev/{null,serial}
 │   ├── ramfs.rs        # in-memory filesystem backing writable /tmp
+│   ├── procfs.rs       # synthetic /proc (+ procfs_format.rs, pure rendering)
+│   ├── memfd.rs        # memfd pages shared by mmap(MAP_SHARED) and SCM_RIGHTS
+│   ├── desktop_dev.rs  # fb/input/vt device nodes for the userspace desktop
 │   ├── elf.rs          # ELF64 validation + PT_LOAD loading (native + Linux static/PIE)
 │   └── elf_classify.rs # pure ELF classifier + static-PIE load-bias selection
 ├── security/
@@ -895,6 +962,20 @@ src/
 └── debug/
     ├── mod.rs          # debug entry points (panic-time helpers)
     └── unwind.rs       # heap-free RBP-chain stack trace for panics
+```
+
+userspace-половина живёт отдельно, каждое приложение — самостоятельный крейт с собственным
+`[workspace]`/`.cargo/config.toml` (корневой конфиг — bare-metal), см.
+[`rust-apps/README.md`](rust-apps/README.md):
+
+```text
+rust-apps/
+├── pagh-desktop/   # композитор: PDP/1-сервер, панель, меню, fbdev/headless backend
+├── pagh-ui/        # клиентский тулкит: canvas, шрифт, виджеты, темы, PDP/1-клиент, PNG
+├── pagh-files/     # файловый менеджер (сайдбар, сетка/список, контекстное меню)
+├── pagh-terminal/  # терминал: VT100/ANSI, рендерер, клиент PDP/1, ShmSurface
+├── tinygl/         # CPU-only fixed-function GL (vendored TinyGL 0.4.1), headless
+└── hello/          # минимальный пример: статический musl ELF для `lxrun`
 ```
 
 ### Заметки о дизайне
@@ -970,7 +1051,7 @@ src/
   POSIX-сигналов реализована (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, `kill(2)` с
   process groups, `SIGSTOP`/`SIGCONT`, `SIGCHLD`, доставка и в возврате из сисколла, и в
   возврате по тику), а `futex` поддерживает блокировки glibc.
-- **Пакеты (apt).** `apt` скачивает Debian-индекс `Packages` и парсит его инкрементально из
+- **Пакеты (`ppkg`).** `ppkg` (модули `pkg::apt*`) скачивает Debian-индекс `Packages` и парсит его инкрементально из
   потокового gzip/xz/zstd-декомпрессора в **компактный byte-arena индекс** — одна
   растущая байтовая арена плюс ссылки `(offset,len)` и отсортированные таблицы поиска по
   целочисленным ключам вместо сотен тысяч per-field `String` — поэтому полный индекс `main`
@@ -1005,10 +1086,12 @@ RAM-mock-устройства (без зависимости от железа).
 каталога:
 
 ```sh
-cd host-tests && cargo test
+cd host-tests && cargo test          # или: python3 tools/host_tests.py (то же, с host-triple)
 ```
 
-Host-набор несёт нумерованные модули свойств `p01`–`p56` плюс именованные модули для
+Прогон на `dev` 2026-11-21 (`origin/dev` = `7e8c4e07`): **850 passed / 0 failed**.
+
+Host-набор несёт нумерованные модули свойств `p01`–`p67` плюс именованные модули для
 областей, добавленных позже (`tty_job`, `kill_target`, `ext2_links`, `link_walk_paths`,
 `nvme_io`, `at_random`, `signal_stop`, семейство `procfs_*`, …). Сверх перечисленных ниже
 свойств ядра он покрывает добавленную позже логику Linux-compat и пакетов: классификатор
