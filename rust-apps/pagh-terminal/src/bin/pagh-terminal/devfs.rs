@@ -94,7 +94,8 @@ pub fn open_frame_source(path: &str) -> Result<OpenedSurface, OpenError> {
 struct MmapSurface {
     /// Держим fd открытым: закрытие `fd` при живом отображении — законно, но
     /// повторный ioctl `generation` делается по этому же fd.
-    file: File,
+    /// `None` — fd закрыт (между `ENODEV` и respawn).
+    file: Option<File>,
     /// Путь нужен для `respawn`: после `ENODEV` сессию поднимает новый `open`.
     path: String,
     base: *mut u8,
@@ -140,7 +141,7 @@ impl MmapSurface {
         );
         Ok((
             MmapSurface {
-                file,
+                file: Some(file),
                 path: path.to_string(),
                 base: base as *mut u8,
                 len,
@@ -153,7 +154,10 @@ impl MmapSurface {
 
 impl FrameSource for MmapSurface {
     fn poll(&mut self) -> Result<VtFbInfo, VtFbError> {
-        let info = query_info(&self.file)?;
+        let Some(file) = self.file.as_ref() else {
+            return Err(VtFbError::Ended);
+        };
+        let info = query_info(file)?;
         if info.pixels_len() > self.len {
             // Разрешение kernel-VT сменилось на живой сессии — это контрактный
             // разрыв, а не повод читать за отображением.
@@ -166,11 +170,19 @@ impl FrameSource for MmapSurface {
     }
 
     fn respawn(&mut self) -> Result<(), VtFbError> {
-        // Ядро поднимает новую сессию на первом `open` устройства, а прежний fd
-        // относится к завершившейся. Порядок: сначала новый open + mmap (если он
-        // не удался, старое отображение не тронуто), затем снять старое и
-        // подменить поля — окно клиента при этом не меняется, второго `create`
-        // композитор не увидит.
+        // Порядок несущий: СНАЧАЛА снять отображение и закрыть старый fd, только
+        // потом `open`. Ядро спавнит новую сессию на первом open, а `close`
+        // старого fd после этого уменьшил бы счётчик открытых устройств до нуля —
+        // ядро попросило бы новую сессию выйти, и следующий ioctl вернул бы
+        // ENODEV (окно «перезапустилось и сразу умерло»).
+        // SAFETY: отображение создано в `new`/`respawn` и ещё не снималось.
+        unsafe {
+            munmap(self.base as *mut c_void, self.len);
+        }
+        self.base = std::ptr::null_mut();
+        self.len = 0;
+        self.file = None; // старый fd закрывается здесь
+
         let file = File::open(&self.path)?;
         let info = query_info(&file)?;
         let len = info.pixels_len();
@@ -194,12 +206,7 @@ impl FrameSource for MmapSurface {
         if base as isize == -1 {
             return Err(VtFbError::Io(io::Error::last_os_error()));
         }
-        // SAFETY: старое отображение создано в `new`/`respawn` и до сих пор не
-        // снималось.
-        unsafe {
-            munmap(self.base as *mut c_void, self.len);
-        }
-        self.file = file; // старый fd закрывается здесь
+        self.file = Some(file);
         self.base = base as *mut u8;
         self.len = len;
         self.info = info;
@@ -218,7 +225,10 @@ impl FrameSource for MmapSurface {
 
 impl Drop for MmapSurface {
     fn drop(&mut self) {
-        // SAFETY: отображение создано `mmap` в `new` и ещё не снималось.
+        if self.base.is_null() || self.len == 0 {
+            return;
+        }
+        // SAFETY: отображение создано `mmap` в `new`/`respawn` и ещё не снималось.
         unsafe {
             munmap(self.base as *mut c_void, self.len);
         }

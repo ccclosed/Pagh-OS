@@ -330,7 +330,8 @@ impl FrameSource for ReadFrameSource {
 
 /// `InputSink` поверх обычного файла (`/dev/vtinput1`).
 pub struct FileInput {
-    file: File,
+    /// `None` — устройство закрыто (например, между `ENODEV` и respawn).
+    file: Option<File>,
     path: PathBuf,
 }
 
@@ -338,18 +339,28 @@ impl FileInput {
     pub fn open(path: impl AsRef<Path>) -> io::Result<FileInput> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().write(true).open(&path)?;
-        Ok(FileInput { file, path })
+        Ok(FileInput {
+            file: Some(file),
+            path,
+        })
     }
 }
 
 impl InputSink for FileInput {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         // Без flush: это символьное устройство, `write` уже отдал байты ядру.
-        self.file.write_all(bytes)
+        match self.file.as_mut() {
+            Some(file) => file.write_all(bytes),
+            None => Err(io::Error::from_raw_os_error(ENODEV)),
+        }
     }
 
     fn respawn(&mut self) -> io::Result<()> {
-        self.file = OpenOptions::new().write(true).open(&self.path)?;
+        // Закрыть старый fd ДО нового `open`: его `close` иначе придёт после
+        // `note_open` новой сессии, счётчик открытых fd дойдёт до нуля и ядро
+        // попросит только что поднятую сессию выйти (окно получит ENODEV).
+        self.file = None;
+        self.file = Some(OpenOptions::new().write(true).open(&self.path)?);
         Ok(())
     }
 }
