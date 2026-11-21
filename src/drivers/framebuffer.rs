@@ -466,6 +466,13 @@ impl FramebufferWriter {
         if !self.owns_vt_surface() {
             return;
         }
+        // Размер снимка теперь пропорционален экрану (59×240 клеток на 1080p,
+        // 79×320 на 1440p). Без открытого `/dev/vtconsole0` публиковать некому,
+        // и собирать его на каждый scroll/clear было бы чистой ценой: один
+        // atomic load здесь дешевле, чем ~400 КиБ Vec.
+        if !crate::drivers::vtsurface::is_active() {
+            return;
+        }
         let snap = self.text_snapshot();
         crate::drivers::vtsurface::publish_shell_full(
             &snap.cells,
