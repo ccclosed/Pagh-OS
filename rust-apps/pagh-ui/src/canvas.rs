@@ -80,6 +80,26 @@ impl Canvas {
         }
     }
 
+    /// Пустая (прозрачная) поверхность с явным порядком пикселей.
+    ///
+    /// Нужна статическому слою кадра ([`crate::layer::StaticLayer`]): основа
+    /// должна храниться в том же формате, что и поверхность, в которую её
+    /// возвращают, иначе [`Canvas::copy_rect`] пойдёт медленным путём с
+    /// конвертацией пикселей.
+    pub fn with_order(width: i32, height: i32, order: PixelOrder) -> Canvas {
+        let width = width.max(0);
+        let height = height.max(0);
+        let stride = width as usize * order.bytes_per_pixel();
+        Canvas {
+            width,
+            height,
+            stride,
+            order,
+            storage: Storage::Owned(vec![0u8; stride * height as usize]),
+            clip_stack: Vec::new(),
+        }
+    }
+
     /// Поверхность, отображающая `ShmSurface` напрямую (mmap).
     ///
     /// `buffer` должен быть получен из [`crate::shm::ShmSurface::map`] для той
@@ -527,6 +547,47 @@ impl Canvas {
         }
     }
 
+    /// Скопировать прямоугольник из другой поверхности **без** смешивания.
+    ///
+    /// Это возврат пикселей из [`crate::layer::StaticLayer`] в поврежённую
+    /// область за O(площадь прямоугольника): строки копируются как байты, а не
+    /// пересобираются по пикселю. Поверхности обязаны иметь одинаковую
+    /// геометрию и [`PixelOrder`] — смешивать форматы нельзя, поэтому неверный
+    /// порядок ловится `debug_assert` (в release копия всё равно побайтовая).
+    /// Отсечение цели учитывается; области вне `src` игнорируются.
+    pub fn copy_rect(&mut self, src: &Canvas, rect: Rect) {
+        let Some(area) = rect.intersect(self.clip()) else {
+            return;
+        };
+        let Some(area) = area.intersect(Rect::new(0, 0, src.width, src.height)) else {
+            return;
+        };
+        if self.order != src.order {
+            // Разный порядок пикселей (основа RGBA → разделяемая XRGB/RGB565):
+            // конвертируем по пикселю. Медленнее побайтовой копии, но
+            // корректно; `StaticLayer` можно создавать сразу в формате
+            // поверхности и всегда идти быстрым путём.
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    let pixel = src.pixel(Point::new(x, y));
+                    self.set_pixel(Point::new(x, y), pixel);
+                }
+            }
+            return;
+        }
+        let bpp = self.order.bytes_per_pixel();
+        let row_bytes = area.w as usize * bpp;
+        if row_bytes == 0 {
+            return;
+        }
+        for y in area.y..area.bottom() {
+            let src_off = y as usize * src.stride + area.x as usize * bpp;
+            let dst_off = y as usize * self.stride + area.x as usize * bpp;
+            self.pixels_mut()[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&src.pixels()[src_off..src_off + row_bytes]);
+        }
+    }
+
     /// Сузить область отсечения; восстанавливается через [`Canvas::pop_clip`].
     pub fn push_clip(&mut self, rect: Rect) {
         let new_clip = rect
@@ -662,6 +723,53 @@ mod tests {
         assert_eq!(base.pixel(Point::new(1, 1)), Color::WHITE);
         assert_eq!(base.pixel(Point::new(0, 0)), Color::BLACK);
         assert_eq!(base.pixel(Point::new(3, 3)), Color::BLACK);
+    }
+
+    #[test]
+    fn copy_rect_is_exact_and_clipped() {
+        let mut src = Canvas::filled(8, 6, Color::rgb(1, 2, 3));
+        src.set_pixel(Point::new(2, 2), Color::rgb(9, 9, 9));
+        src.set_pixel(Point::new(3, 2), Color::rgba(0, 0, 0, 0));
+        let mut dst = Canvas::filled(8, 6, Color::WHITE);
+        let mut dst2 = Canvas::filled(8, 6, Color::WHITE);
+        dst.copy_rect(&src, Rect::new(2, 2, 2, 1));
+        // Точная копия, включая прозрачный пиксель (blit бы его пропустил).
+        assert_eq!(dst.pixel(Point::new(2, 2)), Color::rgb(9, 9, 9));
+        assert_eq!(dst.pixel(Point::new(3, 2)), Color::TRANSPARENT);
+        assert_eq!(dst.pixel(Point::new(1, 2)), Color::WHITE);
+        // Учитывает отсечение.
+        dst2.push_clip(Rect::new(0, 0, 2, 6));
+        dst2.copy_rect(&src, Rect::new(1, 2, 4, 1));
+        dst2.pop_clip();
+        assert_eq!(dst2.pixel(Point::new(0, 2)), Color::WHITE);
+        assert_eq!(dst2.pixel(Point::new(1, 2)), Color::rgb(1, 2, 3));
+        assert_eq!(dst2.pixel(Point::new(2, 2)), Color::WHITE);
+        // Область вне источника игнорируется, а не паникует.
+        let mut dst3 = Canvas::filled(8, 6, Color::WHITE);
+        dst3.copy_rect(&src, Rect::new(7, 5, 4, 4));
+        assert_eq!(dst3.pixel(Point::new(7, 5)), Color::rgb(1, 2, 3));
+        assert_eq!(dst3.pixel(Point::new(2, 2)), Color::WHITE);
+    }
+
+    #[test]
+    fn copy_rect_converts_between_pixel_orders() {
+        use crate::protocol::FrameFormat;
+        let mut src = Canvas::filled(8, 6, Color::rgb(10, 20, 30));
+        let mut dst = Canvas::with_order(8, 6, PixelOrder::Xrgb8888);
+        dst.clear(Color::BLACK);
+        dst.copy_rect(&src, Rect::new(1, 1, 3, 2));
+        // Читается в формате цели: цвет сохранился, а не перепутался.
+        assert_eq!(dst.pixel(Point::new(1, 1)), Color::rgb(10, 20, 30));
+        assert_eq!(dst.pixel(Point::new(3, 2)), Color::rgb(10, 20, 30));
+        assert_eq!(dst.pixel(Point::new(0, 0)), Color::BLACK);
+        // Быстрый путь (тот же порядок) копирует и прозрачность как есть.
+        let mut rgb565 = Canvas::with_order(8, 6, PixelOrder::Rgb565);
+        rgb565.copy_rect(&dst, Rect::new(1, 1, 1, 1));
+        assert_eq!(
+            rgb565.frame_format(),
+            Some(FrameFormat::Rgb565),
+            "порядок цели не изменился"
+        );
     }
 
     #[test]
