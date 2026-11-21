@@ -2058,6 +2058,9 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
     if request == FIONBIO {
         check_user_ptr(arg, 4)?;
         let on = unsafe { core::ptr::read_unaligned(arg as *const u32) } != 0;
+        // stdin — это терминал КОНСОЛЬНОЙ СЕССИИ задачи: O_NONBLOCK окна не
+        // должен переводить в неблокирующий режим stdin boot-shell'а.
+        let session = crate::drivers::session::current();
 
         return compat::with_current_compat(|cs| {
             let obj = cs.fds.get_mut(fd as u32).ok_or(Errno::EBADF)?;
@@ -2073,7 +2076,8 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
                 OpenObject::UnixListener(l) => l.inner.lock().nonblocking = on,
                 OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
                 OpenObject::Stdin => {
-                    STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed);
+                    STDIN_NONBLOCK[pending_slot(session)]
+                        .store(on, core::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {}
             }
@@ -2089,7 +2093,14 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
             vtconsole_ioctl(&node, request, arg)
         }
         Some(Resolved::File { node, .. }) if node.is_vtfb1() => vtfb_ioctl(&node, request, arg),
-        Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
+        // Write-only вход окна: tty-запросы относятся к ТЕРМИНАЛУ СЕССИИ 1, к
+        // которому клиент и обращается (`TIOCSWINSZ` после resize окна,
+        // `TIOCGWINSZ`/`TIOCGPGRP` для диагностики). Дескриптор — не stdin
+        // вызывающего, поэтому сессия передаётся явно, а не выводится из задачи.
+        Some(Resolved::File { node, .. }) if node.is_vtinput1() => vtinput1_ioctl(request, arg),
+        Some(Resolved::Console) | Some(Resolved::Stdin) => {
+            tty_ioctl(crate::drivers::session::current(), request, arg)
+        }
         // Сетевые `SIOCGIF*` — на любом `AF_INET`-сокете, как в Linux. До этой
         // ветки они падали в общий ENOTTY, и `ifconfig` не видел ни адреса, ни
         // флагов, хотя `/proc/net/dev` уже отдавал счётчики. Неизвестный
@@ -2210,7 +2221,14 @@ fn vtconsole_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u6
 /// ядро.
 fn vtfb_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u64, Errno> {
     use crate::drivers::vtfb_abi::{encode_info, VTFBIOGET_INFO, VTFB_INFO_SIZE};
+    // `ENODEV` после выхода сессии — контракт `vtfb1`: он относится и к
+    // winsize-запросу по тому же fd, иначе «мёртвое» окно отвечало бы размером.
     let info = node.vtfb_info().ok_or(Errno::ENODEV)?;
+    // Размер терминала сессии нужен клиенту и на fd поверхности: он может
+    // спросить его, не открывая `vtinput1` отдельно.
+    if request == super::tty::TIOCGWINSZ {
+        return winsize_ioctl(1, request, arg);
+    }
     if request != VTFBIOGET_INFO {
         return Err(Errno::ENOTTY);
     }
@@ -2219,15 +2237,43 @@ fn vtfb_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u64, Er
     Ok(0)
 }
 
+/// ioctl `/dev/vtinput1`: tty-поверхность ТЕРМИНАЛА СЕССИИ 1.
+///
+/// Запись размера окна (`TIOCSWINSZ`) — контракт resize: клиент окна получает
+/// новую клиентскую область от композитора, переводит её в клетки и сообщает
+/// ядру; ядро запоминает `winsize` сессии и шлёт `SIGWINCH` её foreground-группе.
+fn vtinput1_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
+    tty_ioctl(1, request, arg)
+}
+
+/// `TIOCGWINSZ`/`TIOCSWINSZ` для сессии `session`.
+fn winsize_ioctl(session: usize, request: u64, arg: u64) -> Result<u64, Errno> {
+    match super::tty::winsize_request(request) {
+        Some(super::tty::WinsizeRequest::Get) => {
+            check_user_ptr_writable(arg, super::tty::WINSIZE_SIZE as u64)?;
+            let ws = crate::drivers::tty::winsize_for(session);
+            copy_out(arg, &super::tty::encode_winsize(&ws))?;
+            Ok(0)
+        }
+        Some(super::tty::WinsizeRequest::Set) => {
+            // `copy_in` проверяет диапазон и отображаемость страниц (precondition
+            // `check_user_ptr` выполняется внутри) — никакого ring-0 чтения
+            // непроверенного адреса.
+            let raw = copy_in(arg, super::tty::WINSIZE_SIZE as u64)?;
+            let ws = super::tty::decode_winsize(&raw).ok_or(Errno::EINVAL)?;
+            crate::drivers::tty::set_winsize_for(session, ws);
+            Ok(0)
+        }
+        None => Err(Errno::ENOTTY),
+    }
+}
+
 /// `TCGETS`: прочитать атрибуты терминала (`struct termios`).
 const TCGETS: u64 = 0x5401;
 /// `TCSETS` / `TCSETSW` / `TCSETSF`: задать атрибуты терминала (принимаются, игнорируются).
 const TCSETS: u64 = 0x5402;
 const TCSETSW: u64 = 0x5403;
 const TCSETSF: u64 = 0x5404;
-/// `TIOCGWINSZ`: прочитать размер окна (`struct winsize`).
-const TIOCGWINSZ: u64 = 0x5413;
-const TIOCSWINSZ: u64 = 0x5414;
 
 /// Размер Linux `struct termios` в байтах (4×u32 + c_line + c_cc[19]).
 const TERMIOS_SIZE: usize = 36;
@@ -2241,7 +2287,7 @@ const TERMIOS_SIZE: usize = 36;
 /// терминал, см. `drivers::tty`) — сообщаются из живого состояния. Программа,
 /// которая сохраняет атрибуты, меняет их и восстанавливает, должна получить
 /// обратно то, что поставила, а не жёстко зашитый образ.
-fn build_termios() -> [u8; TERMIOS_SIZE] {
+fn build_termios(session: usize) -> [u8; TERMIOS_SIZE] {
     let mut t = [0u8; TERMIOS_SIZE];
     let c_iflag: u32 = 0x0500; // ICRNL | IXON
     let c_oflag: u32 = 0x0005; // OPOST | ONLCR
@@ -2255,7 +2301,7 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
     if !echo_now {
         c_lflag &= !0x0008u32;
     } // ECHO
-    if crate::drivers::tty::tostop() {
+    if crate::drivers::tty::tostop_for(session) {
         c_lflag |= TOSTOP;
     }
     t[0..4].copy_from_slice(&c_iflag.to_le_bytes());
@@ -2272,13 +2318,18 @@ fn build_termios() -> [u8; TERMIOS_SIZE] {
     t
 }
 
-/// ioctl консоли/stdin: ровно столько tty-поверхности, чтобы `isatty()` сказал
-/// «да» (glibc выдаёт `TCGETS`), а программы узнали окно 80×25.
-fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
+/// ioctl консоли/stdin СЕССИИ `session`: ровно столько tty-поверхности, чтобы
+/// `isatty()` сказал «да» (glibc выдаёт `TCGETS`), а программы узнали размер
+/// окна (`TIOCGWINSZ`) своей сессии.
+fn tty_ioctl(session: usize, request: u64, arg: u64) -> Result<u64, Errno> {
+    // winsize — общий для всех tty-запросов путь (в т.ч. на `/dev/vtinput1`).
+    if super::tty::winsize_request(request).is_some() {
+        return winsize_ioctl(session, request, arg);
+    }
     match request {
         TCGETS => {
             check_user_ptr_writable(arg, TERMIOS_SIZE as u64)?;
-            copy_out(arg, &build_termios())?;
+            copy_out(arg, &build_termios(session))?;
             Ok(0)
         }
         // Если ICANON снят, переключаемся в raw-режим, чтобы чтения
@@ -2301,25 +2352,14 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
                     cs.raw_mode = raw;
                     cs.echo = echo;
                 });
-                // TOSTOP (0x100) — состояние ТЕРМИНАЛА, а не процесса: он решает,
-                // останавливает ли запись фонового job (drivers::tty).
-                crate::drivers::tty::set_tostop(c_lflag & TOSTOP != 0);
+                // TOSTOP (0x100) — состояние ТЕРМИНАЛА СЕССИИ, а не процесса: он
+                // решает, останавливает ли запись фонового job этой сессии
+                // (drivers::tty). Окно не может включить TOSTOP boot-консоли.
+                crate::drivers::tty::set_tostop_for(session, c_lflag & TOSTOP != 0);
             }
             Ok(0)
         }
-        TIOCGWINSZ => {
-            check_user_ptr_writable(arg, 8)?;
-            let (cols, rows) = crate::drivers::vt::dimensions();
-            // struct winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
-            let mut ws = [0u8; 8];
-            ws[0..2].copy_from_slice(&rows.to_le_bytes());
-            ws[2..4].copy_from_slice(&cols.to_le_bytes());
-            copy_out(arg, &ws)?;
-            Ok(0)
-        }
-        // Запись размера окна принимается и игнорируется (readline шлёт
-        // TIOCSWINSZ при старте, распространяя вычисленный размер).
-        TIOCSWINSZ => Ok(0),
+        // winsize обработан выше общим путём (per-session).
         // Управление заданиями терминала: сообщить/сменить foreground process
         // group терминала. Раньше оба запроса отвечали про ВЫЗЫВАЮЩЕГО (сообщить
         // вызывающего, принять любую смену молча), поэтому `tcgetpgrp` врал
@@ -2327,7 +2367,7 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
         // terminal process group (-1)» + «no job control in this shell».
         TIOCGPGRP => {
             check_user_ptr_writable(arg, 4)?;
-            let pg = crate::drivers::tty::foreground_pgid() as u32;
+            let pg = crate::drivers::tty::foreground_pgid_for(session) as u32;
             copy_out(arg, &pg.to_le_bytes())?;
             Ok(0)
         }
@@ -2347,10 +2387,10 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
             super::tty::may_set_foreground(
                 target,
                 live,
-                crate::drivers::tty::shell_pgid(),
-                crate::drivers::tty::foreground_pgid(),
+                crate::drivers::tty::shell_pgid_for(session),
+                crate::drivers::tty::foreground_pgid_for(session),
             )?;
-            crate::drivers::tty::set_foreground_pgid(target);
+            crate::drivers::tty::set_foreground_pgid_for(session, target);
             Ok(0)
         }
         _ => Err(Errno::ENOTTY),
@@ -2359,31 +2399,73 @@ fn tty_ioctl(request: u64, arg: u64) -> Result<u64, Errno> {
 
 // Байты cooked-строки, которые предыдущий read(2) не потребил —
 // readline вычерпывает ввод по одному байту за read после select().
-static STDIN_PENDING: crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>> =
-    crate::sync::spinlock::Spinlock::new(alloc::vec::Vec::new());
+//
+// Очередь — на КОНСОЛЬНУЮ СЕССИЮ: ввод окна (`/dev/vtinput1`) не должен
+// попадать в stdin программы boot-shell'а и наоборот. Индекс — сессия
+// (`drivers::session`), ключ — задача, читающая stdin.
+static STDIN_PENDING: [crate::sync::spinlock::Spinlock<alloc::vec::Vec<u8>>;
+    crate::drivers::session_route::MAX_SESSIONS] =
+    [const { crate::sync::spinlock::Spinlock::new(alloc::vec::Vec::new()) };
+        crate::drivers::session_route::MAX_SESSIONS];
 
-/// Положить байты в stdin текущего foreground-процесса (`/dev/vtinput` →
-/// Linux-программа). Ограничение 4 КиБ: медленный читатель не должен дать
-/// userspace бесконечно растить kernel-heap.
-pub fn push_stdin_bytes(bytes: &[u8]) {
+fn pending_slot(session: usize) -> usize {
+    if session < crate::drivers::session_route::MAX_SESSIONS {
+        session
+    } else {
+        crate::drivers::session_route::BOOT_SESSION
+    }
+}
+
+/// Положить байты в stdin foreground-процесса сессии `session`
+/// (`/dev/vtinput` → Linux-программа). Ограничение 4 КиБ на сессию: медленный
+/// читатель не должен дать userspace бесконечно растить kernel-heap.
+pub fn push_stdin_bytes_for(session: usize, bytes: &[u8]) {
     const MAX_PENDING: usize = 4096;
-    let mut q = STDIN_PENDING.lock();
+    let slot = pending_slot(session);
+    let mut q = STDIN_PENDING[slot].lock();
     let room = MAX_PENDING.saturating_sub(q.len());
     if room != 0 {
         q.extend_from_slice(&bytes[..core::cmp::min(bytes.len(), room)]);
     }
 }
 
+/// [`push_stdin_bytes_for`] для сессии текущей задачи.
+pub fn push_stdin_bytes(bytes: &[u8]) {
+    push_stdin_bytes_for(crate::drivers::session::current(), bytes);
+}
+
+/// Сколько байт ждёт в очереди stdin сессии (для тестов/poll).
+pub(crate) fn stdin_pending_len_for(session: usize) -> usize {
+    STDIN_PENDING[pending_slot(session)].lock().len()
+}
+
+/// Забрать до `max` байт из очереди stdin сессии (общий путь чтения и
+/// in-QEMU-проверок: очередь обязана быть per-session).
+pub(crate) fn take_stdin_pending_for(session: usize, max: usize) -> alloc::vec::Vec<u8> {
+    let mut q = STDIN_PENDING[pending_slot(session)].lock();
+    let n = core::cmp::min(max, q.len());
+    q.drain(..n).collect()
+}
+
 // Libuv переводит сырой tty в O_NONBLOCK и мультиплексирует его через epoll;
 // блокирующее чтение в ядре останавливает весь TUI event loop nvim.
-static STDIN_NONBLOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// Флаг — на сессию: неблокирующий stdin окна не делает неблокирующим boot-shell.
+static STDIN_NONBLOCK: [core::sync::atomic::AtomicBool;
+    crate::drivers::session_route::MAX_SESSIONS] = [const { core::sync::atomic::AtomicBool::new(false) };
+    crate::drivers::session_route::MAX_SESSIONS];
 
-/// Истина, когда raw-чтение stdin может продвинуться прямо сейчас: остались
-/// байты, в очереди есть ответы на VT-запросы или неразобранный сканкод клавиатуры.
-pub(crate) fn stdin_input_available() -> bool {
-    !STDIN_PENDING.lock().is_empty()
+/// Истина, когда raw-чтение stdin сессии `session` может продвинуться прямо
+/// сейчас: остались байты, в очереди есть ответы на VT-запросы или
+/// неразобранный сканкод клавиатуры ЭТОЙ сессии.
+pub(crate) fn stdin_input_available_for(session: usize) -> bool {
+    !STDIN_PENDING[pending_slot(session)].lock().is_empty()
         || crate::drivers::vt::has_input_responses()
-        || crate::drivers::ps2_kbd::has_pending()
+        || crate::drivers::ps2_kbd::has_scancode_for(session)
+}
+
+/// [`stdin_input_available_for`] для сессии текущей задачи.
+pub(crate) fn stdin_input_available() -> bool {
+    stdin_input_available_for(crate::drivers::session::current())
 }
 
 // Телеметрия чёрного экрана. Считает байты через три сегмента конвейера
@@ -2421,12 +2503,17 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     if count == 0 {
         return Ok(0);
     }
+    // stdin — терминал ЭТОЙ консольной сессии: очередь и кольцо ввода у окна
+    // свои, поэтому программа в окне не съедает нажатия boot-shell'а.
+    let session = crate::drivers::session::current();
     // Поставить в очередь накопившиеся ответы на VT-запросы (DA1/DSR/DECRQM/OSC),
     // чтобы терминальный опрос nvim получил ответы через stdin.
     {
         let resp = crate::drivers::vt::take_input_responses();
         if !resp.is_empty() {
-            STDIN_PENDING.lock().extend_from_slice(&resp);
+            STDIN_PENDING[pending_slot(session)]
+                .lock()
+                .extend_from_slice(&resp);
         }
     }
     // Сначала вычерпать накопившиеся байты (raw-режим тоже может их оставлять).
@@ -2434,7 +2521,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     // `COMPAT_STATES`, поэтому спинлок очереди отпускается до копии: держать
     // его через подпирание/аллокацию кадров нельзя (инвариант 3 AGENTS.md).
     let head = {
-        let mut pending = STDIN_PENDING.lock();
+        let mut pending = STDIN_PENDING[pending_slot(session)].lock();
         if pending.is_empty() {
             None
         } else {
@@ -2455,7 +2542,29 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
     let mut consumed_any = false;
     let mut spins = 0u32;
     loop {
-        let sc = crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char());
+        // Очередь могла пополниться, пока задача ждала: `/dev/vtinput1` кладёт
+        // ввод туда, а не в физическое кольцо, поэтому проверять её нужно и в
+        // цикле, а не только на входе (иначе typed-in-window программа висела бы
+        // до следующего read).
+        {
+            let head = {
+                let mut pending = STDIN_PENDING[pending_slot(session)].lock();
+                if pending.is_empty() {
+                    None
+                } else {
+                    let n = core::cmp::min(count as usize, pending.len());
+                    Some(pending.drain(..n).collect::<alloc::vec::Vec<u8>>())
+                }
+            };
+            if let Some(head) = head {
+                let n = head.len() as u64;
+                publish_read(buf, &head)?;
+                return Ok(n);
+            }
+        }
+        // Скан-код кольца ИМЕННО этой сессии: физическое — у boot, кольцо
+        // `/dev/vtinput1` — у окна.
+        let sc = crate::drivers::ps2_kbd::take_scancode();
         let sc = match sc {
             Some(b) => b,
             None => {
@@ -2468,7 +2577,7 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
                 }
                 // Соблюдать O_NONBLOCK: блокировка здесь останавливала TUI-цикл
                 // nvim ещё до отрисовки первого кадра.
-                if STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
+                if STDIN_NONBLOCK[pending_slot(session)].load(core::sync::atomic::Ordering::Relaxed)
                     && (!consumed_any || spins > 200)
                 {
                     if !DIAG_STDIN_EAGAIN.swap(true, core::sync::atomic::Ordering::Relaxed) {}
@@ -2525,7 +2634,9 @@ fn read_stdin_raw(buf: u64, count: u64) -> Result<u64, Errno> {
         let n = core::cmp::min(count as usize, bytes.len());
         publish_read(buf, &bytes[..n])?;
         if n < bytes.len() {
-            STDIN_PENDING.lock().extend_from_slice(&bytes[n..]);
+            STDIN_PENDING[pending_slot(session)]
+                .lock()
+                .extend_from_slice(&bytes[n..]);
         }
         return Ok(n as u64);
     }
@@ -2536,11 +2647,12 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
     if count == 0 {
         return Ok(0);
     }
+    let session = crate::drivers::session::current();
     // `publish_read` подпирает страницы приёмника demand paging'ом и берёт
     // `COMPAT_STATES`, поэтому спинлок очереди отпускается до копии: держать
     // его через подпирание/аллокацию кадров нельзя (инвариант 3 AGENTS.md).
     let head = {
-        let mut pending = STDIN_PENDING.lock();
+        let mut pending = STDIN_PENDING[pending_slot(session)].lock();
         if pending.is_empty() {
             None
         } else {
@@ -2556,7 +2668,26 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
     let mut decoder = Decoder::new();
     let mut line: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     loop {
-        let sc = crate::drivers::get_char("keyboard").and_then(|kbd| kbd.read_char());
+        // Ввод окна приходит в очередь сессии, а не в физическое кольцо: без
+        // этой повторной проверки `read(2)` в cooked-режиме висел бы, пока
+        // пользователь не нажмёт клавишу на ФИЗИЧЕСКОЙ клавиатуре.
+        {
+            let head = {
+                let mut pending = STDIN_PENDING[pending_slot(session)].lock();
+                if pending.is_empty() {
+                    None
+                } else {
+                    let n = core::cmp::min(count as usize, pending.len());
+                    Some(pending.drain(..n).collect::<alloc::vec::Vec<u8>>())
+                }
+            };
+            if let Some(head) = head {
+                let n = head.len() as u64;
+                publish_read(buf, &head)?;
+                return Ok(n);
+            }
+        }
+        let sc = crate::drivers::ps2_kbd::take_scancode();
         let sc = match sc {
             Some(b) => b,
             None => {
@@ -2614,7 +2745,9 @@ fn read_stdin_line(buf: u64, count: u64) -> Result<u64, Errno> {
     copy_out_checked(buf, &line[..n])?;
     if n < line.len() {
         // Сохранить хвост: readline просит по одному байту за read(2).
-        STDIN_PENDING.lock().extend_from_slice(&line[n..]);
+        STDIN_PENDING[pending_slot(session)]
+            .lock()
+            .extend_from_slice(&line[n..]);
     }
     Ok(n as u64)
 }
@@ -3383,6 +3516,8 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
         F_GETFL | F_SETFL => {
             const O_NONBLOCK_FL: u64 = 0x800;
             const O_RDWR_FL: u64 = 2;
+            // stdin — терминал текущей консольной сессии (окно ≠ boot-shell).
+            let session = crate::drivers::session::current();
             compat::with_current_compat(|cs| {
                 let obj = cs.fds.get_mut(fd as u32).ok_or(Errno::EBADF)?;
                 if cmd == F_GETFL {
@@ -3392,9 +3527,8 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::UnixListener(l) => l.inner.lock().nonblocking,
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking,
                         // Stdin сообщает своё реальное состояние nonblocking.
-                        OpenObject::Stdin => {
-                            STDIN_NONBLOCK.load(core::sync::atomic::Ordering::Relaxed)
-                        }
+                        OpenObject::Stdin => STDIN_NONBLOCK[pending_slot(session)]
+                            .load(core::sync::atomic::Ordering::Relaxed),
                         _ => false,
                     };
                     Ok(if nb {
@@ -3417,7 +3551,8 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, Errno> {
                         OpenObject::UnixSocketUnbound { nonblocking } => *nonblocking = on,
                         // Libuv переключает O_NONBLOCK на сыром tty.
                         OpenObject::Stdin => {
-                            STDIN_NONBLOCK.store(on, core::sync::atomic::Ordering::Relaxed);
+                            STDIN_NONBLOCK[pending_slot(session)]
+                                .store(on, core::sync::atomic::Ordering::Relaxed);
                         }
                         _ => {}
                     }
