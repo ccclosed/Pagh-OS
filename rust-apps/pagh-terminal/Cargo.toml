@@ -30,7 +30,11 @@ pagh-desktop = { path = "../pagh-desktop" }
 
 [profile.release]
 panic = "abort"
-opt-level = "s"
+# opt-level=3 — это собственный код крейта, а не только pagh-ui: кадр кадра
+# рисуется здесь (render.rs::fill_pixel_run, Canvas::fill_rect, blend_pixel).
+# Замер кадра 900×600 (сетка 112×33, release+lto, host build, медиана 6
+# чередующихся прогонов): 0.655 мс на "s" против 0.590 мс на 3.
+opt-level = 3
 lto = true
 strip = true
 
