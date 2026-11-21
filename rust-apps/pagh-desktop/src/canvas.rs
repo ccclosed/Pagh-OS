@@ -8,6 +8,7 @@ use crate::color::{self, Color, TRANSPARENT};
 use crate::font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 use crate::geometry::{Point, Rect, Size};
 use crate::glyph::GlyphAtlas;
+use crate::shadow;
 use crate::surface::Surface;
 use crate::timing::{self, Stage};
 
@@ -775,6 +776,69 @@ impl Canvas {
         } else {
             copy(self, dst_rect);
         }
+    }
+
+    /// Наложить предкомпонованную тень окна: один слой, один проход.
+    ///
+    /// Пиксель [`shadow::ShadowSprite`] — не цвет, а профиль каскада (сколько чёрных
+    /// слоёв накрывает точку): таблица [`shadow::cascade_luts`] даёт точный
+    /// результат последовательных `blend(BLACK, alpha)` для любого значения
+    /// канала, поэтому байты кадра совпадают с [`Canvas::shadow`] там, где
+    /// тень видна (см. `shadow` для того, почему RGBA-предкомпоновка не может
+    /// быть точной). Отсечение damage пересекается со строкой один раз, как в
+    /// `blend_span`.
+    pub fn blit_shadow(&mut self, sprite: &shadow::ShadowSprite, dst: Point) {
+        let bounds = Rect::new(dst.x, dst.y, sprite.width, sprite.height);
+        let Some(bounds) = bounds.intersection(self.bounds()) else {
+            return;
+        };
+        let _stage = timing::Scope::new(Stage::Shadow);
+        let tables = shadow::cascade_luts();
+        let mut spans = [(0i32, 0i32); 8];
+        let mut covered = 0u64;
+        for row in sprite.rows() {
+            let y = dst.y + row.y;
+            if y < bounds.y || y >= bounds.bottom() {
+                continue;
+            }
+            let x0 = dst.x + row.x0;
+            let x1 = dst.x + row.x1;
+            match self.clip_spans(y, x0, x1, &mut spans) {
+                Some(count) => {
+                    for &(a, b) in &spans[..count] {
+                        covered += (b - a) as u64;
+                        for x in a..b {
+                            let profile = sprite.profiles[row.offset + (x - x0) as usize];
+                            self.shade(x, y, profile, tables);
+                        }
+                    }
+                }
+                None => {
+                    // Клипов больше, чем помещается в буфер: попиксельный путь.
+                    for x in x0..x1 {
+                        if !self.in_clip(x, y) {
+                            continue;
+                        }
+                        covered += 1;
+                        let profile = sprite.profiles[row.offset + (x - x0) as usize];
+                        self.shade(x, y, profile, tables);
+                    }
+                }
+            }
+        }
+        timing::count_blended(covered);
+    }
+
+    /// Применить каскад профиля `profile` к пикселю: точная таблица на канал.
+    #[inline]
+    fn shade(&mut self, x: i32, y: i32, profile: u8, tables: &[[u8; 256]; shadow::PROFILES]) {
+        let lut = &tables[profile as usize];
+        let index = y as usize * self.width as usize + x as usize;
+        let dst = self.pixels[index];
+        let red = lut[((dst >> 16) & 0xFF) as usize] as u32;
+        let green = lut[((dst >> 8) & 0xFF) as usize] as u32;
+        let blue = lut[(dst & 0xFF) as usize] as u32;
+        self.pixels[index] = 0xFF00_0000 | (red << 16) | (green << 8) | blue;
     }
 
     /// Скопировать участок холста (используется для проверки damage в тестах).
