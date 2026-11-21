@@ -493,15 +493,19 @@ application cursor, bracketed paste, mouse) из неё не наблюдаем�
 
 | ситуация | поведение |
 |---|---|
-| `exit` в сессии → `ENODEV` | плашка «the shell session has ended / Press Enter to start a new session in this window»; окно **остаётся**, Enter переоткрывает `vtfb1`/`vtinput1` и ядро поднимает новую сессию в том же окне |
+| `exit` в сессии → `ENODEV` | плашка «the shell session has ended / Press Enter to start a new session in this window, or Esc to close it»; окно **остаётся**, Enter/Space переоткрывает `vtfb1`/`vtinput1` и ядро поднимает новую сессию в том же окне, Esc закрывает окно |
 | `/dev/vtfb1` или `/dev/vtinput1` нет (`ENOENT`, старое ядро) | честная строка в stderr + откат на pipe-сессию (`--pipe-shell`-путь) |
 | устройство есть, но ioctl/mmap/read/write не работают | честное сообщение **в окне** + код возврата 2, без отката в демо |
 | mmap поверхности недоступен | `read()`-снимки (задокументированный fallback) |
 | кадр короче `stride*height` | `ShortRead` — ошибка, а не наполовину нарисованный кадр |
 
 Реконнект — **в том же окне**: сессию спавнит ядро на первом `open`, поэтому
-клиент после `ENODEV` не закрывает окно и не делает второй `create`, а ждёт
-Enter и переоткрывает устройства (`FrameSource::respawn` + `InputSink::respawn`).
+клиент после `ENODEV` не закрывает окно и не делает второй `create`, а плашкой
+ждёт Enter/Space и переоткрывает устройства (`wait_for_restart` →
+`FrameSource::respawn` + `InputSink::respawn`).  Это единственный restart-UX
+клиента: тот же `wait_for_restart`/`draw_notice_frame` расширяет и #167, поэтому
+семантика при объединении веток не меняется (Enter/Space — новая сессия в этом
+окне, Esc — окно закрывается).
 Второго окна не появляется, `duplicate window` при respawn невозможен, а
 композитор не видит ни нового клиента, ни нового окна.  Закрыть окно насовсем —
 кнопкой композитора; тогда при следующем запуске приложения окно создаётся

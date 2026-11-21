@@ -1450,10 +1450,6 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     let mut dirty = true;
     let mut last_commit = Instant::now();
     let mut input_error_reported = false;
-    // Сессия завершилась (`exit` -> ENODEV): окно осталось, ждём Enter, чтобы
-    // переоткрыть устройство и поднять новую сессию в ЭТОМ же окне.
-    let mut awaiting_respawn = false;
-    let mut notice_pending = false;
     // `--vt-trace` (или переменная окружения) печатает каждый отрисованный
     // кадр: в гостевой консоли это serial-доказательство того, что generation
     // растёт с выводом сессии, а не «кадр застыл».
@@ -1462,15 +1458,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     loop {
         // 1. Кадр сессии: перерисовываем окно только когда ядро опубликовало
         //    новый generation — иначе простой не жжёт CPU на блит.
-        if awaiting_respawn && notice_pending {
-            let canvas = canvas_mut(&mut shm, &mut fallback);
-            render_notice(canvas, &theme, ENDED_NOTICE);
-            notice_pending = false;
-            dirty = true;
-        }
-        if awaiting_respawn {
-            // Кадр не блитится: поверхность принадлежала завершившейся сессии.
-        } else {
+        {
             let canvas = canvas_mut(&mut shm, &mut fallback);
             match frame.draw_if_changed(canvas, &theme) {
                 Ok(Draw::Drawn { generation }) => {
@@ -1481,14 +1469,52 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                 }
                 Ok(Draw::Unchanged) => {}
                 Err(VtFbError::Ended) => {
-                    // Честная плашка и ожидание Enter: сессия ядра закончилась,
-                    // но окно — нет. Это и есть respawn без второго окна.
-                    awaiting_respawn = true;
-                    notice_pending = true;
+                    // `exit` в сессии завершил её (`ENODEV`) — окно НЕ закрывается
+                    // само: плашка, Enter/Space поднимает новую сессию в этом же
+                    // окне, Esc закрывает. Это тот самый restart-UX, который #167
+                    // расширяет (та же семантика, тот же путь).
                     diag.line(
                         "kernel session ended (the shell exited); window kept, \
-                         press Enter to restart the session",
+                         waiting for Enter to restart the session",
                     );
+                    let restart = wait_for_restart(&mut client, &mut shm, &theme, width, height)?;
+                    if !restart {
+                        let _ = client.close();
+                        diag.line("kernel session ended; window closed");
+                        return Ok(());
+                    }
+                    match respawn_kernel_session(&mut frame, &mut forwarder, &mut diag) {
+                        Ok(()) => {
+                            // `draw_notice_frame` отпустил ShmSurface: дальше
+                            // полный кадр в локальный холст (как legacy-путь).
+                            fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));
+                            tracker.resize(pagh_ui::geom::Rect::new(
+                                0,
+                                0,
+                                width as i32,
+                                height as i32,
+                            ));
+                            dirty = true;
+                        }
+                        Err(error) => {
+                            let message = error.message();
+                            diag.line(&format!("cannot restart the session: {message}"));
+                            let _ = end_kernel_session(
+                                &mut client,
+                                &mut shm,
+                                &mut diag,
+                                &theme,
+                                width,
+                                height,
+                                &[
+                                    "[kernel session] the session ended and could not be restarted",
+                                    "",
+                                    message.as_str(),
+                                ],
+                            );
+                            return Err(message);
+                        }
+                    }
                 }
                 Err(error) => {
                     let message = error.message();
@@ -1608,45 +1634,6 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     code,
                     pressed,
                     modifiers,
-                }) if awaiting_respawn => {
-                    // Любая клавиша (в первую очередь Enter) — просьба поднять
-                    // новую сессию: переоткрываем vtinput1 и vtfb1. Старые fd
-                    // принадлежали завершившейся сессии, поэтому open спавнит
-                    // новую, а окно остаётся тем же.
-                    let _ = code;
-                    let _ = modifiers;
-                    if pressed {
-                        match respawn_kernel_session(&mut frame, &mut forwarder, &mut diag) {
-                            Ok(()) => {
-                                awaiting_respawn = false;
-                                notice_pending = false;
-                                dirty = true;
-                            }
-                            Err(error) => {
-                                let message = error.message();
-                                diag.line(&format!("cannot restart the session: {message}"));
-                                let _ = end_kernel_session(
-                                    &mut client,
-                                    &mut shm,
-                                    &mut diag,
-                                    &theme,
-                                    width,
-                                    height,
-                                    &[
-                                        "[kernel session] the session ended and could not be restarted",
-                                        "",
-                                        message.as_str(),
-                                    ],
-                                );
-                                return Err(message);
-                            }
-                        }
-                    }
-                }
-                Event::Input(InputEvent::Key {
-                    code,
-                    pressed,
-                    modifiers,
                 }) => match forwarder.handle_key(code, pressed, modifiers) {
                     Ok(_) => {}
                     Err(error) if is_session_end(&error) => {
@@ -1690,17 +1677,72 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     }
 }
 
-/// Что показать в окне, когда `exit` в сессии ядра завершил её (`ENODEV`).
-///
-/// Окно при этом НЕ закрывается: Enter переоткрывает устройство, ядро поднимает
-/// новую сессию, и она продолжается в том же окне. Именно поэтому respawn не
-/// создаёт второе окно и не упирается в `duplicate window`.
+/// Плашка завершившейся сессии — общая для `wait_for_restart` (#167 расширяет
+/// тот же путь, семантика не меняется).
 const ENDED_NOTICE: &[&str] = &[
     "[kernel session] the shell session has ended.",
     "",
-    "Press Enter to start a new session in this window.",
-    "The window itself stays: no second window is created.",
+    "Press Enter to start a new session in this window,",
+    "or Esc to close it. Nothing is simulated in the meantime.",
 ];
+
+/// Нарисовать плашку клиента в окне и отдать её композитору.
+///
+/// Имя и сигнатура совпадают с #167: там тот же кадр рисуется перед
+/// `wait_for_restart`, и объединение веток не должно менять поведение.
+fn draw_notice_frame(
+    client: &mut SurfaceClient,
+    shm: &mut Option<ShmFrame>,
+    theme: &Theme,
+    width: u32,
+    height: u32,
+    lines: &[&str],
+) -> Result<(), String> {
+    if let Some(stale) = shm.take() {
+        let _ = client.release_shm(&stale);
+    }
+    let mut canvas = Canvas::new(width.max(64) as usize, height.max(32) as usize, theme.bg);
+    render_notice(&mut canvas, theme, lines);
+    commit_blocking(client, &canvas)?;
+    Ok(())
+}
+
+/// Показать плашку завершившейся сессии и дождаться решения.
+///
+/// Семантика — общая с #167: Enter/Space → `Ok(true)` (поднять новую сессию в
+/// ЭТОМ окне), Esc или закрытие окна сервером → `Ok(false)` (окно закрывается).
+/// Сам перезапуск устройств делает вызывающий: в #147 это
+/// [`respawn_kernel_session`], в #167 — его attach-код; путь один.
+fn wait_for_restart(
+    client: &mut SurfaceClient,
+    shm: &mut Option<ShmFrame>,
+    theme: &Theme,
+    width: u32,
+    height: u32,
+) -> Result<bool, String> {
+    draw_notice_frame(client, shm, theme, width, height, ENDED_NOTICE)?;
+    loop {
+        for event in client
+            .poll_events(Duration::ZERO)
+            .map_err(|e| format!("poll: {e}"))?
+        {
+            match event {
+                Event::Input(InputEvent::Key {
+                    code,
+                    pressed: true,
+                    ..
+                }) => match code {
+                    keys::evdev::KEY_ENTER | keys::evdev::KEY_SPACE => return Ok(true),
+                    keys::evdev::KEY_ESC => return Ok(false),
+                    _ => {}
+                },
+                Event::Close { .. } => return Ok(false),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
 
 /// Поднять новую сессию ядра в том же окне: переоткрыть ввод и поверхность.
 ///
