@@ -4,6 +4,18 @@
 
 Запись длится 24 с, 15 fps, от загрузки до панели `settings` с темой `synth` и живыми обоями.
 
+**Что именно записано.** Это **консольный вариант A** на ядре 2.18.12 (shell, `paint`,
+`nano+`, `settings`); медиа не переснималось после появления desktop-варианта B
+(userspace-композитор, [`desktop-b.md`](desktop-b.md)), и текущий demo-бандл грузит уже
+desktop. Кадры не постановочные — устарел только сюжет, а не способ съёмки.
+
+**Канал релиза.** Demo — третий, нестабильный канал: тег содержит `-demo` (сейчас
+`2.24.0-demo`) либо образ собран из ветки `integration/demo`, и такая запись **обязана**
+быть GitHub **Pre-release** (`prerelease: true`), никогда не Latest и не описываться как
+production-ready; Latest остаётся за stable `vX.Y.Z` из `main` (правило #154, чек-лист —
+`RELEASING.md`). Старый `2.18.12-demo` опубликован без флага — это ровно та ошибка, против
+которой правило.
+
 ## Как это записывалось
 
 1. Собрать и застейджить ядро как обычно:
@@ -43,14 +55,29 @@
 
 ## Бандл `pagh-demo-x86_64.tar.gz`
 
-Релизный бандл — это просто staged-ядро с загрузчиком на FAT-образе и лаунчер:
+Опубликованный архив распаковывается в каталог `pagh-demo-x86_64/` (поэтому в README
+команда `tar xzf … && cd pagh-demo-x86_64`), в нём — `run.sh` и готовый `pagh-boot.img`
+(образ с ESP и системным томом; самодостаточный, тулчейн Rust не нужен). Лаунчер бандла
+ищет объединённый `OVMF.fd` или сплит-пару `OVMF_CODE.fd`/`OVMF_VARS.fd`, при первом запуске
+копирует vars-шаблон рядом с собой и грузит QEMU (`-machine pc -cpu max -m 2048M`) с образом
+как диском; `PAGH_HEADLESS=1 ./run.sh` грузится без окна и пишет `pagh-serial.log`,
+`./run.sh --iso` грузит ISO-вариант вместо USB-образа. Desktop стартует сам: рецепт
+`/mnt/etc/autorun` уже внутри тома (см. `--autorun` у `tools/mkimage.py`).
+
+Собрать такой бандл из исходников (после `python3 tools/build.py stage --release`):
 
 ```sh
-# из корня репозитория, после `python3 tools/build.py stage --release`
+# ESP с ядром и конфигом Limine
 dd if=/dev/zero of=pagh-boot.img bs=1M count=64
 mkfs.vfat -F 32 -n PAGH pagh-boot.img
 mcopy -i pagh-boot.img -s iso_root/* ::
-tar czf pagh-demo-x86_64.tar.gz pagh-boot.img run.sh TRY-IT.md README.txt
+# верхний каталог — ровно как в опубликованном архиве
+mkdir -p pagh-demo-x86_64 && cp pagh-boot.img run.sh pagh-demo-x86_64/
+tar czf pagh-demo-x86_64.tar.gz pagh-demo-x86_64/
 ```
 
-Лаунчер находит объединённый `OVMF.fd` или сплит-пару `OVMF_CODE.fd`/`OVMF_VARS.fd`, создаёт при первом запуске `disk.img` на 256 MiB и грузит QEMU с образом как UEFI boot-диском и virtio-blk data-диском. `PAGH_HEADLESS=1 ./run.sh` грузится без окна и пишет `pagh-serial.log`.
+Репозиторный `run.sh` — не тот же файл, что в бандле: в бандле лежит самостоятельный
+лаунчер (только QEMU + OVMF, без сборки). Системный том с desktop собирается
+`python3 tools/mkimage.py` (`--make-disk`/`--usb`/`--iso`) плюс `--autorun
+rust-apps/pagh-desktop/desktop-autorun`: без рецепта образ загрузится в консольный shell
+без desktop, и это ожидаемо.
