@@ -25,6 +25,8 @@ Framebuffer-shell с редактированием строки, историе
 | `selection.rs` | Выделение мышью: диапазон клеток, подсветка инверсией, копирование текста из модели экрана; `Ctrl+A` — выделить строку, `Ctrl+X` — вырезать, `Ctrl+Y`/`Ctrl+V` — вставить |
 | `caret.rs` | Мигающая каретка: клетка из позиции консоли и логического курсора (`Caret::cell_for`), отрисовка/стирание вертикальной черты (`paint_caret`), фаза мигания по тикам |
 | `path.rs` | Глобальный CWD под `Spinlock<String>`; чистые `normalize` (фолдинг `.`/`..`, кламп в корень), `resolve`, `cwd`, `set_cwd` |
+| `lxpath.rs` | Чистый (core+alloc) поиск программы по PATH для `lxrun <program>` и shell-fallback: `DEFAULT_PATH` (`/mnt/usr/bin:/usr/bin:/bin`), `is_bare_name` (execvp-правило `/`), `search_dirs` (env-компоненты первыми, затем default; пустые пропускаются, дубли схлопываются), `candidates`, `display_dirs`; host-свойство `lxpath_paths` |
+| `getopt.rs` | Чистый (core+alloc) POSIX/GNU getopt: таблица `OptSpec` (`short`/`long`/`short_value`/…), группировка `-la`, `--`, `--name=value`, приклеенный/отдельный аргумент, `Item::{Opt, Operand}`, честная `Error` на неизвестную опцию; host-свойство `getopt_args` |
 | `suggest.rs` | Bounded Levenshtein `edit_distance`, `nearest_command` для «did you mean» |
 | `paint.rs` | Оконная рисовалка (~1470 строк): title bar, toolbar, taskbar, canvas `Vec<u32>` |
 | `nano.rs` | `nano+` полноэкранный редактор: `Editor`, undo/redo, поиск/замена/goto, clipboard, мигающая каретка, сайдбар с деревом файлов (`^B`) |
@@ -43,6 +45,9 @@ Framebuffer-shell с редактированием строки, историе
 - `identity::{current, set_session, load_users, load_groups, display_groups_for_user, supplementary_groups_for_user, session_groups}`
 - `identity_db::{parse_passwd, parse_group, user_by_name, groups_for_user, supplementary_groups_for_user}`
 - `path::{normalize, resolve, cwd, set_cwd}`
+- `lxpath::{is_bare_name, search_dirs, candidates, display_dirs, DEFAULT_PATH}`;
+  `commands::{find_path_program, run_lxrun}`
+- `getopt::{parse, OptSpec, Item, Error, short, long, short_value}`
 - `suggest::{edit_distance, nearest_command}`
 - `paint::run()`, `nano::run(path)`; `rust` = алиас `lxrun`, `cargo`/`rustc` = установленные бинарники через Linux-слой
 
@@ -61,8 +66,11 @@ Framebuffer-shell с редактированием строки, историе
    ровно один `framebuffer::flush()`.
 5. События: вставка, Backspace/Delete, стрелки/Home/End, Up/Down история, Tab, Enter →
    `execute_command`.
-6. `execute_command`: split по `&&`, токенизация, `registry::lookup` → вызов хендлера;
-   неизвестное → `error_line` + `nearest_command` «did you mean».
+6. `execute_command`: split по `&&`, токенизация, `registry::lookup` → вызов хендлера.
+   Не встроенное голое имя (без `/`) — PATH-поиск `lxpath`+`commands::find_path_program`
+   и запуск найденного Linux ELF общим путём `commands::run_lxrun` (как `lxrun`, без
+   префикса); не найдено → `command not found in PATH (searched: …)` + `nearest_command`
+   «did you mean». Имя с `/` остаётся путём: `Unknown command`.
 
 **Выделение и буфер обмена**: левая кнопка мыши с протяжкой выделяет текст консоли
 (подсветка — инверсия клеток), при отпускании текст уходит в буфер обмена сессии;
@@ -99,6 +107,25 @@ Shift+букву строчной при выключенном CapsLock. Пок
 Без whitespace → `complete_command`; иначе `readdir()` родителя токена через VFS →
 чистая `complete_path`. `Single` заменяет токен; `Multiple` расширяет до LCP и листит кандидатов.
 
+## PATH-поиск и getopt-формы
+
+`lxrun` ищет по PATH только имя без `/` (правило `execvp`): база
+`/mnt/usr/bin:/usr/bin:/bin`, поверх неё — непустые компоненты `PATH` из окружения,
+в котором `lxrun` запускает ребёнка. `/usr/bin` и `/bin` в этой ОС достижимы через
+`/mnt`-fallback полного пути, поэтому поиск пробует и `/mnt`-вариант. Кандидат
+принимается, если узел существует, не каталог и начинается с ELF64-заголовка Linux
+x86_64 (`elf_classify::looks_like_linux_elf`); полный вердикт всё равно даёт
+загрузчик. Ненайденное имя даёт `not found in PATH (searched: …)` со списком
+каталогов — другого бинаря молча не запускается. Диспетчер shell применяет тот же
+поиск к голому имени, поэтому `fastfetch` работает без префикса `lxrun`; встроенные
+команды срабатывают раньше и не затеняются.
+
+Опции команд разбирает `getopt` (таблица `OptSpec` на команду): `-la` = `-l -a`,
+`--` завершает опции, `--name=value` и `-n5`/`-n 5` равносильны, неизвестная опция —
+`unknown option: …` + usage. Пути с `/` (`./fastfetch`) остаются путями и не ищутся.
+`mount`/`umount` — честные заглушки: `mount(2)`/`umount2(2)` в ядре ещё нет
+(отложено до USB S1), блочными устройствами занимается `disk`.
+
 ## Консоль: скроллбек
 
 Колесо PS/2-мыши и `PageUp`/`PageDown` листают историю консоли (3 строки на щелчок
@@ -125,18 +152,23 @@ Shift+букву строчной при выключенном CapsLock. Пок
 `python`/`python3`, `pythonc`, `cargo`, `rustc`, `rust`, `paint`,
 `pkg <host> <path> [port]` (HTTP GET .deb → ar → decompress → tar → install в /mnt),
 `ppkg <update|install|show|list|setmirror>` (`install` принимает `--quiet` и
-`--progress=ansi|cr|plain`, рисуя DNF-style прогресс), `lxrun <path> [args]` (Linux ELF в ring 3,
-fixed env `TERM=xterm`, `PATH=/mnt/usr/bin`; забирает терминал у shell'а на время
-работы — см. «Job control»), `jobs`, `fg`, `bg`, `warn <on|off>` (тумблер fb-зеркала
-warn-логов), `usb` (состояние xHCI и PORTSC каждого порта), `disk`
+`--progress=ansi|cr|plain`, рисуя DNF-style прогресс), `lxrun [path|program] [args]`
+(Linux ELF в ring 3; голое имя без `/` ищется по PATH, полный путь — как раньше; fixed env
+`TERM=xterm`, `PATH=/mnt/usr/bin`; забирает терминал у shell'а на время работы — см.
+«Job control»), `jobs`, `fg`, `bg`, `warn <on|off>` (тумблер fb-зеркала warn-логов), `usb`
+(состояние xHCI и PORTSC каждого порта), `disk`
 (`list`/`setup`/`mount <n>`/`format <n> [--force]`/`cancel` — блочные устройства и
-явное форматирование), `settings`/`theme`/`wallpaper` (тема, фон, статус-бар, каретка).
+явное форматирование), `mount`/`umount` (**не реализованы**: `mount(2)`/`umount2(2)`
+отложены до USB S1; печатают честное сообщение и отсылают к `disk`), `settings`/`theme`/
+`wallpaper` (тема, фон, статус-бар, каретка). POSIX-формы опций: `ls [-l] [-a]`, `id
+[-u|-g|-G] [-n]`, `df [-h|-H]`, `ps [-e] [-f]`, `nano [path] | nano --settings …`; опции
+разбирает `getopt`, неизвестная — ошибка с usage, а не тихий no-op.
 
 ## Команды `ps` и `df`: что они честно показывают
 
 - `ps` печатает и Linux-compat процессы (строки собираются из `/proc/<pid>/stat`
   и `/proc/<pid>/cmdline`), и **kernel-потоки** из таблицы имён планировщика
-  (`task::scheduler::task_names_snapshot`) как `[shell]`, `[net]`, … До этого в
+  (`task::scheduler::task_names_snapshot`) как `[shell]`, `[inputd]`, `[netd]`, … До этого в
   сессии без запущенной программы выводился один заголовок — то есть «в системе
   нет процессов», ровно наоборот к смыслу команды. Состояние `T` — задача
   припаркована в `STOPPED_TASKS`, иначе `R`; PPID kernel-потока — 0, как у

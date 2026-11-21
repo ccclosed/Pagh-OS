@@ -38,7 +38,7 @@ const LIST_HEADER: i32 = 24;
 /// Шаг прокрутки колесом.
 const WHEEL_STEP: i32 = 48;
 /// Прямоугольник иконки в ячейке сетки — как `ICON_WIDTH`/`ICON_HEIGHT`
-/// в `pagh_ui::widgets` (значения там приватные). По нему стирается
+/// в `pagh_ui::widgets` (значения там приватные). По нему закрывается
 /// векторный глиф перед отрисовкой готового растра.
 const GRID_ICON_WIDTH: i32 = 40;
 const GRID_ICON_HEIGHT: i32 = 32;
@@ -1212,12 +1212,28 @@ impl FilesApp {
                 icon_size,
                 icon_size,
             );
-            let tint = if self.sidebar_selected == Some(*id) {
+            let selected = self.sidebar_selected == Some(*id);
+            let tint = if selected {
                 palette.sidebar_text_selected
             } else {
                 palette.sidebar_text
             };
-            draw_glyph(canvas, place.glyph, icon_rect, tint, true);
+            // `List::draw` кладёт подсветку пункта до глифа — повторяем её
+            // цвет, чтобы закрыть глиф ровно фоном пункта.
+            let overlay = if selected {
+                Some(palette.sidebar_selected)
+            } else if self.sidebar_hover == Some(*id) {
+                Some(palette.selection.with_alpha(90))
+            } else {
+                None
+            };
+            draw_glyph(
+                canvas,
+                place.glyph,
+                icon_rect,
+                tint,
+                Some(cell_backdrop(palette.sidebar, overlay)),
+            );
         }
     }
 
@@ -1269,7 +1285,24 @@ impl FilesApp {
                             GRID_ICON_WIDTH,
                             GRID_ICON_HEIGHT,
                         );
-                        draw_entry_icon(canvas, entry, icon_rect, palette, true);
+                        // `Grid::draw` пропускает ячейки, которые не влезают по
+                        // высоте, — вместе с их векторным глифом. Там закрывать
+                        // нечего; иначе мы нарисовали бы подсветку, которой
+                        // виджет не рисовал.
+                        let drawn = cell.bottom() <= area.bottom() && cell.y <= area.bottom();
+                        let overlay = if self.selected == Some(index) {
+                            Some(palette.selection.with_alpha(120))
+                        } else if self.hovered == Some(index) {
+                            Some(Color::rgba(255, 255, 255, 10))
+                        } else {
+                            None
+                        };
+                        let backdrop = if drawn {
+                            Some(cell_backdrop(palette.window, overlay))
+                        } else {
+                            None
+                        };
+                        draw_entry_icon(canvas, entry, icon_rect, palette, backdrop);
                     }
                 }
                 ViewMode::List => self.draw_list(canvas, area),
@@ -1367,7 +1400,7 @@ impl FilesApp {
                 );
             }
             let icon_rect = Rect::new(row.x + 8, row.y + (LIST_ROW - 14) / 2, 14, 14);
-            draw_entry_icon(canvas, entry, icon_rect, palette, false);
+            draw_entry_icon(canvas, entry, icon_rect, palette, None);
             let name = font::ellipsize(&entry.name, columns[0].w - 34);
             font::draw(
                 canvas,
@@ -2171,17 +2204,17 @@ fn legacy_icon(glyph: FluentIcon) -> Icon {
 
 /// Нарисовать значок записи готовым растром.
 ///
-/// `erase` — прямоугольник, где виджет сетки/сайдбара уже нарисовал векторный
-/// глиф: его нужно закрыть фоном, иначе полупрозрачные края растра оставят
-/// двойной контур. Для подробного списка векторного глифа нет, и стирание не
-/// нужно. Фон берётся из самого холста рядом с иконкой, поэтому выделение и
-/// наведение сохраняются без повторения логики виджета.
+/// `backdrop` — ровный фон ячейки/строки, который виджет сетки или сайдбара
+/// уже нарисовал вместе с векторным глифом того же смысла. Растр заменяет
+/// глиф, поэтому площадку под ним надо закрыть этим фоном: иначе
+/// полупрозрачные края растра лягут поверх векторного контура и получится
+/// двойная обводка. В подробном списке векторного глифа нет — там `None`.
 fn draw_entry_icon(
     canvas: &mut Canvas,
     entry: &DirEntry,
     rect: Rect,
     palette: &pagh_ui::theme::Palette,
-    erase_vector: bool,
+    backdrop: Option<Color>,
 ) {
     let glyph = entry_icon(entry);
     let tint = if entry.is_dir() {
@@ -2189,22 +2222,48 @@ fn draw_entry_icon(
     } else {
         palette.text_muted
     };
-    draw_glyph(canvas, glyph, rect, tint, erase_vector);
+    draw_glyph(canvas, glyph, rect, tint, backdrop);
 }
 
-/// Общий путь отрисовки готовой иконки: центр `rect`, тинт, опционально
-/// стирание векторного глифа.
-fn draw_glyph(canvas: &mut Canvas, glyph: FluentIcon, rect: Rect, tint: Color, erase_vector: bool) {
+/// Фон ячейки под готовой иконкой: база (окно/сайдбар) плюс подсветка
+/// выделения или наведения — ровно в том порядке, в каком её кладёт виджет
+/// (`Grid::draw`/`List::draw` в `pagh_ui::widgets`).
+///
+/// Раньше этот фон сэмплировался одним пикселем слева от иконки. Это работает,
+/// пока иконка целиком лежит внутри ячейки, и ломается, как только ячейка
+/// прокручена под панель инструментов: сэмпл берётся уже из соседнего виджета,
+/// и готовая иконка оказывается на прямоугольнике чужого цвета. Цвет считается
+/// из палитры и состояния ячейки, поэтому верен всегда и не зависит от того,
+/// что успело лечь на холст.
+fn cell_backdrop(base: Color, overlay: Option<Color>) -> Color {
+    match overlay {
+        Some(overlay) => overlay.blend_over(base),
+        None => base,
+    }
+}
+
+/// Общий путь отрисовки готовой иконки: центр `rect`, тинт и закрытие
+/// векторного глифа фоном (см. [`cell_backdrop`]).
+fn draw_glyph(
+    canvas: &mut Canvas,
+    glyph: FluentIcon,
+    rect: Rect,
+    tint: Color,
+    backdrop: Option<Color>,
+) {
     let size = icons::best_size(rect);
     let Some(raster) = icons::raster(glyph, size) else {
         return;
     };
-    if erase_vector {
-        // Расширяем зону стирания: растр 16 px чуть больше 14-пиксельного
-        // прямоугольника списка и должен закрыть векторный глиф целиком.
-        let erase = Rect::new(rect.x - 2, rect.y - 2, rect.w + 4, rect.h + 4);
-        let backdrop = canvas.pixel(Point::new(erase.x - 4, erase.center().y));
-        canvas.fill(erase, backdrop);
+    if let Some(backdrop) = backdrop {
+        // Векторный глиф рисуется внутри `rect`; ±2 закрывают его сглаженные
+        // края. Растр бывает на размер больше `rect` (16 px в 14-пиксельной
+        // строке списка) — его собственные полупрозрачные края лягут на тот же
+        // фон, потому что фон уже восстановлен.
+        canvas.fill(
+            Rect::new(rect.x - 2, rect.y - 2, rect.w + 4, rect.h + 4),
+            backdrop,
+        );
     }
     let dst = Rect::new(
         rect.x + (rect.w - raster.width as i32) / 2,
@@ -2523,6 +2582,60 @@ mod tests {
 
         let mut canvas = Canvas::filled(app.size().w, app.size().h, Color::hex(0x101010));
         app.draw(&mut canvas);
+    }
+
+    /// Двойной клик по каталогу в сетке открывает его: `cwd` меняется, наружу
+    /// команда не уходит — навигация внутренняя. Синтез `Event::DoubleClick`
+    /// из двух press'ов живёт в `pagh-ui::client` (F3.1).
+    #[test]
+    fn double_click_directory_navigates_into_it() {
+        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        let index = app
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "Documents")
+            .expect("Documents в домашнем каталоге");
+        let rect = app.item_rect(index).expect("ячейка сетки");
+        let commands = app.handle_event(&Event::DoubleClick { pos: rect.center() });
+        assert!(
+            commands.is_empty(),
+            "навигация не выходит наружу: {commands:?}"
+        );
+        assert_eq!(app.cwd(), "/home/user/Documents");
+        assert!(app.error().is_none(), "{:?}", app.error());
+        assert!(app.can_go_back(), "переход попал в историю");
+        assert_eq!(app.location_label(), "Документы");
+    }
+
+    /// То же на реальной ФС: двойной клик по каталогу входит в него и
+    /// показывает его содержимое (FakeVfs-случай не единственный путь).
+    #[test]
+    fn double_click_real_directory_lists_its_contents() {
+        let home = temp_home("dblclick");
+        let mut app = FilesApp::new(Box::new(HostVfs::with_home(home.to_string_lossy())), SIZE);
+        // Канонические XDG-каталоги создаёт сам Files при старте — файл
+        // кладём после этого, чтобы он появился в листинге без ошибок.
+        std::fs::write(home.join("Documents").join("план.txt"), b"ok").unwrap();
+        let index = app
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "Documents")
+            .expect("Documents на реальной ФС");
+        let rect = app.item_rect(index).expect("ячейка сетки");
+        let commands = app.handle_event(&Event::DoubleClick { pos: rect.center() });
+        assert!(
+            commands.is_empty(),
+            "навигация не выходит наружу: {commands:?}"
+        );
+        assert_eq!(
+            app.cwd(),
+            format!("{}/Documents", home.to_string_lossy()),
+            "двойной клик открыл каталог"
+        );
+        let names: Vec<&str> = app.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["план.txt"]);
+        assert!(app.error().is_none(), "{:?}", app.error());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     /// «Устройства» — реальные точки монтирования: без `/mnt` пункт не

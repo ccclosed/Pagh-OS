@@ -226,20 +226,32 @@ pub fn init(screen_w: usize, screen_h: usize) -> bool {
     ok
 }
 
-/// IRQ12 handler — read one byte from the mouse stream and assemble packets.
+/// IRQ12 handler — read one byte from the mouse stream and queue it.
+///
+/// Пакет собирает поток `inputd`, а не IRQ: сборщик трогает `MOUSE` и зовёт
+/// `evdev::feed_mouse`, то есть у него есть потребители, которых в IRQ-контексте
+/// быть не должно. Здесь остаётся ровно чтение порта и запись байта в очередь.
 pub fn irq_handler() {
     // SAFETY: standard PS/2 data-port read in IRQ context.
     let byte: u8 = unsafe { Port::<u8>::new(DATA_PORT).read() };
-    decode_byte(byte);
+    crate::drivers::inputd::push_aux(byte);
 }
 
 /// Inject a complete PS/2-format packet from another pointing device (USB HID).
 ///
 /// The USB boot mouse report is `[buttons, dx, dy]` — the same information the
 /// 8042 aux stream carries — so it is converted by the caller into this packet
-/// shape and fed through the same decoder, which keeps cursor clamping, button
-/// state and `seq` semantics identical for both sources.
+/// shape. The packet is QUEUED for `inputd`; the decoder itself is
+/// [`commit_packet`], shared by both sources, so cursor clamping, button state and
+/// `seq` semantics stay identical.
 pub fn inject_packet(packet: [u8; 3]) {
+    crate::drivers::inputd::push_mouse_packet(packet);
+}
+
+/// Декодировать готовый пакет (диспетчер `inputd`; также USB-путь до разделения
+/// на очередь). Сброс `index` намеренный: пакет неделим и не продолжает
+/// недособранный поток 8042.
+pub(crate) fn commit_packet(packet: [u8; 3]) {
     let mut m = MOUSE.lock();
     m.packet = [packet[0], packet[1], packet[2], 0];
     m.index = 0;
@@ -285,6 +297,11 @@ fn decode_packet(m: &mut MouseInner) {
     // как REL_X/REL_Y в screen-координатах (PS/2 dy положителен вверх, а Linux
     // REL_Y — вниз, поэтому знак переворачивается), колесо как REL_WHEEL.
     crate::drivers::evdev::feed_mouse(dx, -dy, dz, flags & 0x07);
+}
+
+/// Один байт aux-потока PS/2 — точка входа диспетчера `inputd`.
+pub(crate) fn feed_aux_byte(byte: u8) {
+    decode_byte(byte);
 }
 
 /// Feed one byte of the PS/2 aux stream through the assembler.

@@ -77,6 +77,21 @@ pub mod shadow;
 #[path = "../../src/shell/identity_db.rs"]
 pub mod identity_db;
 
+// `lxpath` — чистый поиск программы по PATH для `lxrun <program>` и
+// shell-fallback'а голого имени: каталоги PATH (env поверх default), кандидаты
+// `dir/name` и список для диагностики. `core`+`alloc`-only, без VFS/консоли,
+// поэтому host-свойство `lxpath_paths` исполняет ровно тот исходник, который
+// компилирует ядро; проба VFS живёт в `shell/commands.rs`.
+#[path = "../../src/shell/lxpath.rs"]
+pub mod lxpath;
+
+// `getopt` — чистый POSIX/GNU-парсер опций: группировка `-la`, `--`, длинные
+// опции, опция с аргументом (`-n5`/`-n 5`), честная ошибка на неизвестную
+// опцию. `core`+`alloc`-only; host-свойство `getopt_args` проверяет правила на
+// случайных кластерах/операндах.
+#[path = "../../src/shell/getopt.rs"]
+pub mod getopt;
+
 #[path = "../../src/arch/x86_64/linux/rand_clock.rs"]
 pub mod rand_clock;
 
@@ -431,6 +446,14 @@ pub mod fb_abi;
 #[path = "../../src/drivers/input_event.rs"]
 pub mod input_event;
 
+// Кольцо сырого ввода `inputd` (`src/drivers/input_ring.rs`): FIFO фиксированной
+// ёмкости с политикой «переполнение отвергает НОВЫЙ элемент». `core`-only и без
+// зависимостей, поэтому свойство `p66` исполняет ровно тот исходник, который
+// компилирует ядро, и модель (VecDeque) доказывает отсутствие потерь/дублей и
+// сохранение порядка на любых последовательностях push/pop.
+#[path = "../../src/drivers/input_ring.rs"]
+pub mod input_ring;
+
 // Shared VT surface ABI (`/dev/vtconsole0`) и перевод VT-байтов в PS/2
 // scancodes (`/dev/vtinput`). Оба модуля `core`-only: host-тесты проверяют
 // байтовую раскладку/валидатор/seqlock и таблицу ввода без QEMU.
@@ -681,6 +704,14 @@ mod properties {
     // percent/speed/size/ETA widgets, the 10 FPS redraw gate, the ANSI repaint
     // sequence and the carriage-return/plain fallbacks.
     mod ppkg_progress_ui;
+    // Поиск программы по PATH (lxrun-волна): env поверх default, кандидаты
+    // `dir/name`, отсутствие поиска для путей со `/`, и префиксный ELF-тест,
+    // которым поиск отбирает кандидата (сверен с `classify_elf`).
+    mod lxpath_paths;
+    // POSIX/GNU getopt: эквивалентность кластера и отдельных флагов, `--`,
+    // длинные опции, аргументы опций, неизвестные опции и отсутствие паники на
+    // произвольных строках.
+    mod getopt_args;
     // OpenPGP repository-metadata verification (issue #32), contract
     // OPENPGP-VERIFY-CONTRACT.md §2/§3/§7.
     //   P51 — armor/packet framing: bounded, panic-free parsing of hostile bytes.
@@ -806,6 +837,11 @@ mod properties {
     // `p60` is the shutdown half-close policy above, so this is `p65` (the
     // next free number after the non-root phase-2 properties P61–P64).
     mod p65;
+
+    // Кольцо сырого ввода `inputd` (порядок/ёмкость/переполнение): модель
+    // `VecDeque` против точной реализации ядра. Следующий свободный номер после
+    // P61–P65 — P66.
+    mod p66;
 
     // NVMe PRP lists + queue-depth arithmetic (PRP1/PRP2/list page, LBA chunk
     // planning, polled CQ phase tags, CAP.MQES clamping). The driver itself is

@@ -15,6 +15,7 @@ use crate::protocol::{
     key, Message, BUTTONS_LEFT, BUTTONS_MIDDLE, BUTTONS_RIGHT, CLOSE_SERVER, CONFIGURE_FOCUSED,
     CONFIGURE_MAXIMIZED, CONFIGURE_MINIMIZED, CONFIGURE_RESIZABLE, MOD_ALT, MOD_CTRL,
 };
+use crate::shadow;
 use crate::surface::{PixelFormat, Surface, SurfaceError};
 use crate::theme::Theme;
 use crate::window::{Window, WindowPart, BORDER, MIN_CONTENT};
@@ -254,16 +255,6 @@ struct ChromeCache {
     layer: Canvas,
 }
 
-/// Один слой предвычисленной тени: alpha и построчные горизонтальные пролёты.
-struct ShadowLayer {
-    alpha: u8,
-    rows: Vec<(i32, i32, i32)>,
-}
-
-struct ShadowCache {
-    layers: Vec<ShadowLayer>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HoverState {
     panel: Option<PanelHover>,
@@ -296,7 +287,7 @@ pub struct Compositor {
     wallpaper_cache: Option<Canvas>,
     panel_cache: Option<(PanelKey, Canvas)>,
     chrome_cache: HashMap<u32, ChromeCache>,
-    shadow_cache: HashMap<(i32, i32), ShadowCache>,
+    shadow_cache: HashMap<(i32, i32), shadow::ShadowSprite>,
     cache_stats: CacheStats,
 }
 
@@ -1730,40 +1721,28 @@ impl Compositor {
         hover: Option<WindowPart>,
     ) {
         let frame = window.frame;
-        // Тень предвычислена для размера окна; внеэкранные окна рисуем старым
-        // путём, чтобы отсечение по bounds не меняло геометрию скруглений.
-        let shadow_box = frame.inflate(9).offset(0, 6);
-        // Тень дороже прочих проходов (P0: 88-92% render), поэтому damage,
-        // который её не задевает (курсор, часы панели), вообще не должен её
-        // обходить. Внутри задетой площади смешивание идёт спанами строк:
-        // clip пересекается раз на строку, а не на каждый пиксель.
-        if self.screen.contains_rect(shadow_box) {
+        // Тень предкомпонована для размера окна: видимое кольцо (+ угловые
+        // квадраты) собирается в один слой один раз на геометрию
+        // (`shadow::build_window_shadow`), в кадре — один `blit_shadow`.
+        let shadow_box = shadow::shadow_box(frame.w, frame.h).offset(frame.x, frame.y);
+        // Старый путь остаётся для двух честных случаев: коробка тени не
+        // помещается на экран (тогда видимую маску нельзя вывести из
+        // геометрии) и chrome без непрозрачной рамки (`border_color` с alpha 0
+        // не закрывает тень, и кольцо перестало бы совпадать с кадром).
+        let ring_visible = self.screen.contains_rect(shadow_box)
+            && color::alpha(window.border_color(&self.theme)) != 0;
+        if ring_visible {
             self.ensure_shadow(frame.w, frame.h);
+            // Damage, который не задевает тень (курсор, часы панели), не
+            // должен её обходить: кольцо — доли процента окна, но проверка
+            // пересечения ещё дешевле.
             if canvas.clip_intersects(shadow_box) {
-                if let Some(shadow) = self.shadow_cache.get(&(frame.w, frame.h)) {
-                    let _stage = crate::timing::Scope::new(crate::timing::Stage::Shadow);
-                    let mut shadow_px = 0u64;
-                    for layer in &shadow.layers {
-                        for &(y, x0, x1) in &layer.rows {
-                            canvas.blend_span(
-                                frame.y + y,
-                                frame.x + x0,
-                                frame.x + x1,
-                                color::BLACK,
-                                layer.alpha,
-                            );
-                            // Считаем только пиксели внутри damage-отсечения:
-                            // иначе при мелком damage «записанные» пиксели тени
-                            // раздувались бы до площади окна и врали о доле blend.
-                            let row = Rect::new(frame.x + x0, frame.y + y, x1 - x0, 1);
-                            shadow_px += canvas.visible_area(row);
-                        }
-                    }
-                    crate::timing::count_blended(shadow_px);
+                if let Some(sprite) = self.shadow_cache.get(&(frame.w, frame.h)) {
+                    canvas.blit_shadow(sprite, Point::new(shadow_box.x, shadow_box.y));
                 }
             }
         } else {
-            canvas.shadow(frame, WINDOW_RADIUS, 9, 18);
+            canvas.shadow(frame, WINDOW_RADIUS, shadow::LAYERS, shadow::ALPHA_STEP);
         }
 
         self.ensure_chrome(window, hover);
@@ -1817,19 +1796,20 @@ impl Compositor {
         }
     }
 
-    fn ensure_shadow(&mut self, width: i32, height: i32) {
-        if !self.shadow_cache.contains_key(&(width, height)) {
-            let cache = build_shadow_cache(width, height);
-            self.cache_stats.shadow_builds += 1;
-            self.shadow_cache.insert((width, height), cache);
-        }
-    }
-
-    /// Предвычислить слои тени для окна `width`×`height`.
+    /// Предкомпоновать видимое кольцо тени окна `width`×`height`.
     ///
     /// Геометрия повторяет `Canvas::shadow` (9 слоёв, `radius = 10`, шаг alpha
-    /// 18), но считается один раз: в кадре остаются только построчные пролёты
-    /// и alpha-смешивание уже готовых прямоугольников.
+    /// 18), но считается один раз на геометрию: слой хранит только видимые
+    /// пиксели (кольцо и угловые квадраты), поэтому в кадре — один проход
+    /// `Canvas::blit_shadow`. Движение курсора и позиция окна кэш не
+    /// инвалидируют: ключ — размер окна.
+    fn ensure_shadow(&mut self, width: i32, height: i32) {
+        if !self.shadow_cache.contains_key(&(width, height)) {
+            let sprite = shadow::build_window_shadow(width, height, WINDOW_RADIUS);
+            self.cache_stats.shadow_builds += 1;
+            self.shadow_cache.insert((width, height), sprite);
+        }
+    }
     fn ensure_chrome(&mut self, window: &Window, hover: Option<WindowPart>) {
         let key = ChromeKey {
             width: window.frame.w,
@@ -2307,50 +2287,6 @@ fn clamp_flyout(mut rect: Rect, screen: Rect) -> Rect {
         .y
         .clamp(8, (screen.bottom() - PANEL_HEIGHT - rect.h - 8).max(8));
     rect
-}
-
-/// Горизонтальный отступ скругления для строки на расстоянии `dy` от края.
-fn rounded_inset(radius: i32, dy: i32) -> i32 {
-    if radius <= 0 || dy >= radius {
-        return 0;
-    }
-    let r = radius as f64;
-    let d = (radius - dy) as f64;
-    (r - (r * r - d * d).sqrt()).round() as i32
-}
-
-fn build_shadow_cache(width: i32, height: i32) -> ShadowCache {
-    const LAYERS: i32 = 9;
-    const RADIUS: i32 = WINDOW_RADIUS;
-    const OPACITY_STEP: u8 = 18;
-    let mut layers = Vec::with_capacity(LAYERS as usize);
-    for layer in (1..=LAYERS).rev() {
-        let spread = layer;
-        // rect.inflate(spread).offset(0, spread / 2 + 2) в координатах окна.
-        let layer_rect = Rect::new(
-            -spread,
-            spread / 2 + 2 - spread,
-            width + spread * 2,
-            height + spread * 2,
-        );
-        let radius = (RADIUS + spread)
-            .max(0)
-            .min(layer_rect.w / 2)
-            .min(layer_rect.h / 2);
-        let alpha = OPACITY_STEP.saturating_sub(layer as u8).max(2);
-        let mut rows = Vec::with_capacity(layer_rect.h.max(0) as usize);
-        for y in layer_rect.y..layer_rect.bottom() {
-            let dy = (y - layer_rect.y).min(layer_rect.bottom() - 1 - y);
-            let inset = rounded_inset(radius, dy);
-            let x0 = layer_rect.x + inset;
-            let x1 = layer_rect.right() - inset;
-            if x1 > x0 {
-                rows.push((y, x0, x1));
-            }
-        }
-        layers.push(ShadowLayer { alpha, rows });
-    }
-    ShadowCache { layers }
 }
 
 #[cfg(test)]
@@ -3111,6 +3047,54 @@ mod tests {
             compositor.cache_stats(),
             first,
             "повторный кадр не должен перестраивать кэши"
+        );
+    }
+
+    /// Тень окна кэшируется по геометрии: движения курсора её не пересобирают
+    /// (в отличие от chrome, который перестраивается при смене hover), а слой
+    /// содержит только видимое кольцо, а не всю площадь коробки.
+    #[test]
+    fn cursor_moves_do_not_rebuild_shadow_sprite() {
+        let mut compositor = compositor();
+        compositor.render_full();
+        let builds = compositor.cache_stats().shadow_builds;
+        assert_eq!(builds, 2, "два окна разных размеров — два слоя тени");
+        for step in 0..16 {
+            compositor.pointer_motion(Point::new(120 + step * 61, 90 + step * 23));
+            compositor.render();
+            assert_eq!(
+                compositor.cache_stats().shadow_builds,
+                builds,
+                "курсор пересобрал тень на шаге {step}"
+            );
+        }
+
+        let frame = compositor.window(1).unwrap().frame;
+        let sprite = compositor
+            .shadow_cache
+            .get(&(frame.w, frame.h))
+            .expect("слой тени Terminal");
+        let box_pixels = (sprite.width * sprite.height) as usize;
+        assert!(
+            sprite.visible_pixels() * 6 < box_pixels,
+            "в слое {} пикселей из {box_pixels}: это не кольцо",
+            sprite.visible_pixels()
+        );
+        // Кольцо вокруг рамки видно, под непрозрачным chrome — нет, а в углу
+        // скругления (там chrome прозрачен) тень обязана остаться.
+        assert_eq!(sprite.profile(0, 0), 0, "тень в углу коробки без слоёв");
+        assert!(
+            sprite.profile(shadow::SPREAD, shadow::OFFSET_Y) > 0,
+            "тень под прозрачным углом chrome потерялась"
+        );
+        assert_eq!(
+            sprite.profile(shadow::SPREAD + frame.w / 2, shadow::OFFSET_Y + frame.h / 2),
+            0,
+            "тень пишется под непрозрачный chrome"
+        );
+        assert!(
+            sprite.profile(shadow::SPREAD + frame.w / 2, 0) > 0,
+            "тень над верхней кромкой окна потерялась"
         );
     }
 
