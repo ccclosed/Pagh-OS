@@ -3242,38 +3242,60 @@ class TermuxPointer:
         self.scale_y = 1.0
 
     def _rel(self, dx: float, dy: float) -> None:
+        """Move in small chunks.
+
+        One huge `input-send-event` becomes several PS/2 packets (QEMU clamps a
+        packet to +-127) and under TCG the 8042 output queue/interrupt path
+        drops bytes when they arrive faster than the guest drains them. A human
+        mouse never moves 300 px in one report either, so chunking is both the
+        honest model and the reliable one.
+        """
         if not dx and not dy:
             return
-        self.h.qmp.rel(int(round(dx)), int(round(dy)))
-        time.sleep(0.12)
+        steps = max(1, int(max(abs(dx), abs(dy)) // 24) + 1)
+        for step in range(1, steps + 1):
+            x0 = round(dx * (step - 1) / steps)
+            x1 = round(dx * step / steps)
+            y0 = round(dy * (step - 1) / steps)
+            y1 = round(dy * step / steps)
+            sx, sy = int(x1 - x0), int(y1 - y0)
+            if sx or sy:
+                self.h.qmp.rel(sx, sy)
+            time.sleep(0.05)
 
     def calibrate(self) -> tuple[float, float]:
         a = _termux_ppm(self.kb, CACHE / "termux_ptr_a.ppm")
-        self._rel(60, 40)
-        b = _termux_ppm(self.kb, CACHE / "termux_ptr_b.ppm")
         w, hgt, ra = a
-        _, _, rb = b
         ox, oy = w // 2, hgt // 2
-        changed = []
-        for y in range(0, max(1, hgt - 60), 2):
-            row = y * w * 3
-            for x in range(0, w, 2):
-                off = row + x * 3
-                if ra[off:off + 3] != rb[off:off + 3]:
-                    changed.append((x, y))
-        # Only the NEW sprite: the old one sits at the centre. Keep changed
-        # pixels in the moved quadrant, then take the arrow's top-left tip as
-        # the hotspot (a centroid would be biased by the sprite's own shape).
-        far = [(x, y) for (x, y) in changed
-               if x > ox + 30 and y > oy + 18]
-        if not far:
-            raise HarnessError("termux: pointer calibration found no cursor in the dump")
-        tip_x = min(x for x, _ in far)
-        tip_y = min(y for _, y in far)
-        self.scale_x = max(0.25, min(4.0, (tip_x - ox) / 60.0))
-        self.scale_y = max(0.25, min(4.0, (tip_y - oy) / 40.0))
-        self.x, self.y = tip_x, tip_y
-        return self.scale_x, self.scale_y
+        # Move UP-LEFT: the new sprite then lands in the upper-left quadrant,
+        # where the old sprite (which spans ox..ox+12, oy..oy+18) cannot appear.
+        # Taking the minimum x/y of that quadrant gives the arrow tip = pointer,
+        # and the observed displacement reveals QEMU's relative-unit scale.
+        for req_x, req_y in ((-300, -200), (-600, -400)):
+            self._rel(req_x, req_y)
+            time.sleep(0.8)
+            b = _termux_ppm(self.kb, CACHE / "termux_ptr_b.ppm")
+            _, _, rb = b
+            far = []
+            for y in range(0, max(1, oy - 30), 2):
+                row = y * w * 3
+                for x in range(0, max(1, ox - 40), 2):
+                    off = row + x * 3
+                    if ra[off:off + 3] != rb[off:off + 3]:
+                        far.append((x, y))
+            if not far:
+                log(f"termux: pointer calibration: rel({req_x},{req_y}) moved nothing")
+                continue
+            tip_x = min(x for x, _ in far)
+            tip_y = min(y for _, y in far)
+            self.scale_x = max(0.05, min(20.0, (ox - tip_x) / float(-req_x)))
+            self.scale_y = max(0.05, min(20.0, (oy - tip_y) / float(-req_y)))
+            self.x, self.y = tip_x, tip_y
+            log(f"termux: pointer rel({req_x},{req_y}) -> ({tip_x},{tip_y}), "
+                f"scale {self.scale_x:.4f}/{self.scale_y:.4f}")
+            return self.scale_x, self.scale_y
+        raise HarnessError("termux: the pointer does not move the compositor "
+                           "(no changed pixels for rel(-300,-200) or rel(-600,-400))")
 
     def move_to(self, x: int, y: int) -> None:
         x = max(0, min(self.w - 1, int(x)))
@@ -3281,12 +3303,63 @@ class TermuxPointer:
         self._rel((x - self.x) / self.scale_x, (y - self.y) / self.scale_y)
         self.x, self.y = x, y
 
+    def _locate_after_probe(self, before, after, old_x: int, old_y: int,
+                            probe_x: int) -> tuple[int, int] | None:
+        """Find the cursor tip in `after` after a +probe_x move from (old_x, old_y)."""
+        w, hgt = before[0], before[1]
+        ra, rb = before[2], after[2]
+        expected = (old_x + probe_x, old_y)
+        best = []
+        fallback = []
+        for y in range(0, hgt - 60, 2):
+            row = y * w * 3
+            for x in range(0, w, 2):
+                off = row + x * 3
+                if ra[off:off + 3] == rb[off:off + 3]:
+                    continue
+                if abs(x - expected[0]) <= 80 and abs(y - expected[1]) <= 60:
+                    best.append((x, y))
+                fallback.append((x, y))
+        pool = best if len(best) >= 6 else fallback
+        if len(pool) < 6:
+            return None
+        return min(x for x, _ in pool), min(y for _, y in pool)
+
+    def aim_to(self, x: int, y: int, tries: int = 3) -> bool:
+        """Closed-loop move: verify the cursor position from the framebuffer.
+
+        Open-loop tracking drifts (PS/2 drops packets under TCG), and a click on
+        the 22x22 title-bar close button must not drift. Each attempt moves,
+        probes +40 px, locates the sprite in two dumps, and corrects.
+        """
+        for _ in range(tries):
+            self.move_to(x, y)
+            before = _termux_ppm(self.kb, CACHE / "termux_aim_a.ppm")
+            old = (self.x, self.y)
+            self._rel(40, 0)
+            after = _termux_ppm(self.kb, CACHE / "termux_aim_b.ppm")
+            found = self._locate_after_probe(before, after, old[0], old[1], 40)
+            if found is None:
+                continue
+            self.x, self.y = found[0] - 40, found[1]
+            if abs(self.x - x) <= 7 and abs(self.y - y) <= 7:
+                return True
+        return False
+
     def click(self, x: int, y: int) -> None:
         self.move_to(x, y)
         self.h.qmp.button("left", True)
         time.sleep(0.1)
         self.h.qmp.button("left", False)
         time.sleep(0.25)
+
+    def click_aimed(self, x: int, y: int) -> bool:
+        aimed = self.aim_to(x, y)
+        self.h.qmp.button("left", True)
+        time.sleep(0.1)
+        self.h.qmp.button("left", False)
+        time.sleep(0.3)
+        return aimed
 
     def drag(self, x0: int, y0: int, x1: int, y1: int) -> None:
         self.move_to(x0, y0)
@@ -3313,9 +3386,50 @@ def _termux_line(kb: "QemuShotKeyboard", qmp: "QmpClient", line: str,
     time.sleep(settle)
 
 
+def _termux_diff_samples(a: tuple[int, int, bytes], b: tuple[int, int, bytes]) -> int:
+    """Coarse pixel-difference count between two framebuffer dumps (step 4)."""
+    if a[0] != b[0] or a[1] != b[1]:
+        raise HarnessError("termux: PPM size mismatch")
+    w, hgt = a[0], a[1]
+    changed = 0
+    for y in range(0, max(1, hgt - 60), 4):
+        row = y * w * 3
+        for x in range(0, w, 4):
+            off = row + x * 3
+            if a[2][off:off + 3] != b[2][off:off + 3]:
+                changed += 1
+    return changed
+
+
 def _termux_shot(kb: "QemuShotKeyboard", path: pathlib.Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     kb.screenshot(path)
+
+
+def _termux_marker_binary() -> pathlib.Path:
+    """Assemble tools/termux_marker.c into a freestanding static ELF.
+
+    The kernel shell has no `>` redirection (it echoes the whole argument list),
+    so "the typed command really ran" is proven by this helper: it appends its
+    arguments to a file. gcc is only a build tool, as in the groups probe.
+    """
+    gcc = shutil.which("gcc")
+    if not gcc:
+        raise SetupError("termux: gcc is required to build tools/termux_marker.c")
+    src = ROOT / "tools" / "termux_marker.c"
+    if not src.is_file():
+        raise SetupError(f"termux: marker source missing: {src}")
+    out = CACHE / "termux-marker"
+    CACHE.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        [gcc, "-static", "-nostdlib", "-ffreestanding", "-fno-stack-protector",
+         "-fno-pie", "-no-pie", "-Os", "-o", out, src,
+         "-Wl,-e,_start", "-Wl,--build-id=none"],
+        "termux marker build", timeout=120,
+    )
+    if not out.is_file():
+        raise SetupError("termux: marker build produced no ELF")
+    return out
 
 
 def _termux_debugfs_cat(image: pathlib.Path, name: str) -> str:
@@ -3357,6 +3471,8 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
     else:
         log(f"termux: reusing {rel(disk)}")
 
+    marker = _termux_marker_binary()
+    _debugfs_inject_exec(disk, marker, "marker", replace=True)
     ev = CACHE / "termux_evidence"
     ev.mkdir(parents=True, exist_ok=True)
     h.boot(need_keyboard=False, disk=disk, net=False)
@@ -3405,6 +3521,26 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         h.check("compositor resumes in the background", bool(bg), bg or "no bg marker")
         time.sleep(1.0)
         _termux_shot(kb, ev / "02-desktop-background.png")
+        # Liveness probe: F10 opens the desktop menu. If the frame does not
+        # change, the compositor is not running (a stopped job would make every
+        # later mouse/keyboard step silently meaningless).
+        before_probe = _termux_ppm(kb, CACHE / "termux_alive_a.ppm")
+        kb.key("f10")
+        time.sleep(0.8)
+        _termux_shot(kb, ev / "02b-desktop-menu.png")
+        after_probe = _termux_ppm(kb, CACHE / "termux_alive_b.ppm")
+        changed_probe = 0
+        for y in range(0, after_probe[1] - 60, 4):
+            row = y * after_probe[0] * 3
+            for x in range(0, after_probe[0], 4):
+                off = row + x * 3
+                if before_probe[2][off:off + 3] != after_probe[2][off:off + 3]:
+                    changed_probe += 1
+        h.check("desktop is running after Ctrl+Z/bg (F10 menu changes the frame)",
+                changed_probe > 50, f"{changed_probe} changed samples")
+        kb.key("esc")
+        time.sleep(0.4)
+        _termux_shot(kb, ev / "02c-desktop-menu-closed.png")
 
         # Screen geometry and pointer calibration before any window exists: the
         # terminal's blinking cursor would otherwise pollute the diff.
@@ -3427,23 +3563,25 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
             # second window starts 36 px lower, so window 1 is focused by a click
             # on its own title bar (y < second window's top).
             if index == 1:
-                pointer.click(500, 80)
+                pointer.click_aimed(500, 80)
             else:
-                pointer.click(700, 116)
+                pointer.click_aimed(700, 116)
             time.sleep(0.3)
 
         def close_window(index: int) -> None:
             if index == 1:
-                pointer.click(978, 80)
+                closed = pointer.click_aimed(978, 80)
             else:
-                pointer.click(1020, 116)
+                closed = pointer.click_aimed(1020, 116)
+            if not closed:
+                log("termux: close-button aim did not converge; clicking anyway")
             time.sleep(2.2)
 
         # Window 1: history, editing, scrollback, selection, nano, exit/restart.
         open_terminal("03-terminal-open")
         _termux_shot(kb, ev / "04-terminal-banner.png")
         focus_window(1)
-        _termux_line(kb, h.qmp, "echo history-1 > /mnt/q1")
+        _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q1 history-1")
         kb.key("up")
         time.sleep(0.3)
         _termux_shot(kb, ev / "05-history-recalled.png")
@@ -3454,39 +3592,52 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         # Home + right/insert + End + backspace: the resulting file NAME proves
         # Home/End (caret moved to start and back to the end) and its content
         # proves the insert position.
-        _desktop_type(kb, h.qmp, "echo AB > /mnt/q2")
+        # Type the command WITHOUT its verb, then Home + "lxrun " prefixes it:
+        # if Home did not work the line would not start with a command, and the
+        # marker file would not appear at all.
+        _desktop_type(kb, h.qmp, "/mnt/marker /mnt/q2 B")
         kb.key("home")
-        for _ in range(5):
-            kb.key("right")
-        _desktop_type(kb, h.qmp, "CD")
+        _desktop_type(kb, h.qmp, "lxrun ")
         kb.key("end")
         kb.key("backspace")
-        _desktop_type(kb, h.qmp, "2Z")
+        _desktop_type(kb, h.qmp, "CD")
         _termux_shot(kb, ev / "07-editing-line.png")
         kb.key("ret")
         time.sleep(0.8)
 
         # Scrollback: a screenful of `help`, wheel up, then back to the live view.
-        _termux_line(kb, h.qmp, "help", settle=2.0)
+        # The pixel diff is the proof: at the live bottom a no-op wheel leaves
+        # the frame identical, so "frame changed after wheel-up" is the signal.
+        _termux_line(kb, h.qmp, "help", settle=3.5)
         _termux_shot(kb, ev / "08-help-screenful.png")
+        live_ppm = _termux_ppm(kb, CACHE / "termux_scroll_live.ppm")
         pointer.move_to(w // 2, hgt // 2 - 100)
         pointer.wheel(4)
+        time.sleep(1.0)
         _termux_shot(kb, ev / "09-scrollback-wheel-up.png")
+        up_ppm = _termux_ppm(kb, CACHE / "termux_scroll_up.ppm")
         pointer.wheel(-4)
+        time.sleep(1.0)
         _termux_shot(kb, ev / "10-scrollback-wheel-down.png")
+        down_ppm = _termux_ppm(kb, CACHE / "termux_scroll_down.ppm")
+        moved_up = _termux_diff_samples(live_ppm, up_ppm)
+        moved_down = _termux_diff_samples(up_ppm, down_ppm)
+        h.check("wheel scrolls the session's own scrollback (and back)",
+                moved_up > 500 and moved_down > 500,
+                f"changed samples up={moved_up} down={moved_down}")
 
         # Selection + Ctrl+Y paste: clear the screen, run an APPENDING command
         # (so a successful paste is visible as the second line of /mnt/q4), then
         # drag over the command line on row 0 and paste it.
         _termux_line(kb, h.qmp, "clear", settle=1.0)
         _termux_shot(kb, ev / "11-cleared-screen.png")
-        _termux_line(kb, h.qmp, "echo SEL >> /mnt/q4")
+        _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q4 SEL")
         pointer.move_to(5, 5)
         _termux_shot(kb, ev / "12-before-selection.png")
         # content origin (window y + border + title) + letterbox (600-562)/2 +
         # half a scaled cell: row 0 of the session surface.
         row0_y = 64 + 1 + 30 + (600 - 562) // 2 + 6
-        pointer.drag(110, row0_y, 430, row0_y)
+        pointer.drag(98, row0_y, 470, row0_y)
         _termux_shot(kb, ev / "13-selection.png")
         h.qmp.keys(["ctrl", "y"])
         h.qmp.release_modifiers()
@@ -3510,7 +3661,7 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         kb.key("esc")
         time.sleep(1.0)
         _termux_shot(kb, ev / "18-nano-exit.png")
-        _termux_line(kb, h.qmp, "echo after-nano > /mnt/q6")
+        _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q6 after-nano")
 
         # exit -> ENODEV notice -> Enter restarts the session in the same window.
         _termux_line(kb, h.qmp, "exit", settle=1.5)
@@ -3518,7 +3669,7 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         kb.key("ret")
         time.sleep(2.5)
         _termux_shot(kb, ev / "20-session-restarted.png")
-        _termux_line(kb, h.qmp, "echo after-restart > /mnt/q7")
+        _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q7 after-restart")
 
         # Close/reopen x20: every reopen must run a command, so /mnt/r ends with
         # 20 lines. A crash (#PF/panic) or a failed respawn loses a line.
@@ -3540,13 +3691,13 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         open_terminal("23b-window1", wait=6.5)
         open_terminal("23c-window2", wait=7.0)
         focus_window(2)
-        _termux_line(kb, h.qmp, "echo two > /mnt/q9two")
+        _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q9two two")
         _termux_shot(kb, ev / "24-two-windows-window2.png")
         focus_window(1)
         # After the raise, window 1's content is on top at its own frame.
         pointer.click(400, 300)
         time.sleep(0.3)
-        _termux_line(kb, h.qmp, "echo one > /mnt/q9one")
+        _termux_line(kb, h.qmp, "lxrun /mnt/marker /mnt/q9one one")
         _termux_shot(kb, ev / "25-two-windows-window1.png")
 
         # Give the shell/desktop a moment to flush, then stop the guest and read
@@ -3563,7 +3714,7 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
 
         files = {
             "q1": cat("q1"),
-            "q2Z": cat("q2Z"),
+            "q2": cat("q2"),
             "q4": cat("q4"),
             "q6": cat("q6"),
             "q7": cat("q7"),
@@ -3577,12 +3728,12 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
         (ev / "markers.json").write_text(json.dumps(files, indent=2))
 
         ok = True
-        ok &= h.check("history: recalled command re-executed",
-                      "history-1" in files["q1"], files["q1"].strip())
-        ok &= h.check("editing: Home/End/backspace shaped the command",
-                      "CDAB" in files["q2Z"], files["q2Z"].strip() or "q2Z missing")
-        ok &= h.check("selection + Ctrl+Y pasted the command again",
-                      files["q4"].count("SEL") >= 2, files["q4"].strip())
+        ok &= h.check("history: recalled command re-executed (Up + Enter ran it twice)",
+                      files["q1"].count("history-1") == 2, files["q1"].strip())
+        ok &= h.check("editing: Home prefixed the verb, End+backspace replaced the arg",
+                      files["q2"].strip() == "CD", files["q2"].strip() or "q2 missing")
+        ok &= h.check("selection + Ctrl+Y pasted and re-ran the command",
+                      files["q4"].count("SEL") == 2, files["q4"].strip())
         ok &= h.check("nano exited and the shell continued",
                       files["q6"].strip() == "after-nano", files["q6"].strip())
         ok &= h.check("exit -> notice -> Enter restarted the session",
@@ -3601,9 +3752,10 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
                       _first_line(log_text, "in slot 2"))
         ok &= h.check("session restart visible in the client log",
                       "kernel session reopened" in log_text, _first_line(log_text, "reopened"))
-        ok &= h.check("windows were closed by the server (no self-kill)",
-                      "server closed the window" in log_text,
-                      _first_line(log_text, "server closed"))
+        closed_count = log_text.count("server closed the window")
+        ok &= h.check(f"all {TERMUX_CLOSE_CYCLES} window closes came from the server",
+                      closed_count >= TERMUX_CLOSE_CYCLES,
+                      f"{closed_count} Close events logged")
 
         # Isolation from the boot VT: the typed text must never appear on serial.
         leaks = [needle for needle in
@@ -3650,8 +3802,12 @@ def _groups_probe_binary() -> pathlib.Path:
     return out
 
 
-def _debugfs_inject_exec(image: pathlib.Path, src: pathlib.Path, name: str) -> None:
+def _debugfs_inject_exec(image: pathlib.Path, src: pathlib.Path, name: str,
+                         replace: bool = False) -> None:
     """Write `src` as `/{name}` mode 0100755 into an ext2 image, then verify it."""
+    if replace:
+        subprocess.run(["debugfs", "-w", "-R", f"rm /{name}", str(image)],
+                       capture_output=True, text=True)
     for argv in (
         ["debugfs", "-w", "-R", f"write {src} /{name}", str(image)],
         ["debugfs", "-w", "-R", f"sif /{name} mode 0100755", str(image)],
