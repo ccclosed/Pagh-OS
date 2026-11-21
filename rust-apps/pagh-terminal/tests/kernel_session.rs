@@ -64,6 +64,8 @@ struct MockFb {
     fail_after: usize,
     /// Сколько раз источник переоткрывали (`ENODEV` -> respawn).
     respawned: usize,
+    /// Сколько раз источник закрывали перед переоткрытием.
+    closed: usize,
 }
 
 impl MockFb {
@@ -75,6 +77,7 @@ impl MockFb {
             failure: None,
             fail_after: 0,
             respawned: 0,
+            closed: 0,
         }
     }
 
@@ -96,6 +99,11 @@ impl FrameSource for MockFb {
             Some("io") => Err(VtFbError::Io(io::Error::other("device exploded"))),
             _ => Ok(self.info),
         }
+    }
+
+    fn close(&mut self) -> Result<(), VtFbError> {
+        self.closed += 1;
+        Ok(())
     }
 
     fn respawn(&mut self) -> Result<(), VtFbError> {
@@ -124,11 +132,17 @@ impl FrameSource for MockFb {
 struct MockInput {
     written: Vec<u8>,
     respawns: usize,
+    closes: usize,
 }
 
 impl InputSink for MockInput {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.written.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        self.closes += 1;
         Ok(())
     }
 
@@ -355,6 +369,7 @@ fn keys_become_vt_bytes_for_the_kernel_input() {
     let mut forwarder = KeyForwarder::new(MockInput {
         written: Vec::new(),
         respawns: 0,
+        closes: 0,
     });
     use pagh_terminal::keys::evdev;
     // PDP/1 modifier bits (same wire values as `protocol::mods`).
@@ -581,6 +596,7 @@ fn a_finished_session_restarts_in_the_same_frame() {
         other => panic!("expected Ended, got {other:?}"),
     }
 
+    frame.close_source().expect("close the surface first");
     let info = frame.respawn().expect("respawn in the same window");
     assert_eq!(info.generation, 1, "новая сессия начинает счёт заново");
     assert_eq!(
@@ -596,10 +612,13 @@ fn input_device_is_reopened_for_the_new_session() {
     let mut forwarder = KeyForwarder::new(MockInput {
         written: Vec::new(),
         respawns: 0,
+        closes: 0,
     });
     use pagh_terminal::keys::evdev;
     forwarder.handle_key(evdev::KEY_H, true, 0).expect("write");
+    forwarder.close().expect("close the old device");
     forwarder.respawn().expect("reopen input");
+    assert_eq!(forwarder.sink().closes, 1);
     assert_eq!(forwarder.sink().respawns, 1);
     forwarder.handle_key(evdev::KEY_A, true, 0).expect("write");
     assert_eq!(forwarder.sink().written, b"ha");

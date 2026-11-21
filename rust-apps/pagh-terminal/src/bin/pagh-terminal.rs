@@ -1712,6 +1712,11 @@ fn respawn_kernel_session(
     forwarder: &mut KeyForwarder<FileInput>,
     diag: &mut Diag,
 ) -> Result<(), VtFbError> {
+    // Сначала закрыть ОБА старых устройства, и только потом открывать новые:
+    // ядро сбрасывает счётчик открытых fd при выходе сессии, поэтому «поздний»
+    // close после `open` новой сессии попросил бы её выйти (ENODEV на ioctl).
+    forwarder.close().map_err(VtFbError::Io)?;
+    frame.close_source()?;
     forwarder.respawn().map_err(VtFbError::Io)?;
     let info = frame.respawn()?;
     diag.line(&format!(

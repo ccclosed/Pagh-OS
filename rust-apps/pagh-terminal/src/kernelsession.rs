@@ -232,6 +232,21 @@ pub trait FrameSource {
     /// первом `open`. Устройство переоткрывается, а окно клиента остаётся тем
     /// же: перезапуск сессии не должен требовать нового окна (иначе композитор
     /// получает `duplicate window` на тот же id).
+    /// Закрыть устройство перед respawn — **вместе** со всеми остальными.
+    ///
+    /// Несущий порядок: ядро сбрасывает счётчик открытых fd сессии при её
+    /// выходе, а `close` переживших сессию fd считает заново. Если закрыть один
+    /// старый fd уже после `open` нового, счётчик дойдёт до нуля и ядро
+    /// попросит только что поднятую сессию выйти. Поэтому клиент сначала
+    /// закрывает ВСЕ старые устройства, и только потом открывает новые.
+    fn close(&mut self) -> Result<(), VtFbError> {
+        Ok(())
+    }
+
+    /// Переоткрыть поверхность после `ENODEV` — ядро спавнит новую сессию на
+    /// первом `open`. Устройство переоткрывается, а окно клиента остаётся тем
+    /// же: перезапуск сессии не должен требовать нового окна (иначе композитор
+    /// получает `duplicate window` на тот же id).
     fn respawn(&mut self) -> Result<(), VtFbError> {
         Err(VtFbError::Ended)
     }
@@ -240,6 +255,11 @@ pub trait FrameSource {
 /// Приёмник VT-байтов ввода (в бою — `/dev/vtinput1`).
 pub trait InputSink {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Закрыть устройство (перед общим close-then-open respawn).
+    fn close(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 
     /// Переоткрыть устройство после `ENODEV` (новая сессия ядра).
     fn respawn(&mut self) -> io::Result<()> {
@@ -355,11 +375,15 @@ impl InputSink for FileInput {
         }
     }
 
-    fn respawn(&mut self) -> io::Result<()> {
-        // Закрыть старый fd ДО нового `open`: его `close` иначе придёт после
-        // `note_open` новой сессии, счётчик открытых fd дойдёт до нуля и ядро
-        // попросит только что поднятую сессию выйти (окно получит ENODEV).
+    fn close(&mut self) -> io::Result<()> {
         self.file = None;
+        Ok(())
+    }
+
+    fn respawn(&mut self) -> io::Result<()> {
+        // К этому моменту `close` уже закрыл старый fd (ядро сбрасывает счётчик
+        // при выходе сессии), поэтому новый `open` — единственный: он и спавнит
+        // сессию, и не даёт «позднему» close счётчику упасть до нуля.
         self.file = Some(OpenOptions::new().write(true).open(&self.path)?);
         Ok(())
     }
@@ -500,6 +524,11 @@ impl<S: FrameSource> KernelFrame<S> {
         self.full = true;
     }
 
+    /// Закрыть поверхность (перед общим close-then-open respawn).
+    pub fn close_source(&mut self) -> Result<(), VtFbError> {
+        self.source.close()
+    }
+
     /// Поднять новую сессию ядра на месте той, что завершилась (`ENODEV`).
     ///
     /// Окно клиента не пересоздаётся: переоткрывается только устройство, поэтому
@@ -598,6 +627,11 @@ impl<S: InputSink> KeyForwarder<S> {
 
     pub fn sink(&self) -> &S {
         &self.sink
+    }
+
+    /// Закрыть устройство ввода (перед общим close-then-open respawn).
+    pub fn close(&mut self) -> io::Result<()> {
+        self.sink.close()
     }
 
     /// Переоткрыть устройство ввода для новой сессии.

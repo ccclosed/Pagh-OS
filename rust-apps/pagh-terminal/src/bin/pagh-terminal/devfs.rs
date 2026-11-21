@@ -169,20 +169,25 @@ impl FrameSource for MmapSurface {
         Ok(info)
     }
 
-    fn respawn(&mut self) -> Result<(), VtFbError> {
-        // Порядок несущий: СНАЧАЛА снять отображение и закрыть старый fd, только
-        // потом `open`. Ядро спавнит новую сессию на первом open, а `close`
-        // старого fd после этого уменьшил бы счётчик открытых устройств до нуля —
-        // ядро попросило бы новую сессию выйти, и следующий ioctl вернул бы
-        // ENODEV (окно «перезапустилось и сразу умерло»).
-        // SAFETY: отображение создано в `new`/`respawn` и ещё не снималось.
-        unsafe {
-            munmap(self.base as *mut c_void, self.len);
+    fn close(&mut self) -> Result<(), VtFbError> {
+        // Снять отображение и закрыть fd. Вызывается ДО любого нового `open`:
+        // `close` пережившего сессию fd после `open` новой уменьшил бы счётчик
+        // открытых устройств до нуля, и ядро попросило бы новую сессию выйти.
+        if !self.base.is_null() && self.len > 0 {
+            // SAFETY: отображение создано в `new`/`respawn` и ещё не снималось.
+            unsafe {
+                munmap(self.base as *mut c_void, self.len);
+            }
         }
         self.base = std::ptr::null_mut();
         self.len = 0;
-        self.file = None; // старый fd закрывается здесь
+        self.file = None;
+        Ok(())
+    }
 
+    fn respawn(&mut self) -> Result<(), VtFbError> {
+        // `close` уже закрыл старый fd (общий порядок — см. `FrameSource::close`),
+        // поэтому здесь только новый open + mmap: open и спавнит сессию.
         let file = File::open(&self.path)?;
         let info = query_info(&file)?;
         let len = info.pixels_len();
