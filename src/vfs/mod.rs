@@ -274,10 +274,17 @@ pub trait VfsNode: Send + Sync {
         false
     }
 
+    /// Номер консольной сессии, если узел — `/dev/vtfb{N}` (read-only
+    /// пиксельная поверхность окна); `None` для всего остального.
+    fn vtfb_session(&self) -> Option<usize> {
+        None
+    }
+
     /// Является ли узел `/dev/vtfb1` (read-only пиксельная поверхность
-    /// терминальной сессии).
+    /// терминальной сессии). Сохранено для кода, который различает именно
+    /// первый слот; новый код спрашивает [`VfsNode::vtfb_session`].
     fn is_vtfb1(&self) -> bool {
-        false
+        self.vtfb_session() == Some(1)
     }
 
     /// Информация о пиксельной поверхности сессии (`VTFBIOGET_INFO`/`mmap`);
@@ -291,9 +298,21 @@ pub trait VfsNode: Send + Sync {
         None
     }
 
+    /// Номер консольной сессии, если узел — `/dev/vtinput{N}` (write-only
+    /// приём VT-байтов окна); `None` для всего остального.
+    fn vtinput_session(&self) -> Option<usize> {
+        None
+    }
+
+    /// Номер консольной сессии, если узел — `/dev/vtmouse{N}` (write-only
+    /// поток указателя окна).
+    fn vtmouse_session(&self) -> Option<usize> {
+        None
+    }
+
     /// Является ли узел `/dev/vtinput1` (write-only приём VT-байтов сессии).
     fn is_vtinput1(&self) -> bool {
-        false
+        self.vtinput_session() == Some(1)
     }
 }
 
@@ -554,6 +573,9 @@ impl VfsNode for MountNode {
     fn is_vtinput(&self) -> bool {
         self.inner.is_vtinput()
     }
+    fn vtfb_session(&self) -> Option<usize> {
+        self.inner.vtfb_session()
+    }
     fn is_vtfb1(&self) -> bool {
         self.inner.is_vtfb1()
     }
@@ -563,8 +585,14 @@ impl VfsNode for MountNode {
     fn vtfb_page(&self, index: u64) -> Option<u64> {
         self.inner.vtfb_page(index)
     }
+    fn vtinput_session(&self) -> Option<usize> {
+        self.inner.vtinput_session()
+    }
     fn is_vtinput1(&self) -> bool {
         self.inner.is_vtinput1()
+    }
+    fn vtmouse_session(&self) -> Option<usize> {
+        self.inner.vtmouse_session()
     }
 }
 
@@ -657,13 +685,21 @@ pub fn init() {
     crate::debug!("/dev/vtconsole0 — ready");
     let vtinput = desktop_dev::vtinput();
     crate::debug!("/dev/vtinput — ready");
-    // Терминальное окно desktop'а: пиксельная поверхность и ввод kernel-shell
-    // сессии 1. Узлы существуют всегда; `open` поднимает сессию, а на машине без
-    // фреймбуфера/PMM честно отвечает ENODEV.
-    let vtfb1 = desktop_dev::vtfb1();
-    crate::debug!("/dev/vtfb1 — ready");
-    let vtinput1 = desktop_dev::vtinput1();
-    crate::debug!("/dev/vtinput1 — ready");
+    // Терминальные окна desktop'а: на каждую сессию 1..MAX_SESSIONS — своя
+    // пиксельная поверхность, приём ввода и приём указателя. Узлы существуют
+    // всегда; `open` поднимает сессию, а на машине без фреймбуфера/PMM честно
+    // отвечает ENODEV. Несколько окон — независимые сессии, а не общий экран:
+    // именно это изолирует ввод и scrollback (см. `docs/terminal-session.md`).
+    let mut terminal_devices: Vec<Arc<dyn VfsNode>> = Vec::new();
+    for session in 1..crate::drivers::session_route::MAX_SESSIONS {
+        terminal_devices.push(desktop_dev::vtfb(session));
+        terminal_devices.push(desktop_dev::vtinput_session(session));
+        terminal_devices.push(desktop_dev::vtmouse(session));
+    }
+    crate::debug!(
+        "/dev/vtfb1..{} + vtinput + vtmouse — ready",
+        crate::drivers::session_route::MAX_SESSIONS - 1
+    );
     let dev = Arc::new(DevDirectory {
         children: vec![
             Arc::clone(&null),
@@ -674,9 +710,10 @@ pub fn init() {
             Arc::clone(&input),
             Arc::clone(&vtconsole),
             Arc::clone(&vtinput),
-            Arc::clone(&vtfb1),
-            Arc::clone(&vtinput1),
-        ],
+        ]
+        .into_iter()
+        .chain(terminal_devices)
+        .collect(),
     }) as Arc<dyn VfsNode>;
     // Записываемый in-memory /tmp: Linux-userspace считает, что он есть, —
     // nvim в vim_mktempdir делает mkdir("/tmp/nvim.XXXXXX").

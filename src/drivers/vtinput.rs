@@ -56,12 +56,53 @@ fn parser_for(session: usize) -> &'static Spinlock<KeyParser> {
 /// нового окна «достраивали» бы последовательность прошлого. Дополнительно
 /// чистится кольцо скан-кодов сессии (см. [`crate::drivers::ps2_kbd::reset_session`]):
 /// задача прошлой сессии могла выйти посреди пачки.
+
+/// `ioctl(fd, VTINPUT_SET_FOCUS, on)` — окно сообщает ядру, что композитор
+/// отдал ему клавиатуру (или забрал).
+///
+/// Зачем это ядру: физические клавиши приходят в IRQ1/USB и по-прежнему
+/// кладутся в boot-кольцо (композитор читает их из `/dev/input/event0`
+/// независимо). Пока фокус у терминального окна, клиент возвращает те же
+/// клавиши через `/dev/vtinput{N}`, поэтому прямой путь в boot-shell обязан
+/// молчать — иначе каждая буква, набранная в терминале, попадала бы и в
+/// boot-консоль (двойное эхо/двойная история, «ввод ушёл в boot VT»).
+pub const VTINPUT_SET_FOCUS: u64 = 0x4710;
+
+/// Фокус клавиатуры по сессиям: `[0]` не используется.
+static FOCUS: [AtomicBool; crate::drivers::session_route::MAX_SESSIONS] =
+    [const { AtomicBool::new(false) }; crate::drivers::session_route::MAX_SESSIONS];
+
+/// Запомнить фокус окна (`on == false` — композитор забрал клавиатуру).
+pub fn set_focus(session: usize, on: bool) {
+    if session != crate::drivers::session_route::BOOT_SESSION && session < FOCUS.len() {
+        FOCUS[session].store(on, Ordering::Relaxed);
+    }
+}
+
+/// Есть ли сейчас сфокусированное терминальное окно с живой сессией.
+///
+/// Проверка дешёвая (атомики) и вызывается из `inputd` на каждый скан-код:
+/// фокус умершего клиента не должен навсегда «съесть» клавиатуру boot-shell,
+/// поэтому живучесть сессии проверяется здесь же. Выход сессии сбрасывает
+/// фокус явно ([`reset_session`]).
+pub fn session_focused() -> bool {
+    for (session, flag) in FOCUS.iter().enumerate().skip(1) {
+        if flag.load(Ordering::Relaxed) && crate::drivers::session::live(session) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Забыть состояние сессии (выход/переоткрытие окна): фокус и недособранная
+/// ESC-последовательность не должны переживать генерацию.
 pub fn reset_session(session: usize) {
     if session == crate::drivers::session_route::BOOT_SESSION || session >= PARSERS.len() {
         return;
     }
     parser_for(session).lock().reset();
     crate::drivers::ps2_kbd::reset_session(session);
+    FOCUS[session].store(false, Ordering::Relaxed);
 }
 
 /// PID userspace-владельца клавиатуры (последний писавший в `/dev/vtinput`).
@@ -195,12 +236,13 @@ pub fn write_session(session: usize, bytes: &[u8]) -> usize {
     if bytes.is_empty() || session == crate::drivers::session_route::BOOT_SESSION {
         return write(bytes);
     }
-    // Та же защёлка владельца, что у boot-пути: окно водит клавиатуру, пока в
-    // него пишет живой клиент. kernel-контекст (selftest) владельцем не
-    // становится — иначе тест отобрал бы ввод у настоящей консоли.
-    if crate::task::compat::current_has_compat() {
-        note_client(crate::task::scheduler::current_pid());
-    }
+    // Окно НЕ защёлкивает глобального владельца клавиатуры: у него есть точный
+    // признак — фокус композитора (`VTINPUT_SET_FOCUS`), и `deliver_physical`
+    // учитывает его через `session_focused()`. Глобальная защёлка переживала
+    // клик по рабочему столу и до закрытия окна отбирала физическую клавиатуру
+    // у boot-shell; с несколькими окнами она вдобавок не говорит, ЧЬЁ окно
+    // владеет клавиатурой. Boot-путь (`/dev/vtinput`) защёлку сохраняет: у него
+    // нет сессии и фокуса. Session-bound pass-through остаётся из #169/#147.
     if stdin_owned_by(session) {
         crate::arch::x86_64::linux::io_sys::push_stdin_bytes(bytes);
         return bytes.len();

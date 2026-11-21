@@ -1900,10 +1900,19 @@ pub fn repaint_grid() {
     writer_for_current().flush();
 }
 
-/// Framebuffer dimensions in pixels via the global writer, `(0, 0)` if the
-/// framebuffer never initialized.
+/// Framebuffer dimensions in pixels via the current task's writer, `(0, 0)` if
+/// the framebuffer never initialized.
 pub fn dimensions() -> (usize, usize) {
     writer_for_current().dimensions()
+}
+
+/// Геометрия поверхности конкретной сессии (не зависит от текущей задачи).
+///
+/// Нужна путям, которые работают **от имени** сессии из чужой задачи:
+/// `/dev/vtmouse{N}` клампит координаты указателя по поверхности сессии, хотя
+/// `write(2)` исполняется в задаче клиента (маршрут которой — boot-сессия).
+pub fn dimensions_for(session: usize) -> (usize, usize) {
+    writer_for(session).dimensions()
 }
 
 /// Геометрия Limine-фреймбуфера для `/dev/fb0`; `None` на serial-only boot.

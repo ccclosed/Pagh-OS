@@ -555,7 +555,7 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         if node.is_evdev() {
             return read_evdev_event(fd as u32, buf, count);
         }
-        if node.is_vtconsole() || node.is_vtfb1() {
+        if node.is_vtconsole() || node.vtfb_session().is_some() {
             return read_snapshot_dev(fd as u32, buf, count);
         }
     }
@@ -1316,16 +1316,28 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
         // получает снимок уже нарисованного shell-текста.
         crate::drivers::vtsurface::activate();
     }
-    if node.is_vtfb1() || node.is_vtinput1() {
-        // Первый open любого из двух устройств поднимает kernel-shell сессию
-        // (`/dev/vtfb1` + `/dev/vtinput1`). Поверхность аллоцируется здесь, в
-        // контексте открывающего, поэтому `mmap`/`ioctl` сразу после open видят
-        // готовую геометрию. Отказ (нет фреймбуфера/PMM) — честный ENODEV, а
-        // выделенный fd откатывается: иначе клиент получил бы дескриптор на
-        // мёртвое окно.
-        if !crate::drivers::session::note_open(1) {
-            let _ = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
-            return Err(Errno::ENODEV);
+    if let Some(session) = node
+        .vtfb_session()
+        .or_else(|| node.vtinput_session())
+        .or_else(|| node.vtmouse_session())
+    {
+        // Первый open любого устройства сессии (`vtfb`/`vtinput`/`vtmouse`)
+        // поднимает kernel-shell сессию своего слота. Поверхность аллоцируется
+        // здесь, в контексте открывающего, поэтому `mmap`/`ioctl` сразу после
+        // open видят готовую геометрию. Отказ (нет фреймбуфера/PMM) — честный
+        // ENODEV, занятая другим окном сессия — EBUSY; выделенный fd
+        // откатывается: иначе клиент получил бы дескриптор на мёртвое окно.
+        match crate::drivers::session::note_open(session) {
+            crate::drivers::session::SessionOpen::Started
+            | crate::drivers::session::SessionOpen::Attached => {}
+            crate::drivers::session::SessionOpen::Busy => {
+                let _ = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
+                return Err(Errno::EBUSY);
+            }
+            crate::drivers::session::SessionOpen::Unavailable => {
+                let _ = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
+                return Err(Errno::ENODEV);
+            }
         }
     }
     Ok(fd as u64)
@@ -1401,10 +1413,13 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
             // `vtinput`). Сама сессия поднимается в `open_resolved`, после
             // успешной аллокации fd, — чтобы неудачный open не считался
             // открытием окна.
-            if node.is_vtfb1() && flags & 0o3 != 0 {
+            if node.vtfb_session().is_some() && flags & 0o3 != 0 {
                 return Err(Errno::EACCES);
             }
-            if node.is_vtinput1() && flags & 0o3 == 0 {
+            if node.vtinput_session().is_some() && flags & 0o3 == 0 {
+                return Err(Errno::EACCES);
+            }
+            if node.vtmouse_session().is_some() && flags & 0o3 == 0 {
                 return Err(Errno::EACCES);
             }
             if flags & O_TRUNC_FL != 0 && !node.is_directory() {
@@ -1507,18 +1522,21 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
     // сессии. Сама задача выйдет на границе своего цикла (`session::check_reap`),
     // а не будет сорвана асинхронным kill'ом, который мог бы застать её с чужим
     // ресурсом в руках.
-    let closing_session_dev = matches!(
-        resolve_fd(fd as u32),
-        Some(Resolved::File { ref node, .. }) if node.is_vtfb1() || node.is_vtinput1()
-    );
+    let closing_session = match resolve_fd(fd as u32) {
+        Some(Resolved::File { ref node, .. }) => node
+            .vtfb_session()
+            .or_else(|| node.vtinput_session())
+            .or_else(|| node.vtmouse_session()),
+        _ => None,
+    };
     let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
     match res {
         Some(Ok(())) => {
             if closing_vtconsole {
                 crate::drivers::vtsurface::deactivate();
             }
-            if closing_session_dev {
-                crate::drivers::session::note_close(1);
+            if let Some(session) = closing_session {
+                crate::drivers::session::note_close(session);
             }
             Ok(0)
         }
@@ -1562,8 +1580,9 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
         Some(Resolved::File { node, .. })
             if node.is_vtconsole()
                 || node.is_vtinput()
-                || node.is_vtfb1()
-                || node.is_vtinput1() =>
+                || node.vtfb_session().is_some()
+                || node.vtinput_session().is_some()
+                || node.vtmouse_session().is_some() =>
         {
             Err(Errno::ESPIPE)
         }
@@ -1593,8 +1612,9 @@ pub fn sys_ftruncate(fd: u64, length: u64) -> Result<u64, Errno> {
                 || node.is_evdev()
                 || node.is_vtconsole()
                 || node.is_vtinput()
-                || node.is_vtfb1()
-                || node.is_vtinput1()
+                || node.vtfb_session().is_some()
+                || node.vtinput_session().is_some()
+                || node.vtmouse_session().is_some()
             {
                 return Err(Errno::EINVAL);
             }
@@ -1875,8 +1895,9 @@ fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
         || node.is_evdev()
         || node.is_vtconsole()
         || node.is_vtinput()
-        || node.is_vtfb1()
-        || node.is_vtinput1()
+        || node.vtfb_session().is_some()
+        || node.vtinput_session().is_some()
+        || node.vtmouse_session().is_some()
     {
         // Символьные устройства варианта B: композитор видит S_IFCHR, как
         // `/dev/fb0`/`/dev/input/event0` в Linux, и может отличить их от
@@ -2088,7 +2109,22 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
         Some(Resolved::File { node, .. }) if node.is_vtconsole() => {
             vtconsole_ioctl(&node, request, arg)
         }
-        Some(Resolved::File { node, .. }) if node.is_vtfb1() => vtfb_ioctl(&node, request, arg),
+        Some(Resolved::File { node, .. }) if node.vtfb_session().is_some() => {
+            vtfb_ioctl(&node, request, arg)
+        }
+        Some(Resolved::File { node, .. }) if node.vtinput_session().is_some() => {
+            match request {
+                crate::drivers::vtinput::VTINPUT_SET_FOCUS => {
+                    // Фокус — не «политика окна», а факт от композитора:
+                    // принимаем только 0/1 и только от процесса, который
+                    // реально держит fd устройства этой сессии.
+                    let session = node.vtinput_session().unwrap_or(1);
+                    crate::drivers::vtinput::set_focus(session, arg != 0);
+                    Ok(0)
+                }
+                _ => Err(Errno::ENOTTY),
+            }
+        }
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
         // Сетевые `SIOCGIF*` — на любом `AF_INET`-сокете, как в Linux. До этой
         // ветки они падали в общий ENOTTY, и `ifconfig` не видел ни адреса, ни
