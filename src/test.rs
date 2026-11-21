@@ -8740,6 +8740,13 @@ mod desktop_b_tests {
             assert_eq_kernel!(VTFB_INFO_SIZE, 24, "respawn: info header is 24 bytes");
         });
         restore_synth(me, saved);
+        // Тест писал в `/dev/vtinput1` из задачи с СИНТЕТИЧЕСКИМ compat-состоянием,
+        // а этот путь защёлкивает владельца клавиатуры (`vtinput::client_active`):
+        // без сброса прямой IRQ1/USB-путь в boot-кольцо остался бы подавленным до
+        // конца загрузки, и следующие рутины (USB HID, `inputd`) во втором проходе
+        // `selftest 2` не увидели бы своих же байтов. Реальный `reap_dead_client`
+        // снимает защёлку из цикла shell, которого во время selftest нет.
+        crate::drivers::vtinput::reset();
         // Поверхность освобождается только когда задача сессии действительно
         // вышла: иначе flush писал бы в освобождённые кадры.
         if !session::live(1) {
