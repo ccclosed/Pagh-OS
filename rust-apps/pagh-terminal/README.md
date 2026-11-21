@@ -27,7 +27,14 @@ E2E с реальным композитором: `pagh-desktop` из dev (PR #1
   без bit 2 обслуживается прежним полным кадром.
 * ABI v1 kernel console shared surface: валидатор, reader, конвертация в
   экран (`/dev/vtconsole0`, `/dev/vtinput`), см. [TERMINAL.md](TERMINAL.md).
-* 120 host-тестов, включая эталонные escape-последовательности и скриншоты.
+* **Режим kernel-session (по умолчанию для `--socket`)**: окно блитит пиксели
+  поверхности сессии ядра `/dev/vtfb1` (ioctl `0x4700` + `mmap`) и передаёт
+  клавиатуру в `/dev/vtinput1`. Команды, эхо, редактирование строки и
+  scrollback делает ядро; клиент рендерит и передаёт ввод, ничего не имитируя.
+  Масштаб/центрирование — по `generation`, ошибки устройств и `exit` в сессии
+  показываются в окне честно. Детали и границы — в [TERMINAL.md](TERMINAL.md).
+* 159 host-тестов, включая эталонные escape-последовательности, скриншоты и
+  mock-устройства kernel-session (на хосте `/dev/vtfb1` нет).
 
 ## Сборка и проверки
 
@@ -57,16 +64,21 @@ cargo run -- --headless --demo 01-welcome --out /tmp/welcome.png --print
 cargo run -- --headless --script session.bin --cols 100 --rows 30 \
   --out /tmp/session.png --print
 
-# живое окно через compositor (task desktop-server)
+# живое окно через compositor: сессия ядра (/dev/vtfb1 + /dev/vtinput1) —
+# это режим по умолчанию, никаких специальных флагов не нужно
 cargo run -- --socket /tmp/pagh-desktop.sock --size 900x600
 
-# окно с собственной shell-сессией (по умолчанию для --vt + --socket):
-# дочерний shell за pipe'ами, boot-VT не читается и ввод в lxrun не уходит
-cargo run -- --vt /dev/vtconsole0 --socket /tmp/pagh-desktop.sock
+# другой worktree/ядро: подменить устройства поверхности и ввода
+cargo run -- --socket /tmp/pagh-desktop.sock \
+  --vt-fb /dev/vtfb1 --vt-input /dev/vtinput1
 
-# диагностика: по-прежнему зеркалить boot-VT в окне
-cargo run -- --vt /dev/vtconsole0 --vt-input /dev/vtinput \
-  --socket /tmp/pagh-desktop.sock --mirror-vt
+# демо-шелл (скриншоты, A/B) и userspace-shell за pipe'ами (fallback/тест) —
+# оба режима сохранены, но больше не по умолчанию
+cargo run -- --socket /tmp/pagh-desktop.sock --demo-shell
+cargo run -- --socket /tmp/pagh-desktop.sock --pipe-shell
+
+# диагностика: зеркалить boot-VT (--vt + --socket) или один снимок (без --socket)
+cargo run -- --vt /dev/vtconsole0 --socket /tmp/pagh-desktop.sock --mirror-vt
 ```
 
 Headless-демо: `01-welcome`, `02-colors`, `03-scrollback`, `04-unicode`.
@@ -75,13 +87,26 @@ Headless-демо: `01-welcome`, `02-colors`, `03-scrollback`, `04-unicode`.
 
 ## Ограничения
 
-Полноценного PTY нет (ABI v1 kernel console surface описан в
-[TERMINAL.md](TERMINAL.md)). Live-режим подключается к `pagh-desktop` по PDP/1:
-окно запускает собственный shell-потомок через pipe'ы (минимальный userspace
-shell `help/ls/cd/pwd/echo/cat/uname/clear/exit`), а не зеркалит boot-VT;
-`--mirror-vt` возвращает старое зеркало для диагностики. ShmSurface включается только если
-сервер объявил `welcome.flags` bit 2 (иначе — полный кадр). Нет reflow при
-resize,
+Live-режим подключается к `pagh-desktop` по PDP/1 и по умолчанию показывает
+сессию ядра: клиент блитит `/dev/vtfb1` и пишет клавиши в `/dev/vtinput1`.
+Полный набор команд (`df`, `ps`, `ppkg`, `lxrun`, `disk`, `nano`, history,
+редактирование строки, scrollback) — это ядро; в клиенте их нет вообще.
+Если устройств нет (старое ядро), окно говорит об этом в stderr и
+откатывается на прежнюю pipe-сессию с userspace-shell'ом
+(`help/ls/cd/pwd/echo/cat/uname/clear/exit`, флаг `--pipe-shell`, он же
+`--vt` + `--socket`); `--mirror-vt` возвращает зеркало boot-VT для
+диагностики, `--demo-shell` — демо-шелл.
+
+Честные границы kernel-session: нет PTY/termios, нет `TIOCGWINSZ`/SIGWINCH
+(размер знает только ядро), `Ctrl+C`/`Ctrl+Z` — просто байты в
+`/dev/vtinput1` (сигналы доставляет ядро), пиксельная поверхность не несёт
+DEC-режимов, поэтому стрелки всегда идут в normal-кадрах; одна сессия на
+окно, scrollback/selection остаются в ядре и колесом не листаются. При
+уменьшении окна кадр масштабируется nearest-neighbour (без обрезки и без
+апскейла).  Интеграция с kernel-веткой пока не проверена live: устройства
+реализуются в параллельной ветке, клиент проверен на mock-устройствах и
+`read()`-fallback'е.  ShmSurface включается только если сервер объявил
+`welcome.flags` bit 2 (иначе — полный кадр). Нет reflow при resize,
 комбинирующие метки не компонуются, OSC 4/8/52 игнорируются.  Подробно —
 [TERMINAL.md](TERMINAL.md).
 

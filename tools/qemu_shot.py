@@ -110,6 +110,11 @@ def key_name(ch: str) -> str:
 # (one sendkey per character), so "down" there really types d-o-w-n — the arrows,
 # Enter, Escape, Tab, Backspace and the function keys need `Monitor.send_key`.
 NAMED_KEYS = {
+    # Modifiers are valid QEMU key names on their own and are the parts of a
+    # chord (`ctrl-s`), which `send_key` passes through to one `sendkey` word.
+    "ctrl",
+    "alt",
+    "shift",
     "esc",
     "ret",
     "tab",
@@ -215,7 +220,16 @@ class Monitor:
         character is accepted too, so ``send_key("f")`` and ``send_keys("f")`` mean
         the same thing.
         """
-        if len(name) == 1:
+        # A chord (`ctrl-s`, `ctrl-alt-f1`) is one QEMU `sendkey` word: QEMU
+        # presses every part, holds, and releases. It must go through the SAME
+        # monitor path as ordinary typing — mixing a QMP `send-key` chord with
+        # HMP `sendkey` left a modifier stuck under TCG, and the next letter then
+        # reached the guest as ^C.
+        if "-" in name and len(name) <= 24 and all(
+            part in NAMED_KEYS or len(part) == 1 for part in name.split("-")
+        ):
+            cmd = f"sendkey {name}"
+        elif len(name) == 1:
             cmd = f"sendkey {key_name(name)}"
         elif name in NAMED_KEYS:
             cmd = f"sendkey {name}"
