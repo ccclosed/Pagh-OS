@@ -132,6 +132,20 @@ pub fn bind(pid: u64, session: usize) {
     BIND_COUNT.store(binds.len() as u32, Ordering::Relaxed);
 }
 
+/// Унаследовать привязку родителя fork-ребёнком (`lxrun`-программа сделала
+/// `fork`).
+///
+/// Без этого ребёнок задания не принадлежал бы ни окну, ни boot-консоли: его
+/// вывод ушёл бы в boot-консоль, а stdin — в boot-терминал. Привязка — часть
+/// управляющего терминала, поэтому наследуется как `pgid`/`tty_job`. Boot-сессия
+/// привязок не имеет, и родитель из неё не создаёт запись.
+pub fn inherit_bind(child: u64) {
+    let session = current();
+    if session != session_route::BOOT_SESSION {
+        bind(child, session);
+    }
+}
+
 /// Снять привязку задачи (вызывается на её выходе, чтобы таблица не росла).
 pub fn unbind(pid: u64) {
     let mut binds = BINDS.lock();
@@ -264,6 +278,8 @@ pub fn exit(session: usize) -> ! {
     // Забыть fd прошлой генерации: их close придёт позже и не должен
     // сосчитаться как закрытие будущей сессии (см. [`note_close`]).
     OPEN_FDS.store(0, Ordering::Relaxed);
+    crate::shell::jobs::clear_session(session);
+    crate::drivers::tty::reset_session(session);
     reset(session);
     crate::drivers::framebuffer::reset_session(session);
     crate::task::scheduler::exit_current()

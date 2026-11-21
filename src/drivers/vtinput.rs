@@ -99,6 +99,88 @@ pub fn reap_dead_client() {
     }
 }
 
+/// Отдать VT-байты foreground-программе сессии, применив `ISIG`.
+///
+/// Пока foreground — Linux-программа (`lxrun`), её stdin читается из очереди
+/// сессии в io_sys; байты идут туда дословно (UTF-8/escape сохраняются). Но
+/// управляющий терминал обязан превращать `^C`/`^Z`/`^\\` в сигналы, пока
+/// программа не сняла `ISIG` (raw-режим): иначе вызов `read(2)` в cooked-режиме
+/// получил бы байт `0x03` вместо `SIGINT`, и `Ctrl+C` в окне не прерывал бы
+/// задание. Сигнальные байты не доставляются (Linux ISIG их не отдаёт).
+///
+/// `true` — байты обработаны как ввод программы; `false` — foreground'а нет, и
+/// вызывающий переводит их в скан-коды shell'а.
+fn deliver_to_job(session: usize, fg: u64, bytes: &[u8]) -> bool {
+    use crate::arch::x86_64::linux::signal_frame::{SIGINT, SIGQUIT, SIGTSTP};
+    if fg == 0 || !crate::task::compat::compat_exists(fg) {
+        return false;
+    }
+    // Raw-режим (nvim/less) сам разбирает управляющие байты: ISIG снят вместе
+    // с ICANON, поэтому байт доставляется как есть в stdin-очередь.
+    if crate::task::compat::compat_is_raw(fg) {
+        crate::arch::x86_64::linux::io_sys::push_stdin_bytes_for(session, bytes);
+        return true;
+    }
+    // Cooked-режим: сигнальные байты — в сигналы (ISIG), остальное — в
+    // scancode-кольцо ЭТОЙ сессии, чтобы `read_stdin_line` применил ту же
+    // cooked-дисциплину (эхо, Backspace, Enter), что и к физической клавиатуре.
+    // Отдавать сырые байты в очередь здесь нельзя: они вернулись бы из `read`
+    // до Enter, и построчное чтение перестало бы быть построчным.
+    let mut kept = [0u8; 64];
+    let mut kept_len = 0usize;
+    let mut flush = |bytes: &[u8], session: usize| {
+        let mut parser = parser_for(session).lock();
+        if session == crate::drivers::session_route::BOOT_SESSION {
+            parser.feed(bytes, &mut |scancode| {
+                crate::drivers::ps2_kbd::inject_scancode_from_vt(scancode);
+            });
+        } else {
+            parser.feed(bytes, &mut |scancode| {
+                crate::drivers::ps2_kbd::push_session_scancode(session, scancode);
+            });
+        }
+    };
+    for &byte in bytes {
+        match byte {
+            0x03 | 0x1A | 0x1C => {
+                let sig = if byte == 0x03 {
+                    SIGINT
+                } else if byte == 0x1A {
+                    SIGTSTP
+                } else {
+                    SIGQUIT
+                };
+                // Защёлка — чтобы foreground_wait shell'а увидел нажатие и
+                // вернул промпт/напечатал `^C`/`^Z` даже когда сигнал доставили
+                // мы, а не декодер скан-кодов.
+                if sig == SIGINT {
+                    crate::drivers::ps2_kbd::set_ctrl_c(session, true);
+                } else if sig == SIGTSTP {
+                    crate::drivers::ps2_kbd::set_ctrl_z(session, true);
+                }
+                if kept_len > 0 {
+                    flush(&kept[..kept_len], session);
+                    kept_len = 0;
+                }
+                let pgid = crate::drivers::tty::foreground_pgid_for(session);
+                let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(pgid, sig);
+            }
+            _ => {
+                kept[kept_len] = byte;
+                kept_len += 1;
+                if kept_len == kept.len() {
+                    flush(&kept[..kept_len], session);
+                    kept_len = 0;
+                }
+            }
+        }
+    }
+    if kept_len > 0 {
+        flush(&kept[..kept_len], session);
+    }
+    true
+}
+
 /// Перевести VT-байты в скан-коды и разбудить shell. Возвращает `len` — запись
 /// всегда принимается целиком (как `/dev/uinput`-подобный sink).
 pub fn write(bytes: &[u8]) -> usize {
@@ -112,15 +194,14 @@ pub fn write(bytes: &[u8]) -> usize {
         note_client(crate::task::scheduler::current_pid());
     }
     // Пока foreground — Linux-программа (`lxrun`), её stdin читается из
-    // `STDIN_PENDING` в io_sys; отдаём байты туда дословно (UTF-8/escape
-    // сохраняются). Иначе ввод адресован shell-редактору — переводим в set-1.
-    let fg = crate::drivers::ps2_kbd::FG_PID.load(core::sync::atomic::Ordering::Relaxed);
-    if fg != 0 && crate::task::compat::compat_exists(fg) {
-        crate::arch::x86_64::linux::io_sys::push_stdin_bytes(bytes);
+    // очереди сессии; иначе ввод адресован shell-редактору — переводим в set-1.
+    let session = crate::drivers::session::current();
+    let fg = crate::drivers::ps2_kbd::fg_pid(session);
+    if deliver_to_job(session, fg, bytes) {
         return bytes.len();
     }
     {
-        let mut parser = parser_for(crate::drivers::session::current()).lock();
+        let mut parser = parser_for(session).lock();
         parser.feed(bytes, &mut |scancode| {
             crate::drivers::ps2_kbd::inject_scancode_from_vt(scancode);
         });
@@ -159,9 +240,11 @@ pub fn write_session(session: usize, bytes: &[u8]) -> usize {
     if bytes.is_empty() || session == crate::drivers::session_route::BOOT_SESSION {
         return write(bytes);
     }
-    let fg = crate::drivers::ps2_kbd::FG_PID.load(Ordering::Relaxed);
-    if fg != 0 && crate::task::compat::compat_exists(fg) {
-        crate::arch::x86_64::linux::io_sys::push_stdin_bytes(bytes);
+    // Foreground — программа ИМЕННО этой сессии: ввод окна не должен уходить
+    // в stdin программы другого окна/ boot-shell'а, а `ISIG` (`^C`/`^Z`) обязан
+    // слать сигнал foreground-группе этой сессии.
+    let fg = crate::drivers::ps2_kbd::fg_pid(session);
+    if deliver_to_job(session, fg, bytes) {
         return bytes.len();
     }
     {

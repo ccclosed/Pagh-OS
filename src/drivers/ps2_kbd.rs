@@ -82,6 +82,85 @@ static SESSION_RINGS: [Spinlock<KeyboardInner>; crate::drivers::session_route::M
 };
     crate::drivers::session_route::MAX_SESSIONS];
 
+// ─── per-session foreground pid / Ctrl-latches ───────────────────────────────
+//
+// Каждая консольная сессия имеет СВОЙ foreground-процесс и свои защёлки ^C/^Z:
+// два окна (или окно и boot-shell) не должны отбирать друг у друга терминал и
+// глотать чужой Ctrl+C. Boot-сессия (0) по-прежнему живёт в публичных статиках
+// [`CTRL_C`]/[`CTRL_Z`]/[`FG_PID`] — их читают IRQ1 и старые пути; сессии окон
+// (`>= 1`) — в массивах ниже, доступ через [`ctrl_c`]/[`ctrl_z`]/[`fg_pid`].
+
+/// Защёлка Ctrl+C по сессиям (индекс 0 не используется: см. [`CTRL_C`]).
+static SESSION_CTRL_C: [core::sync::atomic::AtomicBool;
+    crate::drivers::session_route::MAX_SESSIONS] = [const { core::sync::atomic::AtomicBool::new(false) };
+    crate::drivers::session_route::MAX_SESSIONS];
+/// Защёлка Ctrl+Z по сессиям (индекс 0 не используется).
+static SESSION_CTRL_Z: [core::sync::atomic::AtomicBool;
+    crate::drivers::session_route::MAX_SESSIONS] = [const { core::sync::atomic::AtomicBool::new(false) };
+    crate::drivers::session_route::MAX_SESSIONS];
+/// PID foreground `Compat_Process` по сессиям (индекс 0 не используется).
+static SESSION_FG_PIDS: [core::sync::atomic::AtomicU64;
+    crate::drivers::session_route::MAX_SESSIONS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::drivers::session_route::MAX_SESSIONS];
+
+fn session_slot(session: usize) -> Option<usize> {
+    if session != crate::drivers::session_route::BOOT_SESSION
+        && session < crate::drivers::session_route::MAX_SESSIONS
+    {
+        Some(session)
+    } else {
+        None
+    }
+}
+
+/// Забрать (и сбросить) защёлку Ctrl+C сессии.
+pub fn take_ctrl_c(session: usize) -> bool {
+    match session_slot(session) {
+        Some(s) => SESSION_CTRL_C[s].swap(false, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_C.swap(false, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Поставить защёлку Ctrl+C сессии.
+pub fn set_ctrl_c(session: usize, on: bool) {
+    match session_slot(session) {
+        Some(s) => SESSION_CTRL_C[s].store(on, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_C.store(on, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Забрать (и сбросить) защёлку Ctrl+Z сессии.
+pub fn take_ctrl_z(session: usize) -> bool {
+    match session_slot(session) {
+        Some(s) => SESSION_CTRL_Z[s].swap(false, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_Z.swap(false, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Поставить защёлку Ctrl+Z сессии.
+pub fn set_ctrl_z(session: usize, on: bool) {
+    match session_slot(session) {
+        Some(s) => SESSION_CTRL_Z[s].store(on, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_Z.store(on, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// PID foreground-программы сессии (`0` — foreground у shell).
+pub fn fg_pid(session: usize) -> u64 {
+    match session_slot(session) {
+        Some(s) => SESSION_FG_PIDS[s].load(core::sync::atomic::Ordering::Relaxed),
+        None => FG_PID.load(core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Записать PID foreground-программы сессии (`0` — вернуть терминал shell).
+pub fn set_fg_pid(session: usize, pid: u64) {
+    match session_slot(session) {
+        Some(s) => SESSION_FG_PIDS[s].store(pid, core::sync::atomic::Ordering::Relaxed),
+        None => FG_PID.store(pid, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 /// Initialize the PS/2 keyboard driver.
 pub fn init() {
     let kbd = Arc::new(Ps2Keyboard::new());
