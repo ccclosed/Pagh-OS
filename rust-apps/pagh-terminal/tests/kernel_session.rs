@@ -18,9 +18,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use pagh_terminal::kernelsession::{
-    encode_key_bytes, encode_snapshot, fit_placement, is_missing_device, is_session_end,
-    render_notice, solid_pixels, Draw, FileInput, FitPlacement, FrameSource, InputSink,
-    KernelFrame, KeyForwarder, ReadFrameSource, VtFbError, VtFbInfo,
+    buttons_to_mask, encode_key_bytes, encode_mouse_event, encode_snapshot, fit_placement,
+    is_missing_device, is_session_end, render_notice, solid_pixels, wheel_from_axis,
+    window_to_surface, Draw, FileInput, FitPlacement, FrameSource, InputSink, KernelFrame,
+    KeyForwarder, MouseEvent, MouseForwarder, ReadFrameSource, VtFbError, VtFbInfo, MOUSE_BTN_LEFT,
+    MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_EVENT_LEN,
 };
 use pagh_terminal::protocol::{self, configure_flags, welcome_flags, Message};
 use pagh_terminal::render::{Canvas, Theme};
@@ -684,4 +686,150 @@ fn a_regular_file_surface_uses_read_fallback_and_reports_a_missing_compositor() 
         "причина отказа композитора обязана быть названа: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── указатель сессии: /dev/vtmouse{N} ─────────────────────────────────────────
+
+#[test]
+fn mouse_event_is_sixteen_little_endian_bytes() {
+    let event = MouseEvent {
+        x: 1234,
+        y: -5,
+        buttons: MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT,
+        wheel: -3,
+    };
+    let bytes = encode_mouse_event(&event);
+    assert_eq!(bytes.len(), MOUSE_EVENT_LEN);
+    assert_eq!(i32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1234);
+    assert_eq!(i32::from_le_bytes(bytes[4..8].try_into().unwrap()), -5);
+    assert_eq!(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT
+    );
+    assert_eq!(i32::from_le_bytes(bytes[12..16].try_into().unwrap()), -3);
+}
+
+#[test]
+fn pdp_button_mask_maps_to_the_kernels_button_bits() {
+    // PDP/1: LEFT = bit0, MIDDLE = bit1, RIGHT = bit2. Ядро: LEFT=1, RIGHT=2,
+    // MIDDLE=4. Ошибка здесь — «нажал левую, выделилась правая».
+    assert_eq!(
+        buttons_to_mask(protocol::buttons::MASK_LEFT),
+        MOUSE_BTN_LEFT
+    );
+    assert_eq!(
+        buttons_to_mask(protocol::buttons::MASK_RIGHT),
+        MOUSE_BTN_RIGHT
+    );
+    assert_eq!(
+        buttons_to_mask(protocol::buttons::MASK_MIDDLE),
+        MOUSE_BTN_MIDDLE
+    );
+    assert_eq!(
+        buttons_to_mask(protocol::buttons::MASK_LEFT | protocol::buttons::MASK_RIGHT),
+        MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT
+    );
+    assert_eq!(buttons_to_mask(0), 0);
+}
+
+#[test]
+fn wheel_axis_is_translated_to_the_ps2_convention() {
+    // PDP/1 REL_WHEEL: +1 = away from the user (scroll up, older text).
+    // PS/2 IntelliMouse: away from the user is -1, and the kernel shell
+    // computes `lines = -delta` (positive = older), so the client negates.
+    assert_eq!(wheel_from_axis(1), -1);
+    assert_eq!(wheel_from_axis(-1), 1);
+    assert_eq!(wheel_from_axis(0), 0);
+    assert_eq!(wheel_from_axis(3), -3);
+}
+
+#[test]
+fn window_coordinates_map_back_to_surface_pixels() {
+    let surface = info(1280, 800, 1);
+    // 1:1 по центру: поверхность 1280×800 в окне 1400×900 → x=60, y=50.
+    let place = fit_placement(1280, 800, 1400, 900).expect("fit");
+    assert_eq!(
+        (place.x, place.y, place.width, place.height),
+        (60, 50, 1280, 800)
+    );
+    assert_eq!(window_to_surface(60, 50, &surface, &place), (0, 0));
+    assert_eq!(
+        window_to_surface(60 + 1279, 50 + 799, &surface, &place),
+        (1279, 799)
+    );
+    // Точка в поле (левее кадра) прижимается к краю, а не уезжает в минус.
+    assert_eq!(window_to_surface(0, 0, &surface, &place), (0, 0));
+
+    // Downscale: окно 640×400 показывает поверхность 1280×800 вдвое меньше.
+    let small = fit_placement(1280, 800, 640, 400).expect("fit");
+    assert_eq!(
+        (small.x, small.y, small.width, small.height),
+        (0, 0, 640, 400)
+    );
+    assert_eq!(window_to_surface(0, 0, &surface, &small), (0, 0));
+    assert_eq!(window_to_surface(639, 399, &surface, &small), (1278, 798));
+    assert_eq!(window_to_surface(320, 200, &surface, &small), (640, 400));
+}
+
+#[test]
+fn mouse_forwarder_sends_position_buttons_and_wheel() {
+    let surface = info(100, 50, 1);
+    let place = fit_placement(100, 50, 100, 50).expect("fit");
+    let mut forwarder = MouseForwarder::new(
+        MockInput {
+            written: Vec::new(),
+        },
+        &surface,
+        place,
+    );
+    forwarder.motion(10, 20, 0).unwrap();
+    forwarder
+        .button(10, 20, protocol::buttons::MASK_LEFT)
+        .unwrap();
+    forwarder
+        .axis(10, 20, protocol::buttons::MASK_LEFT, 2)
+        .unwrap();
+    let written = &forwarder.sink().written;
+    assert_eq!(written.len(), 3 * MOUSE_EVENT_LEN);
+    let first = &written[..MOUSE_EVENT_LEN];
+    assert_eq!(i32::from_le_bytes(first[0..4].try_into().unwrap()), 10);
+    assert_eq!(i32::from_le_bytes(first[4..8].try_into().unwrap()), 20);
+    assert_eq!(u32::from_le_bytes(first[8..12].try_into().unwrap()), 0);
+    assert_eq!(i32::from_le_bytes(first[12..16].try_into().unwrap()), 0);
+    let second = &written[MOUSE_EVENT_LEN..2 * MOUSE_EVENT_LEN];
+    assert_eq!(
+        u32::from_le_bytes(second[8..12].try_into().unwrap()),
+        MOUSE_BTN_LEFT
+    );
+    let third = &written[2 * MOUSE_EVENT_LEN..];
+    assert_eq!(i32::from_le_bytes(third[12..16].try_into().unwrap()), -2);
+}
+
+#[test]
+fn mouse_forwarder_reports_a_broken_session_sink() {
+    struct Failing;
+    impl InputSink for Failing {
+        fn send(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(19))
+        }
+    }
+    let surface = info(10, 10, 1);
+    let place = fit_placement(10, 10, 10, 10).unwrap();
+    let mut forwarder = MouseForwarder::new(Failing, &surface, place);
+    let error = forwarder.motion(1, 1, 0).unwrap_err();
+    assert!(is_session_end(&error));
+}
+
+#[test]
+fn help_names_the_pointer_device_and_session_scan() {
+    let out = Command::new(binary()).arg("--help").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("--vt-mouse"),
+        "help must name the pointer device: {text}"
+    );
+    assert!(
+        text.contains("first free /dev/vtfbN"),
+        "help must explain session auto-attach: {text}"
+    );
 }
