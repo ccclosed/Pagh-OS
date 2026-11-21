@@ -27,11 +27,11 @@ cargo test                       # host gnu; C-компилятор = $CC или
 cargo run --bin tinygl-probe     # эталонный треугольник + ELF-класс
 ```
 
-`cargo test` прогоняет 53 теста: unit-тесты `Surface`/`lists` (валидация,
+`cargo test` прогоняет 55 тестов: unit-тесты `Surface`/`lists` (валидация,
 resize, зеркало list-слотов), `tests/criterion6.rs` (строгий эталон PR1 +
 детерминизм), `tests/ffi_core.rs` (матрицы/viewport, depth, culling,
 `ZB_resize`, bad-input, матричные стеки), `tests/textures.rs` (квадранты,
-ресемпл, DECAL, `GL_TEXTURE`-стек, пиксельные дайджесты textured quad/cube),
+ресемпл, DECAL, `GL_TEXTURE`-стек, пиксельные дайджесты textured triangle/quad/cube),
 `tests/display_lists.rs` (равенство immediate-рендеру, вложенность, эмуляция
 `glDeleteLists`, отказы на crash-условиях C) и `tests/probe_binary.rs`
 (маркеры/cc/ELF собранного бинаря).
@@ -46,9 +46,10 @@ digest=0x3f7e5ece33386f9b center=0x003c4c7a corner=0x00000000
 PR3 закрепляет и текстурные кадры (те же 64×64, кадр `n` = угол `n*15°`):
 
 ```text
-textured quad   digest=0xd42374727addc383 center=0x0000ff00 coverage=4096
-textured cube 0 digest=0x72e1d21459ce58e1 center=0x0000ff00 coverage=1444
-textured cube 5 digest=0xe40990fcec6b8835 center=0x00ff0000 coverage=1288
+textured triangle digest=0xf65ae5ccdb28d083 center=0x0000ff00 coverage=2080
+textured quad     digest=0xd42374727addc383 center=0x0000ff00 coverage=4096
+textured cube 0   digest=0x72e1d21459ce58e1 center=0x0000ff00 coverage=1444
+textured cube 5   digest=0xe40990fcec6b8835 center=0x00ff0000 coverage=1288
 ```
 
 Любое расхождение валит тест: это сделано намеренно (никакого «запишем и

@@ -113,6 +113,7 @@ FP-reassociation при идентичной геометрии (тот же `ce
 
 | Сцена | digest | center | coverage |
 |---|---|---|---|
+| textured triangle (нижняя половина) | `0xf65ae5ccdb28d083` | `0x0000ff00` | 2080 |
 | textured quad (полный экран) | `0xd42374727addc383` | `0x0000ff00` | 4096 |
 | textured cube, frame 0 | `0x72e1d21459ce58e1` | `0x0000ff00` | 1444 |
 | textured cube, frame 1 | `0x07f06296f1d4e322` | `0x0000ff00` | 1289 |
@@ -126,7 +127,7 @@ GL; upstream данные не переворачивает). Квадранты
 верх-право белый, низ-лево красный, низ-право зелёный — это проверяет
 `texture_quadrants_and_orientation`.
 
-**Host и musl совпали байт-в-байт** (все 53 теста зелёные на обоих):
+**Host и musl совпали байт-в-байт** (все 55 тестов зелёные на обоих):
 host `gcc 16.2.1` (`x86_64-unknown-linux-gnu`) и musl `musl-gcc 12.2.0`
 (Debian 12.2.0-14+deb12u1, контейнер `debian:bookworm-slim` + `musl-tools`,
 toolchain `nightly-2026-07-12`). Расхождения интерполяции не наблюдается,

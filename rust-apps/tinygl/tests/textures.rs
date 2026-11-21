@@ -127,6 +127,28 @@ fn bind_quadrant_texture(ctx: &Context<'_>) -> u32 {
     names[0]
 }
 
+/// Полноэкранный текстурный треугольник (`GL_TRIANGLES`, UV 0..1) — нижняя
+/// половина экрана при `quad_projection`.
+fn draw_textured_triangle(ctx: &Context<'_>) {
+    ctx.begin(Primitive::Triangles).expect("begin");
+    ctx.color3f(1.0, 1.0, 1.0);
+    ctx.tex_coord2f(0.0, 0.0);
+    ctx.vertex3f(-1.0, -1.0, 0.0);
+    ctx.tex_coord2f(1.0, 0.0);
+    ctx.vertex3f(1.0, -1.0, 0.0);
+    ctx.tex_coord2f(0.0, 1.0);
+    ctx.vertex3f(-1.0, 1.0, 0.0);
+    ctx.end().expect("end");
+}
+
+fn render_textured_triangle() -> Frame {
+    frame(CLEAR, |ctx| {
+        quad_projection(ctx);
+        bind_quadrant_texture(ctx);
+        draw_textured_triangle(ctx);
+    })
+}
+
 /// Полноэкранный текстурный quad (`GL_QUADS`, UV 0..1).
 fn draw_textured_quad(ctx: &Context<'_>) {
     ctx.begin(Primitive::Quads).expect("begin");
@@ -231,6 +253,9 @@ fn render_textured_cube(frame_index: u32) -> Frame {
 
 // --- пиксельные эталоны (закреплены после детерминированного прогона) ------
 
+const TRIANGLE_DIGEST: u64 = 0xf65a_e5cc_db28_d083;
+const TRIANGLE_CENTER: u32 = 0x0000_ff00;
+const TRIANGLE_COVERAGE: usize = 2080;
 const QUAD_DIGEST: u64 = 0xd423_7472_7add_c383;
 const QUAD_CENTER: u32 = 0x0000_ff00;
 const QUAD_COVERAGE: usize = 4096;
@@ -283,6 +308,34 @@ fn textured_quad_matches_criterion() {
         "full-screen textured quad covers the corner (no clear colour left)"
     );
     assert_eq!(rendered.center() >> 24, 0, "pixels must stay 0x00RRGGBB");
+}
+
+#[test]
+fn textured_triangle_matches_criterion() {
+    let _guard = gl_test_lock();
+    let rendered = render_textured_triangle();
+    if rendered.center() != TRIANGLE_CENTER || rendered.coverage() != TRIANGLE_COVERAGE {
+        panic!(
+            "textured triangle GEOMETRY changed (center 0x{:08x} vs 0x{TRIANGLE_CENTER:08x}, \
+             coverage {} vs {TRIANGLE_COVERAGE}) — BLOCK until classified",
+            rendered.center(),
+            rendered.coverage()
+        );
+    }
+    assert_eq!(
+        rendered.digest, TRIANGLE_DIGEST,
+        "textured triangle digest diverged with identical geometry — classify and record both \
+         host/musl digests before accepting"
+    );
+}
+
+#[test]
+fn textured_triangle_is_deterministic() {
+    let _guard = gl_test_lock();
+    let first = render_textured_triangle();
+    let second = render_textured_triangle();
+    assert_eq!(first.digest, second.digest);
+    assert_eq!(first.pixels, second.pixels);
 }
 
 #[test]
