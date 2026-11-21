@@ -385,50 +385,52 @@ pub fn irq_handler() {
     } else {
         let extended = DRV_EXTENDED.swap(false, Ordering::Relaxed);
         let make = scancode & 0x80 == 0;
+        // Терминальные семантики ^C/^Z принадлежат ВЛАДЕЛЬЦУ клавиатуры. Пока
+        // вводом владеет VT-клиент (boot `/dev/vtinput` или окно
+        // `/dev/vtinput1`), тот же физический байт уже ушёл в его терминал, и
+        // IRQ-трекинг не должен дублировать SIGINT/SIGTSTP в boot-сессию:
+        // иначе `Ctrl+C` в окне убивал boot-клиента, а `Ctrl+Z` парковал его
+        // (live-QEMU). Модификаторы всё равно отслеживаются — это цена одного
+        // атомика на IRQ.
+        let terminal_owner = !crate::drivers::vtinput::client_active();
         match (extended, scancode) {
             (false, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
             (true, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
             (false, 0x2C) if make && DRV_CTRL.load(Ordering::Relaxed) => {
-                CTRL_Z.store(true, Ordering::Relaxed);
+                if terminal_owner {
+                    CTRL_Z.store(true, Ordering::Relaxed);
+                }
             }
             (false, 0x2E) if make && DRV_CTRL.load(Ordering::Relaxed) => {
-                CTRL_C.store(true, Ordering::Relaxed);
-                let fg = FG_PID.load(Ordering::Relaxed);
-                // Клавиатурой владеет клиент окна, а foreground-группа этой
-                // ветки — он сам (клиент запущен из boot-shell): ^C, набранный
-                // В окне, пришёл сюда как физический scancode, но адресован он
-                // session-shell'у окна (его байты уже идут через
-                // `/dev/vtinput1`). Убить здесь клиента — значит закрыть всё
-                // окно по ^C, набранному внутри него. Программа, запущенная
-                // `lxrun` В окне, привязана к сессии 1 и защиту не получает:
-                // её ^C по-прежнему доставляется ниже, foreground-группе.
-                let window_owns_keys = fg != 0
-                    && crate::drivers::vtinput::client_active()
-                    && crate::drivers::session::bound_session(fg)
-                        == crate::drivers::session_route::BOOT_SESSION;
-                if fg != 0
-                    && crate::task::compat::compat_exists(fg)
-                    && !crate::task::compat::compat_is_raw(fg)
-                    && !window_owns_keys
-                {
-                    // Phase-2 signals: ^C delivers a real SIGINT to the
-                    // terminal's FOREGROUND PROCESS GROUP — a job that forked
-                    // has several thread groups and every one of them must see
-                    // the interrupt, not only the pid the shell records. A
-                    // program with a handler gets it (the blocking-wait EINTR
-                    // checks wake it); without one the default-terminate action
-                    // kills it at the next syscall return — the classic
-                    // driver-level bypass remains only as the fallback for a
-                    // foreground group that has no live member (e.g. ^C racing
-                    // the handoff in `cmd_lxrun`).
-                    let pgid = crate::drivers::tty::foreground_pgid();
-                    if crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
-                        pgid,
-                        crate::arch::x86_64::linux::signal_frame::SIGINT,
-                    )
-                    .is_err()
+                if !terminal_owner {
+                    // Занято окном: байт уже ушёл композитору, а его сессия
+                    // разберёт `ISIG` сама.
+                } else {
+                    CTRL_C.store(true, Ordering::Relaxed);
+                    let fg = FG_PID.load(Ordering::Relaxed);
+                    if fg != 0
+                        && crate::task::compat::compat_exists(fg)
+                        && !crate::task::compat::compat_is_raw(fg)
                     {
-                        crate::task::scheduler::request_exit(fg);
+                        // Phase-2 signals: ^C delivers a real SIGINT to the
+                        // terminal's FOREGROUND PROCESS GROUP — a job that forked
+                        // has several thread groups and every one of them must see
+                        // the interrupt, not only the pid the shell records. A
+                        // program with a handler gets it (the blocking-wait EINTR
+                        // checks wake it); without one the default-terminate action
+                        // kills it at the next syscall return — the classic
+                        // driver-level bypass remains only as the fallback for a
+                        // foreground group that has no live member (e.g. ^C racing
+                        // the handoff in `cmd_lxrun`).
+                        let pgid = crate::drivers::tty::foreground_pgid();
+                        if crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
+                            pgid,
+                            crate::arch::x86_64::linux::signal_frame::SIGINT,
+                        )
+                        .is_err()
+                        {
+                            crate::task::scheduler::request_exit(fg);
+                        }
                     }
                 }
             }

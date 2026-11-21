@@ -1327,6 +1327,11 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
             let _ = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
             return Err(Errno::ENODEV);
         }
+        // Открывший окно процесс забирает физическую клавиатуру у boot-консоли:
+        // ввод этой сессии идёт только через `/dev/vtinput1`, а дублирование
+        // IRQ1 в boot-кольцо давало второй доставке `^C`/`^Z` (live-QEMU: окно
+        // исчезало). Защёлка снимается `reap_dead_client` после выхода клиента.
+        crate::drivers::vtinput::claim_keyboard();
     }
     Ok(fd as u64)
 }
