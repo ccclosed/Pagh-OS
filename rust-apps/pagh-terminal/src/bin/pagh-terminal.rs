@@ -74,6 +74,8 @@ struct Args {
     vt_input: Option<String>,
     /// Pixel surface of the kernel shell session (default `/dev/vtfb1`).
     vt_fb: String,
+    /// Log every drawn kernel frame (generation evidence for live runs).
+    vt_trace: bool,
     size: (u32, u32),
     cols: Option<usize>,
     rows: Option<usize>,
@@ -116,6 +118,7 @@ impl Default for Args {
             vt: None,
             vt_input: None,
             vt_fb: KERNEL_FB.to_string(),
+            vt_trace: false,
             size: (900, 600),
             cols: None,
             rows: None,
@@ -1344,7 +1347,10 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     let mut dirty = true;
     let mut last_commit = Instant::now();
     let mut input_error_reported = false;
-    let trace = std::env::var_os("PAGH_TERMINAL_KERNEL_TRACE").is_some();
+    // `--vt-trace` (или переменная окружения) печатает каждый отрисованный
+    // кадр: в гостевой консоли это serial-доказательство того, что generation
+    // растёт с выводом сессии, а не «кадр застыл».
+    let trace = args.vt_trace || std::env::var_os("PAGH_TERMINAL_KERNEL_TRACE").is_some();
 
     loop {
         // 1. Кадр сессии: перерисовываем окно только когда ядро опубликовало
@@ -1354,7 +1360,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
             match frame.draw_if_changed(canvas, &theme) {
                 Ok(Draw::Drawn { generation }) => {
                     if trace {
-                        eprintln!("pagh-terminal: kernel frame generation {generation}");
+                        eprintln!("pagh-terminal: kernel frame generation {generation} drawn");
                     }
                     dirty = true;
                 }
@@ -1676,6 +1682,7 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             "--vt" => out.vt = Some(next_value(&mut args, "--vt")?),
             "--vt-input" => out.vt_input = Some(next_value(&mut args, "--vt-input")?),
             "--vt-fb" => out.vt_fb = next_value(&mut args, "--vt-fb")?,
+            "--vt-trace" => out.vt_trace = true,
             "--size" => out.size = parse_size(&next_value(&mut args, "--size")?)?,
             "--cols" => out.cols = Some(parse_usize(&next_value(&mut args, "--cols")?)?),
             "--rows" => out.rows = Some(parse_usize(&next_value(&mut args, "--rows")?)?),
@@ -1777,6 +1784,8 @@ WINDOW (default with --socket): KERNEL SHELL SESSION
   only, and simulates nothing.
   --vt-fb PATH      session pixel surface (default /dev/vtfb1)
   --vt-input PATH   session input device (default /dev/vtinput1)
+  --vt-trace        log every drawn frame (its kernel generation) to stderr;
+                   the guest console forwards that to the serial log
   If the devices are missing (kernel without the session surface) the window
   says so on stderr and falls back to the private userspace shell session.  If
   the devices exist but fail, the window shows the honest error and exits; it

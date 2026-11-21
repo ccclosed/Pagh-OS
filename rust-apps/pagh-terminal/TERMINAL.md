@@ -76,7 +76,10 @@ bare-metal target, поэтому для host-сборки std пересоби�
 
 Устройства kernel-session переопределяются `--vt-fb` (по умолчанию
 `/dev/vtfb1`) и `--vt-input` (по умолчанию `/dev/vtinput1` для этого режима и
-`/dev/vtinput` для `--vt`/`--mirror-vt`).
+`/dev/vtinput` для `--vt`/`--mirror-vt`).  `--vt-trace` печатает каждый
+отрисованный кадр с его `generation`: в гостевой консоли эти строки попадают в
+serial-лог, чем live-прогон доказывает, что поверхность действительно
+обновляется.
 
 ## Архитектура
 
@@ -500,6 +503,25 @@ application cursor, bracketed paste, mouse) из неё не наблюдаем�
 на первом `open`, а «предложить reconnect» в пиксельном зеркале пришлось бы
 делать отдельным UI ввода, которого в v1 нет.  Пауза перед закрытием нужна,
 чтобы сообщение успели прочитать, а не чтобы спрятать конец сессии.
+
+### Диагностика live-прогона
+
+При открытии поверхности клиент печатает одну строку о том, **как** получены
+пиксели, и с какой геометрией:
+
+```text
+pagh-terminal: kernel surface /dev/vtfb1: mmap 3145728 bytes PROT_READ|MAP_SHARED (ioctl 0x4700 1024x768 stride 4096 bpp 32)
+pagh-terminal: kernel session 1024x768 (stride 4096, generation 7) on /dev/vtfb1
+pagh-terminal: kernel session connected (client 3, screen 1280x800)
+```
+
+`read()`-fallback вместо первой строки печатает `mmap of … unavailable (…);
+falling back to read() snapshots`, так что путь получения пикселей виден в логе
+без отладчика.  С `--vt-trace` каждый отрисованный кадр печатает
+`kernel frame generation N drawn`, а завершение сессии —
+`kernel session ended (the shell exited); window closed`.  Гостевая консоль
+форвардит stderr процесса в serial-лог, поэтому все эти строки — evidence для
+live-интеграции (см. `.cache/pagh-agent-notes/q147-live/serial.log`).
 
 ### Тестируемость
 

@@ -425,6 +425,7 @@ fn help_names_the_kernel_session_mode_and_its_devices() {
         "/dev/vtfb1",
         "/dev/vtinput1",
         "--vt-fb",
+        "--vt-trace",
         "--pipe-shell",
         "--demo-shell",
         "no PTY/termios",

@@ -62,7 +62,7 @@ pub fn open_frame_source(path: &str) -> Result<Box<dyn FrameSource>, OpenError> 
             )))
         }
     };
-    match MmapSurface::new(file) {
+    match MmapSurface::new(file, path) {
         Ok(surface) => Ok(Box::new(surface)),
         Err(reason) => {
             eprintln!(
@@ -87,7 +87,7 @@ struct MmapSurface {
 }
 
 impl MmapSurface {
-    fn new(file: File) -> Result<MmapSurface, String> {
+    fn new(file: File, path: &str) -> Result<MmapSurface, String> {
         let info = query_info(&file)
             .map_err(|error| format!("ioctl 0x{VTFB_IOCTL_GET_INFO:04x}: {error}"))?;
         let len = info.pixels_len();
@@ -113,6 +113,15 @@ impl MmapSurface {
                 io::Error::last_os_error()
             ));
         }
+        // Одна строка на открытие: по ней видно, что поверхность получена
+        // именно общим отображением (а не read()-снимками), и какая геометрия
+        // объявлена ядром. В гостевой консоли она попадает в serial-лог, то
+        // есть служит доказательством live-интеграции без отладчика.
+        eprintln!(
+            "pagh-terminal: kernel surface {path}: mmap {len} bytes PROT_READ|MAP_SHARED \
+             (ioctl 0x{VTFB_IOCTL_GET_INFO:04x} {}x{} stride {} bpp {})",
+            info.width, info.height, info.stride, info.bpp
+        );
         Ok(MmapSurface {
             file,
             base: base as *mut u8,
