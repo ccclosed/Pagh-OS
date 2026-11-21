@@ -326,7 +326,11 @@ input-trace + full-render (для QEMU-приёмки tools/e2e.py desktop).
   --launch-target 'terminal=/usr/bin/pagh-terminal|--socket|{{socket}}'
 Токен {{socket}} заменяется путём сокета; без него добавится --connect.
 --autostart APP открывает приложение из --launch-target сразу после старта
-(панель остаётся интерактивной; один раз, как --spawn-demo).
-Протокол: PROTOCOL.md; демо-клиент: pagh-desktop-demo."
+(панель остаётся интерактивной; один раз).
+--demo-window/--spawn-demo/--demo-binary — ТОЛЬКО для тестов
+(tools/e2e.py desktop --legacy-demo). Обычный образ стартует из
+/mnt/etc/autorun с реальными --launch-target (канонический рецепт —
+desktop-autorun в этом каталоге), без demo-флагов.
+Протокол: PROTOCOL.md."
     );
 }

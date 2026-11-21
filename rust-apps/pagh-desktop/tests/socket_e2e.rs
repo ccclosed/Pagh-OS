@@ -345,6 +345,16 @@ fn launch_message_spawns_configured_app() {
     let (code, message) = error.expect("ошибка на неизвестное приложение");
     assert_eq!(code, ERR_UNSUPPORTED, "message = {message:?}");
     assert!(message.contains("paint"), "message = {message:?}");
+    // Обычный образ (без --spawn-demo) не должен молча падать в демо-клиент:
+    // клиент получает подсказку, что приложение задаётся --launch-target.
+    assert!(
+        message.contains("--launch-target paint="),
+        "ошибка не подсказывает --launch-target: {message:?}"
+    );
+    assert!(
+        !message.contains("spawn_demo"),
+        "ошибка всё ещё говорит про spawn_demo: {message:?}"
+    );
 
     server.control.shutdown();
     server.join().expect("сервер завершился");

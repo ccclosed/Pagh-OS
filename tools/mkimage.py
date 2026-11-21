@@ -19,6 +19,14 @@ programs. Limine loads ``disk.img`` next to the kernel and ``drivers::memdisk``
 presents it as a block device, so the medium carries the system. Writes go to
 RAM and are lost on reboot; the boot menu says so.
 
+THE DESKTOP RECIPE IS INSTALLED, NOT GENERATED. The desktop compositor is
+started by ``/mnt/etc/autorun`` inside the embedded ``disk.img`` (the kernel
+shell runs it on boot; see ``src/shell/mod.rs::run_autorun``). ``--autorun``
+installs a recipe file into a COPY of that image with ``debugfs`` — the original
+is never modified. Ordinary media use ``rust-apps/pagh-desktop/desktop-autorun``
+(real ``--launch-target`` entries); the demo client and its flags
+(``--spawn-demo``/``--demo-window``) are test-only and belong in no recipe.
+
 TOOLS REQUIRED. ``parted`` writes the GPT (both images and ``--make-disk``);
 ``mtools`` (``mformat``/``mcopy``/``mmd``) fills the ESP without loop devices or
 root; ``xorriso`` builds the ISO and is the only tool the ISO path needs beyond
@@ -125,6 +133,69 @@ def build_disk_image(dest: pathlib.Path, size_mb: int, userland: pathlib.Path | 
     else:
         log(f"disk image: {dest} ({size_mb} MiB, GPT, one empty partition — "
             f"the kernel formats it on first mount)")
+
+
+def stage_autorun(diskimg: pathlib.Path, autorun: pathlib.Path) -> pathlib.Path:
+    """Return a temporary copy of ``diskimg`` with ``autorun`` installed as /etc/autorun.
+
+    WHY A COPY. ``disk.img`` is the developer's/release builder's prepared volume
+    (64 MiB ext2 with the static binaries); the kernel mounts it as /mnt and runs
+    ``/etc/autorun`` before the shell prompt. Patching it in place would mutate an
+    input artifact and make a second build non-reproducible, so the copy is
+    patched and then unlinked by the caller.
+
+    The image must be a BARE ext2 filesystem: that is what the 2.24.0 desktop
+    media carry (Limine loads it as ``disk.img`` and the kernel mounts it without
+    a partition table). ``debugfs`` cannot address an ext2 inside a partition at
+    an offset, so a GPT image is rejected with a message instead of silently
+    writing to the wrong bytes.
+
+    The recipe must already fit the kernel's autorun budget (512 bytes, comments
+    skipped): a longer file is rejected here rather than truncated at boot.
+    """
+    if not autorun.is_file():
+        fail(f"autorun recipe not found: {autorun}")
+    body = autorun.read_bytes()
+    if len(body) > 512:
+        fail(f"autorun recipe is {len(body)} bytes; /mnt/etc/autorun is read as 512")
+    if not shutil.which("debugfs"):
+        fail("debugfs is required for --autorun (e2fsprogs)")
+    raw = diskimg.read_bytes()
+    # ext2 superblock magic 0xEF53 lives at byte 0x438 (1024 + 0x38).
+    if len(raw) < 1024 + 0x3A or raw[1024 + 0x38:1024 + 0x3A] != b"\x53\xef":
+        fail(f"{diskimg} is not a bare ext2 image (GPT/offset images are not "
+             f"supported by --autorun): pass the ext2 volume the kernel mounts as /mnt")
+    tmpdir = pathlib.Path(tempfile.mkdtemp(prefix="pagh-autorun-"))
+    staged = tmpdir / "disk.img"
+    recipe = tmpdir / "autorun"
+    shutil.copy2(diskimg, staged)
+    recipe.write_bytes(body)
+
+    def debugfs(command: str, write: bool = False) -> subprocess.CompletedProcess:
+        # One `-R` per invocation: debugfs documents a single request per run.
+        argv = ["debugfs"] + (["-w"] if write else []) + ["-R", command, str(staged)]
+        return subprocess.run(argv, capture_output=True, text=True)
+
+    probe = debugfs("stat /etc")
+    if "File not found" in (probe.stdout + probe.stderr):
+        fail(f"{diskimg} has no /etc: boot it once so the kernel formats/provisions "
+             f"the volume before installing the desktop autorun recipe")
+
+    # `write` refuses an existing destination, so drop the previous recipe first
+    # (a reused demo disk already carries one).
+    debugfs("rm /etc/autorun", write=True)
+    proc = debugfs(f"write {recipe} /etc/autorun", write=True)
+    if proc.returncode != 0 or "File not found" in (proc.stdout + proc.stderr):
+        fail(f"debugfs write /etc/autorun failed: {(proc.stderr or proc.stdout).strip()}")
+    proc = debugfs("sif /etc/autorun mode 0100644", write=True)
+    if proc.returncode != 0:
+        fail(f"debugfs chmod /etc/autorun failed: {(proc.stderr or proc.stdout).strip()}")
+    back = debugfs("cat /etc/autorun")
+    if back.stdout.encode() != body:
+        fail("debugfs: /etc/autorun read back differently than written")
+    log(f"autorun recipe installed into a copy of {diskimg} "
+        f"({len(body)} bytes, no demo flags assumed — the recipe file is the source)")
+    return staged
 
 
 def resolve_inputs(elf: str | None, disk: str | None) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -301,6 +372,11 @@ def main() -> int:
     ap.add_argument("--usb", metavar="PATH", help="write a GPT+ESP USB image here")
     ap.add_argument("--iso", metavar="PATH", help="write a BIOS+UEFI ISO here")
     ap.add_argument("--disk", metavar="PATH", help="disk image to embed (default disk.img)")
+    ap.add_argument("--autorun", metavar="PATH",
+                    help="install this file as /etc/autorun in a COPY of the embedded "
+                         "disk image (ordinary desktop recipe: "
+                         "rust-apps/pagh-desktop/desktop-autorun). Demo flags are "
+                         "test-only and must not be in this file")
     ap.add_argument("--make-disk", metavar="PATH",
                     help="create a GPT disk image with one ext2 partition here and exit")
     ap.add_argument("--disk-size-mb", type=int, default=1024,
@@ -323,10 +399,18 @@ def main() -> int:
     log(f"kernel {kernel} ({kernel.stat().st_size // 1024} KiB)")
     log(f"disk   {diskimg} ({diskimg.stat().st_size // (1024 * 1024)} MiB)")
     log(f"loader {loader}")
-    if args.usb:
-        build_usb(pathlib.Path(args.usb), kernel, diskimg, loader, args.size_mb or 0)
-    if args.iso:
-        build_iso_from(args.iso, loader, kernel, diskimg)
+    staged = None
+    try:
+        if args.autorun:
+            staged = stage_autorun(diskimg, pathlib.Path(args.autorun).resolve())
+            diskimg = staged
+        if args.usb:
+            build_usb(pathlib.Path(args.usb), kernel, diskimg, loader, args.size_mb or 0)
+        if args.iso:
+            build_iso_from(args.iso, loader, kernel, diskimg)
+    finally:
+        if staged is not None:
+            shutil.rmtree(staged.parent, ignore_errors=True)
     return 0
 
 
