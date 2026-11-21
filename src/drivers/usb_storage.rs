@@ -569,6 +569,9 @@ pub fn umount(target: &str, force: bool) -> Result<UmountOutcome, MountError> {
                 record.error = error::FLUSH_FAILED;
                 record.mounted = true;
                 record.safe_to_remove = false;
+                // Durability не подтверждён: до следующего успешного flush/replay
+                // том честно «unclean», даже если остался смонтированным.
+                record.unclean = true;
             }) {
                 usb_uevent::push_state(&record, kind::ERROR, error::FLUSH_FAILED);
             }
