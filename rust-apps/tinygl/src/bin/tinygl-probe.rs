@@ -29,8 +29,12 @@ fn main() -> ExitCode {
     let interp_only = args.iter().any(|arg| arg == "--check-interp");
 
     if !interp_only {
-        let Some((digest, center, corner)) = render_probe() else {
-            return ExitCode::FAILURE;
+        let (digest, center, corner) = match render_probe() {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("tinygl-probe: {err}");
+                return ExitCode::FAILURE;
+            }
         };
         println!(
             "TINYGL PROBE digest=0x{digest:016x} center=0x{center:08x} corner=0x{corner:08x} w={W} h={H} cc={}",
@@ -65,44 +69,36 @@ fn main() -> ExitCode {
     }
 }
 
-/// Эталонная сцена PR1. Возвращает `(digest, center, corner)`; `None` — не
-/// удалось открыть контекст (сообщение уже в stderr).
-fn render_probe() -> Option<(u64, u32, u32)> {
+/// Эталонная сцена PR1. Возвращает `(digest, center, corner)`; ошибка
+/// содержит контекст вызова (сообщение печатается в `main`).
+fn render_probe() -> Result<(u64, u32, u32), String> {
     let mut fb = vec![0xABu32; (W * H) as usize];
     let (digest, center, corner) = {
-        let surface = match Surface::new(&mut fb, W, H) {
-            Ok(surface) => surface,
-            Err(err) => {
-                eprintln!("tinygl-probe: Surface::new: {err}");
-                return None;
-            }
-        };
-        let ctx = match Context::new(surface) {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                eprintln!("tinygl-probe: Context::new: {err}");
-                return None;
-            }
-        };
+        let surface = Surface::new(&mut fb, W, H).map_err(|err| format!("Surface::new: {err}"))?;
+        let ctx = Context::new(surface).map_err(|err| format!("Context::new: {err}"))?;
 
-        ctx.set_viewport(0, 0, W, H);
+        ctx.set_viewport(0, 0, W, H)
+            .map_err(|err| err.to_string())?;
         ctx.clear(0x0000_0000, 0);
 
         ctx.matrix_mode(MatrixMode::Projection);
         ctx.load_identity();
-        ctx.frustum(-1.0, 1.0, -1.0, 1.0, 1.0, 10.0);
+        ctx.frustum(-1.0, 1.0, -1.0, 1.0, 1.0, 10.0)
+            .map_err(|err| err.to_string())?;
         ctx.matrix_mode(MatrixMode::ModelView);
         ctx.load_identity();
-        ctx.translate(0.0, 0.0, -3.0);
+        ctx.translate(0.0, 0.0, -3.0)
+            .map_err(|err| err.to_string())?;
 
-        ctx.begin(Primitive::Triangles);
+        ctx.begin(Primitive::Triangles)
+            .map_err(|err| err.to_string())?;
         ctx.color3f(1.0, 0.0, 0.0);
         ctx.vertex3f(-1.0, -1.0, 0.0);
         ctx.color3f(0.0, 1.0, 0.0);
         ctx.vertex3f(1.0, -1.0, 0.0);
         ctx.color3f(0.0, 0.0, 1.0);
         ctx.vertex3f(0.0, 1.0, 0.0);
-        ctx.end();
+        ctx.end().map_err(|err| err.to_string())?;
 
         (
             pixel_digest(ctx.pixels()),
@@ -111,7 +107,7 @@ fn render_probe() -> Option<(u64, u32, u32)> {
         )
     };
     // Буфер снова доступен: Context закрыл glClose + ZB_close.
-    Some((digest, center, corner))
+    Ok((digest, center, corner))
 }
 
 struct ElfInfo {
