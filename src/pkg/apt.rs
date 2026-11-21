@@ -1565,6 +1565,10 @@ fn scan_deb_metadata(
                     while scanned >= next_tick {
                         next_tick += 256 * 1024;
                     }
+                    // Interleave with the rest of the system: the scan is a long
+                    // CPU-bound decode and the observer call above is the point
+                    // where no ext2 transaction is held.
+                    crate::task::scheduler::cooperative_checkpoint();
                 }
                 Ok(())
             }
@@ -1653,6 +1657,9 @@ fn extract_deb_stream(
                         while self.written >= self.next_tick {
                             self.next_tick += 256 * 1024;
                         }
+                        // The write just returned without holding an ext2 lock;
+                        // let a waiting compositor draw a frame mid-unpack.
+                        crate::task::scheduler::cooperative_checkpoint();
                     }
                     Ok(())
                 }
