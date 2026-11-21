@@ -827,6 +827,15 @@ fn kernel_main() -> ! {
     // предоставляет сам контроллер.
     task::scheduler::kernel_thread_spawn_named(crate::drivers::xhci::usb_thread, "usb");
 
+    // Поток mass storage: probe новых USB-накопителей и снятие исчезнувших.
+    // Отдельный от `usb`, потому что BOT-команды синхронные и требуют
+    // `CONTROLLER` без удержания его `poll()`-циклом; ядро само ничего не
+    // монтирует — событие уходит композитору, а `mount(2)` зовёт он.
+    task::scheduler::kernel_thread_spawn_named(
+        crate::drivers::usb_storage::usb_storage_thread,
+        "usb-storage",
+    );
+
     // Зеркало логов: сливает in-memory ring в /mnt/pagh-log.txt. Отдельный поток
     // ядра, а не inline-запись, потому что logger также работает в контексте
     // прерываний и паники, где обращение к файловой системе приведёт к дедлоку.

@@ -483,6 +483,16 @@ pub mod vt_keys;
 #[path = "../../src/drivers/usb_rndis_proto.rs"]
 pub mod usb_rndis_proto;
 
+// BOT (USB Bulk-Only Transport): CBW 31 B / CSW 13 B — кодирование, подпись,
+// тег, остаток и три статуса. `core`-only; host-тесты исполняют тот же файл.
+#[path = "../../src/drivers/usb_msc_proto.rs"]
+pub mod usb_msc_proto;
+
+// SCSI Phase 1: CDB-билдеры (6/10/16), INQUIRY/READ CAPACITY/REQUEST SENSE,
+// sense-матрица и явный отказ 4K/>2TiB. `core`-only.
+#[path = "../../src/drivers/usb_scsi.rs"]
+pub mod usb_scsi;
+
 // Политика сброса корневого порта xHCI. Только `core`, самодостаточна: state
 // machine порта для USB2 debounce/training, ожиданий PRC/PED+U0, стабильности и
 // backoff, без PP power-cycle. Host-тесты симулируют порты (Polling сотни

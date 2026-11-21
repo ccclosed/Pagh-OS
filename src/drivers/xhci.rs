@@ -30,12 +30,14 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::drivers::pci::PciDevice;
-use crate::drivers::usb_desc::{self, HidIface, RndisIface};
+use crate::drivers::usb_desc::{self, HidIface, MscIface, RndisIface};
 use crate::drivers::usb_hid_report::{self, RecoveryAction, ReportMode};
+use crate::drivers::usb_msc_proto;
 use crate::drivers::usb_rndis::{self, RndisTransport};
 use crate::drivers::usb_rndis_proto;
 use crate::drivers::xhci_hub::{
@@ -524,6 +526,179 @@ struct RndisEndpoint {
     keepalive_xid: u32,
 }
 
+/// DMA-буфер переменного размера (для data-стадии BOT): 64 KiB одним куском,
+/// а если contiguous-аллокация не удалась — одна страница (8 секторов за
+/// команду). Владелец один — `MscLink`; на каждую команду буфер не выделяется.
+struct MscBuf {
+    phys: u64,
+    virt: usize,
+    pages: usize,
+}
+
+impl Drop for MscBuf {
+    fn drop(&mut self) {
+        crate::memory::pmm::free_frames_contiguous(self.phys, self.pages);
+    }
+}
+
+impl MscBuf {
+    fn new(pages: usize) -> Option<Self> {
+        let phys = crate::memory::pmm::alloc_frames_contiguous(pages)?;
+        let virt = crate::memory::vmm::phys_to_virt(phys) as usize;
+        // SAFETY: PMM только что выдал этот непрерывный диапазон кадров и он
+        // отображён в HHDM; обнуление принадлежит нам до публикации в контроллер.
+        unsafe { core::ptr::write_bytes(virt as *mut u8, 0, pages * PAGE_SIZE) };
+        Some(Self { phys, virt, pages })
+    }
+
+    fn len(&self) -> usize {
+        self.pages * PAGE_SIZE
+    }
+}
+
+/// Почему BOT-команда не дошла. Драйвер различает их, потому что лечатся они
+/// по-разному: `Stall` — ClearFeature+Reset Endpoint, `Csw*`/`Timeout` — полный
+/// Reset Recovery, `Failed` — REQUEST SENSE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MscBotError {
+    /// Устройство помечено мёртвым (hot-unplug) или слот исчез.
+    Dead,
+    /// Слота с таким id больше нет.
+    NoDevice,
+    /// Событие не пришло за отведённое время (CBW/data/CSW).
+    Timeout,
+    /// Bulk-эндпоинт ответил STALL (completion code 6).
+    Stall,
+    /// Иная ошибка передачи xHCI.
+    Transfer(u8),
+    /// CSW не разобрался (подпись/тег/короткое чтение).
+    Csw(usb_msc_proto::CswError),
+    /// `bCSWStatus = Failed`: нужен REQUEST SENSE.
+    Failed,
+    /// `bCSWStatus = Phase Error`: команда и данные разъехались.
+    PhaseError,
+    /// OUT-стадия передала меньше байт, чем было в CBW.
+    Residue,
+    /// CDB не влезает в CBW (1..=16 байт).
+    BadCdb,
+    /// Запрос длиннее data-буфера канала.
+    TooLong,
+}
+
+/// Публичная задержка для SCSI-слоя: TUR-цикл «носитель ещё не готов» обязан
+/// ждать столько же, сколько ждёт xHCI, и под тем же выключенным IF.
+pub fn msc_settle_us(us: u64) {
+    settle_us(us);
+}
+
+/// Сколько байт data-стадии помещается в один BOT-переход для этого канала.
+/// Storage-слой режет `read_block`/`write_block` по этому значению; после
+/// fallback на 4 KiB это 8 секторов, а не 128.
+pub fn msc_max_transfer(slot_id: u8) -> usize {
+    let guard = CONTROLLER.lock();
+    let Some(ctrl) = guard.as_ref() else {
+        return 0;
+    };
+    ctrl.slots
+        .iter()
+        .find(|s| s.id == slot_id)
+        .and_then(|s| s.msc.as_ref())
+        .map(|m| m.data.len())
+        .unwrap_or(0)
+}
+
+/// Один mass-storage канал: две bulk-точки, их кольца и DMA-буферы.
+///
+/// `dead` — `Arc<AtomicBool>`, потому что тот же флаг читает зарегистрированный
+/// `MscDevice` из другого потока: после выдёргивания все новые I/O обязаны
+/// получить EIO ещё до того, как контроллер забудет слот.
+struct MscLink {
+    iface: u8,
+    in_dci: u8,
+    out_dci: u8,
+    in_mps: u16,
+    out_mps: u16,
+    in_ring: Ring,
+    out_ring: Ring,
+    cbw: DmaFrame,
+    csw: DmaFrame,
+    data: MscBuf,
+    /// Монотонный тег CBW; CSW обязан его повторить.
+    tag: u32,
+    /// Неудачных recovery подряд; три — устройство объявляется мёртвым.
+    recoveries: u8,
+    dead: Arc<AtomicBool>,
+    /// `usbN`, выданный storage-потоком; при disconnect по нему снимаются
+    /// блочные имена. `None` — устройство ещё не прошло probe.
+    usb_index: Option<u32>,
+}
+
+/// Новое MSC-устройство, готовое к probe. Публикуется после `poll()`, потому
+/// что probe шлёт BOT-команды и обязан отпустить `CONTROLLER` (спинлок
+/// нереентерабелен).
+static MSC_PENDING: Spinlock<Vec<u8>> = Spinlock::new(Vec::new());
+
+/// Слоты, чьё устройство исчезло; storage-поток снимет блочные имена и
+/// отправит REMOVE. `surprise` решает он, а не poll: только он знает, был ли
+/// том смонтирован.
+pub struct MscRemoval {
+    pub usb_index: Option<u32>,
+    pub slot_id: u8,
+}
+
+static MSC_REMOVED: Spinlock<Vec<MscRemoval>> = Spinlock::new(Vec::new());
+
+/// Забрать список новых MSC-устройств (slot id) для probe.
+pub fn take_msc_pending() -> Vec<u8> {
+    core::mem::take(&mut *MSC_PENDING.lock())
+}
+
+/// Забрать исчезнувшие MSC-устройства.
+pub fn take_msc_removed() -> Vec<MscRemoval> {
+    core::mem::take(&mut *MSC_REMOVED.lock())
+}
+
+/// Флаг смерти канала, который storage-слой кладёт в `MscDevice`: один
+/// `Arc<AtomicBool>` на канал, поэтому `read_block` видит выдёргивание без
+/// повторного поиска слота.
+pub fn msc_dead_flag(slot_id: u8) -> Option<Arc<AtomicBool>> {
+    let guard = CONTROLLER.lock();
+    let ctrl = guard.as_ref()?;
+    ctrl.slots
+        .iter()
+        .find(|s| s.id == slot_id)
+        .and_then(|s| s.msc.as_ref())
+        .map(|m| Arc::clone(&m.dead))
+}
+
+/// Записать выданный storage-потоком `usbN` в канал: при disconnect по нему
+/// снимаются `usbN`/`usbNpM`.
+pub fn msc_set_usb_index(slot_id: u8, index: u32) {
+    let mut guard = CONTROLLER.lock();
+    let Some(ctrl) = guard.as_mut() else {
+        return;
+    };
+    if let Some(slot) = ctrl.slots.iter_mut().find(|s| s.id == slot_id) {
+        if let Some(msc) = slot.msc.as_mut() {
+            msc.usb_index = Some(index);
+        }
+    }
+}
+
+/// Пометить устройство мёртвым, не трогая слот (используется, когда probe
+/// провалился и storage-поток снимает с регистрации уже после disconnect).
+pub fn msc_mark_dead(slot_id: u8) {
+    let mut guard = CONTROLLER.lock();
+    let Some(ctrl) = guard.as_mut() else {
+        return;
+    };
+    if let Some(slot) = ctrl.slots.iter().find(|s| s.id == slot_id) {
+        if let Some(msc) = slot.msc.as_ref() {
+            msc.dead.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Одно адресованное устройство.
 struct Slot {
     id: u8,
@@ -539,6 +714,8 @@ struct Slot {
     hid: Vec<HidEndpoint>,
     /// RNDIS-канал, если конфигурация его выставила.
     rndis: Option<RndisEndpoint>,
+    /// Mass-storage канал (BOT), если конфигурация его выставила.
+    msc: Option<MscLink>,
 }
 
 /// Что драйвер узнал о порте. Boot-меню печатает это: на машине с мёртвой
@@ -1642,7 +1819,15 @@ fn observe_portsc(raw: u32) -> PortObservation {
 /// нужное boot-меню: порт в debounce или в ожидании PRC трогается один раз, его
 /// дедлайн сравнивается, и poll возвращается.
 fn poll_port(ctrl: &mut Controller, port: u8) {
-    if ctrl.slots.iter().any(|s| s.port == port) {
+    if let Some(si) = ctrl.slots.iter().position(|s| s.port == port) {
+        // Слот живёт, пока CCS=1. Ранний возврат по одному лишь `slot.port`
+        // означал, что выдёргивание не замечается: слот остаётся, порт больше
+        // никогда не перечисляется, а `MscDevice` продолжает отдавать I/O в
+        // исчезнувшее устройство.
+        if rd32(ctrl.op, portsc(port)) & PORTSC_CCS != 0 {
+            return;
+        }
+        disconnect_slot(ctrl, si, port);
         return;
     }
     let off = portsc(port);
@@ -2218,6 +2403,7 @@ fn enable_slot(ctrl: &mut Controller) -> Option<usize> {
         ctrl_buf,
         hid: Vec::new(),
         rndis: None,
+        msc: None,
     });
     Some(ctrl.slots.len() - 1)
 }
@@ -2370,8 +2556,9 @@ fn configure_endpoints(
     ifaces: &[HidIface],
     modes: &[ReportMode],
     rndis: Option<&RndisIface>,
+    msc: Option<&MscIface>,
 ) -> bool {
-    if ifaces.len() != modes.len() || (ifaces.is_empty() && rndis.is_none()) {
+    if ifaces.len() != modes.len() || (ifaces.is_empty() && rndis.is_none() && msc.is_none()) {
         return false;
     }
     let ctx_size = ctrl.ctx_size;
@@ -2478,12 +2665,90 @@ fn configure_endpoints(
         }
         None => None,
     };
+    let msc_link = match msc {
+        Some(iface) => {
+            let in_mps = (iface.bulk_in_max_packet & 0x07FF) as u32;
+            let out_mps = (iface.bulk_out_max_packet & 0x07FF) as u32;
+            let in_dci = dci_of(iface.bulk_in_addr);
+            let out_dci = dci_of(iface.bulk_out_addr);
+            if in_mps == 0 || out_mps == 0 || in_dci == out_dci {
+                crate::warn!(
+                    "usb-msc: bulk endpoints invalid (in={:#04x} out={:#04x} mps={}/{}); not configuring",
+                    iface.bulk_in_addr,
+                    iface.bulk_out_addr,
+                    in_mps,
+                    out_mps
+                );
+                return false;
+            }
+            if eps.iter().any(|e| e.dci == in_dci || e.dci == out_dci)
+                || rndis_ep.as_ref().map_or(false, |r| {
+                    r.bulk_in_dci == in_dci
+                        || r.bulk_out_dci == out_dci
+                        || r.bulk_in_dci == out_dci
+                        || r.bulk_out_dci == in_dci
+                })
+            {
+                crate::warn!(
+                    "usb-msc: endpoints {:#04x}/{:#04x} collide with another interface's DCI",
+                    iface.bulk_in_addr,
+                    iface.bulk_out_addr
+                );
+                return false;
+            }
+            let Some(in_ring) = Ring::new("msc in ring") else {
+                return false;
+            };
+            let Some(out_ring) = Ring::new("msc out ring") else {
+                return false;
+            };
+            let Some(cbw) = DmaFrame::new_zeroed("msc cbw") else {
+                return false;
+            };
+            let Some(csw) = DmaFrame::new_zeroed("msc csw") else {
+                return false;
+            };
+            // 64 KiB одним куском — штатный data-буфер; при фрагментации PMM
+            // fallback 4 KiB честен, но медленнее (8 секторов за команду).
+            let data = match MscBuf::new(16) {
+                Some(buf) => buf,
+                None => {
+                    crate::warn!(
+                        "usb-msc: 64 KiB contiguous DMA unavailable; using 4 KiB data buffer (slower)"
+                    );
+                    match MscBuf::new(1) {
+                        Some(buf) => buf,
+                        None => return false,
+                    }
+                }
+            };
+            Some(MscLink {
+                iface: iface.interface,
+                in_dci,
+                out_dci,
+                in_mps: iface.bulk_in_max_packet & 0x07FF,
+                out_mps: iface.bulk_out_max_packet & 0x07FF,
+                in_ring,
+                out_ring,
+                cbw,
+                csw,
+                data,
+                tag: 1,
+                recoveries: 0,
+                dead: Arc::new(AtomicBool::new(false)),
+                usb_index: None,
+            })
+        }
+        None => None,
+    };
     // Старший присутствующий DCI задаёт поле Context Entries slot context.
     let max_dci = eps
         .iter()
         .map(|ep| ep.dci)
         .chain(rndis_ep.as_ref().map(|r| r.bulk_in_dci))
         .chain(rndis_ep.as_ref().map(|r| r.bulk_out_dci))
+        .chain(msc_link.as_ref().map(|m| m.in_dci))
+        .chain(msc_link.as_ref().map(|m| m.out_dci))
         .max()
         .unwrap_or(1);
     // SAFETY: `input` — наша обнулённая страница; контексты пишутся по смещениям,
@@ -2500,6 +2765,10 @@ fn configure_endpoints(
         if let Some(r) = rndis_ep.as_ref() {
             add |= 1u32 << r.bulk_in_dci;
             add |= 1u32 << r.bulk_out_dci;
+        }
+        if let Some(m) = msc_link.as_ref() {
+            add |= 1u32 << m.in_dci;
+            add |= 1u32 << m.out_dci;
         }
         write_volatile(p.add(1), add);
         let slot_ctx = p.add(8) as *mut u32;
@@ -2554,6 +2823,36 @@ fn configure_endpoints(
                 write_volatile(ep_ctx.add(3), (ring_phys >> 32) as u32);
             }
         }
+        if let Some(m) = msc_link.as_ref() {
+            // BOT использует обе bulk-точки: IN для данных и CSW, OUT для CBW и
+            // данных записи. CErr=3 — чтобы одна испорченная передача не
+            // отключала эндпоинт.
+            for (dci, ep_type, mps, ring_phys) in [
+                (
+                    m.in_dci,
+                    EP_TYPE_BULK_IN,
+                    m.in_mps as u32,
+                    m.in_ring.base_phys(),
+                ),
+                (
+                    m.out_dci,
+                    EP_TYPE_BULK_OUT,
+                    m.out_mps as u32,
+                    m.out_ring.base_phys(),
+                ),
+            ] {
+                let ep_ctx = (input + ctx_size * (1 + dci as usize)) as *mut u32;
+                write_volatile(ep_ctx, 0);
+                write_volatile(
+                    ep_ctx.add(1),
+                    (3 << EP_CTX_CERR_SHIFT)
+                        | (ep_type << EP_CTX_EP_TYPE_SHIFT)
+                        | (mps << EP_CTX_MAX_PACKET_SHIFT),
+                );
+                write_volatile(ep_ctx.add(2), (ring_phys | 1) as u32);
+                write_volatile(ep_ctx.add(3), (ring_phys >> 32) as u32);
+            }
+        }
     }
     // Физический адрес: см. тот же комментарий в `address_device`.
     let (a0, a1) = ctx_addr(input_phys);
@@ -2578,6 +2877,7 @@ fn configure_endpoints(
     }
     ctrl.slots[slot_index].hid = eps;
     ctrl.slots[slot_index].rndis = rndis_ep;
+    ctrl.slots[slot_index].msc = msc_link;
     true
 }
 
@@ -2599,6 +2899,26 @@ fn enumerate_with_speed(ctrl: &mut Controller, port: u8, speed: u8) -> bool {
     ok
 }
 
+/// Обработать физическое отключение: пометить MSC-канал мёртвым ДО освобождений,
+/// поставить REMOVE-задание storage-потоку и снять слот.
+fn disconnect_slot(ctrl: &mut Controller, slot_index: usize, port: u8) {
+    if let Some(msc) = ctrl.slots.get(slot_index).and_then(|s| s.msc.as_ref()) {
+        msc.dead.store(true, Ordering::SeqCst);
+        crate::warn!(
+            "xhci: port {}: mass-storage device disconnected (slot {}); I/O now returns EIO",
+            port,
+            ctrl.slots[slot_index].id
+        );
+    }
+    ctrl.brought_up.retain(|p| *p != port);
+    if let Some(d) = ctrl.diag.get_mut(port as usize - 1) {
+        d.stage = "disconnected";
+        d.code = 0;
+        d.policy = PortPolicy::new(d.proto == 3);
+    }
+    release_slot(ctrl, slot_index);
+}
+
 /// Отключить выданный контроллером слот и убрать его учёт.
 fn release_slot(ctrl: &mut Controller, slot_index: usize) {
     let Some(slot) = ctrl.slots.get(slot_index) else {
@@ -2608,6 +2928,15 @@ fn release_slot(ctrl: &mut Controller, slot_index: usize) {
     if slot.rndis.is_some() {
         // Сетевой поток не должен видеть канал, чьи bulk-эндпоинты уже не существуют.
         usb_rndis::reset();
+    }
+    if let Some(msc) = slot.msc.as_ref() {
+        // Сначала флаг, потом всё остальное: storage-поток и открытые fd должны
+        // увидеть смерть раньше, чем контроллер забудет эндпоинты.
+        msc.dead.store(true, Ordering::SeqCst);
+        MSC_REMOVED.lock().push(MscRemoval {
+            usb_index: msc.usb_index,
+            slot_id,
+        });
     }
     let _ = command(
         ctrl,
@@ -2705,7 +3034,7 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     // обычно единственной. Ограничение четырьмя не даёт лживому bNumConfigurations
     // крутить цикл на мс.
     let n_configs = dev[17].max(1).min(4);
-    let mut parsed: Option<(Vec<HidIface>, Option<RndisIface>)> = None;
+    let mut parsed: Option<(Vec<HidIface>, Option<RndisIface>, Option<MscIface>)> = None;
     for ci in 0..n_configs {
         let Some(head) = get_descriptor(ctrl, slot_index, 2, ci, 9) else {
             continue;
@@ -2722,15 +3051,16 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         };
         let hid = usb_desc::parse_hid_interfaces(&blob);
         let rndis = usb_desc::parse_rndis_interfaces(&blob);
-        if !hid.is_empty() || rndis.is_some() {
-            parsed = Some((hid, rndis));
+        let msc = usb_desc::parse_msc_interfaces(&blob);
+        if !hid.is_empty() || rndis.is_some() || msc.is_some() {
+            parsed = Some((hid, rndis, msc));
             break;
         }
     }
-    let Some((ifaces, rndis)) = parsed else {
+    let Some((ifaces, rndis, msc)) = parsed else {
         ctrl.fail(port, "no-supported-interface", dev[4] as u32);
         crate::debug!(
-            "xhci: port {}: device {:04x}:{:04x} has no HID or RNDIS interface",
+            "xhci: port {}: device {:04x}:{:04x} has no HID, RNDIS or MSC interface",
             port,
             vendor,
             product
@@ -2773,11 +3103,12 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
     let config_value = rndis
         .as_ref()
         .map(|r| r.config_value)
-        .or_else(|| chosen.first().map(|i| i.config_value));
+        .or_else(|| chosen.first().map(|i| i.config_value))
+        .or_else(|| msc.as_ref().map(|m| m.config_value));
     let Some(config_value) = config_value else {
-        ctrl.fail(port, "no-boot-hid", dev[4] as u32);
+        ctrl.fail(port, "no-usable-interface", dev[4] as u32);
         crate::debug!(
-            "xhci: port {}: device {:04x}:{:04x} has HID interfaces but none is a boot keyboard/mouse",
+            "xhci: port {}: device {:04x}:{:04x} has interfaces but none is a boot HID, RNDIS or MSC",
             port,
             vendor,
             product
@@ -2791,6 +3122,22 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         ctrl.fail(port, "set-configuration", config_value as u32);
         crate::warn!("xhci: port {}: SET_CONFIGURATION failed", port);
         return false;
+    }
+    // GET_MAX_LUN читается сразу после SET_CONFIGURATION: это class-запрос на
+    // EP0, bulk-контексты ему не нужны. Устройство может ответить STALL — спека
+    // BOT разрешает трактовать это как LUN 0, и это не ошибка перечисления.
+    let mut max_lun = 0u8;
+    if let Some(iface) = msc.as_ref() {
+        match control_in(ctrl, slot_index, 0xA1, 0xFE, 0, iface.interface as u16, 1) {
+            Some(bytes) if !bytes.is_empty() => max_lun = bytes[0].min(15),
+            _ => max_lun = 0,
+        }
+        if max_lun > 0 {
+            crate::warn!(
+                "usb-msc: max_lun={}; LUN>0 unsupported in phase 1 (only LUN 0 is served)",
+                max_lun
+            );
+        }
     }
     // RNDIS поднимается до Configure Endpoint: INIT/QUERY/SET идут через EP0 и не
     // требуют bulk-контекстов, зато после неудачи незачем конфигурировать пару,
@@ -2847,16 +3194,18 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
         modes.push(mode);
     }
     let rndis_iface = rndis_link.as_ref().map(|(iface, _)| iface);
-    if !configure_endpoints(ctrl, slot_index, &chosen, &modes, rndis_iface) {
+    if !configure_endpoints(ctrl, slot_index, &chosen, &modes, rndis_iface, msc.as_ref()) {
         // Configure Endpoint не состоялся: состояние RNDIS уже выставлено, и без
         // сброса сетевой поток увидел бы «готовый» канал без единого эндпоинта.
         usb_rndis::reset();
         ctrl.fail(port, "configure-endpoint", 0);
         return false;
     }
-    let stage = match (chosen.is_empty(), rndis_link.is_some()) {
-        (true, true) => "rndis-ready",
-        (false, true) => "hid+rndis-ready",
+    let stage = match (chosen.is_empty(), rndis_link.is_some(), msc.is_some()) {
+        (true, true, _) => "rndis-ready",
+        (false, true, _) => "hid+rndis-ready",
+        (true, false, true) => "msc-ready",
+        (false, false, true) => "hid+msc-ready",
         _ => "hid-ready",
     };
     ctrl.stage(port, stage, chosen.len() as u32);
@@ -2893,6 +3242,21 @@ fn enumerate_slot(ctrl: &mut Controller, slot_index: usize, port: u8, speed: u8)
             info.medium,
             info.max_transfer
         );
+    }
+    if let Some(iface) = msc.as_ref() {
+        // Единственная строка, по которой serial-лог показывает, что mass
+        // storage перечислен; probe (INQUIRY/capacity) делает storage-поток
+        // после poll, чтобы не держать CONTROLLER во время BOT-команд.
+        crate::info!(
+            "usb-msc: iface={} ep_in={:#04x} ep_out={:#04x} mps={}/{} max_lun={}",
+            iface.interface,
+            iface.bulk_in_addr,
+            iface.bulk_out_addr,
+            iface.bulk_in_max_packet & 0x07FF,
+            iface.bulk_out_max_packet & 0x07FF,
+            max_lun
+        );
+        MSC_PENDING.lock().push(ctrl.slots[slot_index].id);
     }
     true
 }
@@ -3337,6 +3701,439 @@ fn reset_endpoint(ctrl: &mut Controller, slot_id: u8, dci: u8) -> bool {
     matches!(ev, Some(ev) if ev.completion_code() == CC_SUCCESS)
 }
 
+// ─── Bulk-Only Transport: синхронная команда ────────────────────────────────
+//
+// Команда выполняется ВЫЗЫВАЮЩИМ потоком, а не `usb`-потоком: `BlockDevice`
+// синхронный, его вызывает ext2 под `tx_lock` (спинлок с выключенными
+// прерываниями), и «разбудить usb-поток и поспать» здесь задеадлочило бы
+// машину. Поэтому BOT берёт `CONTROLLER`, кладёт CBW/data/CSW и сам ждёт
+// transfer events; `poll()` в это время не выполняется, зато между командами
+// снова получает лок и обслуживает HID/RNDIS.
+
+/// Ожидание одного transfer event с настоящим дедлайном по TSC. Без
+/// калиброванных часов остаётся бюджет спин-итераций: он не равен времени, но
+/// отличает «событие не пришло» от вечного ожидания.
+struct MscWait {
+    use_clock: bool,
+    deadline_us: u64,
+    spins: u32,
+}
+
+impl MscWait {
+    fn ms(ms: u64) -> Self {
+        if clock_ready() {
+            Self {
+                use_clock: true,
+                deadline_us: now_us().saturating_add(ms.saturating_mul(1_000)),
+                spins: 0,
+            }
+        } else {
+            // ~2000 итераций на миллисекунду — грубая, но конечная замена.
+            Self {
+                use_clock: false,
+                deadline_us: 0,
+                spins: (ms.saturating_mul(2_000)).min(u32::MAX as u64) as u32,
+            }
+        }
+    }
+
+    fn expired(&mut self) -> bool {
+        if self.use_clock {
+            now_us() >= self.deadline_us
+        } else {
+            self.spins = self.spins.saturating_sub(1);
+            self.spins == 0
+        }
+    }
+}
+
+/// Ждать transfer event именно для `(slot_id, dci)`. События других эндпоинтов
+/// откладываются, чтобы их забрал `poll()`: проглотить отчёт HID значило бы
+/// потерять ввод.
+fn msc_wait_event(
+    ctrl: &mut Controller,
+    slot_id: u8,
+    dci: u8,
+    wait: &mut MscWait,
+) -> Result<Trb, MscBotError> {
+    loop {
+        if wait.expired() {
+            return Err(MscBotError::Timeout);
+        }
+        let Some(ev) = next_event(ctrl, 0) else {
+            core::hint::spin_loop();
+            continue;
+        };
+        match ev.trb_type() {
+            TRB_TRANSFER_EVENT => {
+                if ev.slot_id() == slot_id && ev.endpoint_id() == dci {
+                    return Ok(ev);
+                }
+                defer_event(ctrl, ev);
+            }
+            // Смена состояния порта не относится к передаче; `poll()` увидит её
+            // на следующем проходе (CSC остаётся выставленным).
+            _ => {}
+        }
+    }
+}
+
+/// Один Normal TRB в bulk-кольцо и ожидание его завершения. Возвращает
+/// `(completion_code, residual)`.
+fn msc_bulk(
+    ctrl: &mut Controller,
+    slot_id: u8,
+    dci: u8,
+    in_ring: bool,
+    phys: u64,
+    len: usize,
+    timeout_ms: u64,
+) -> Result<(u8, u32), MscBotError> {
+    let enqueue_before;
+    {
+        let Some(si) = ctrl.slots.iter().position(|s| s.id == slot_id) else {
+            return Err(MscBotError::NoDevice);
+        };
+        let Some(link) = ctrl.slots[si].msc.as_mut() else {
+            return Err(MscBotError::NoDevice);
+        };
+        let ring = if in_ring {
+            &mut link.in_ring
+        } else {
+            &mut link.out_ring
+        };
+        enqueue_before = ring.enqueue;
+        ring.push(
+            phys as u32,
+            (phys >> 32) as u32,
+            len as u32,
+            ((TRB_NORMAL as u32) << 10) | TRB_IOC,
+        );
+        ring_doorbell(ctrl, slot_id, dci);
+    }
+    let _ = enqueue_before;
+    let mut wait = MscWait::ms(timeout_ms);
+    let ev = msc_wait_event(ctrl, slot_id, dci, &mut wait)?;
+    Ok((ev.completion_code(), ev.residual()))
+}
+
+/// Полный Reset Recovery (BOT 1.0 §5.3.4): Bulk-Only Reset, CLEAR_FEATURE(HALT)
+/// на обеих точках, Reset Endpoint и перемотка dequeue на следующий TRB.
+///
+/// Одного Reset Endpoint мало после таймаута: контроллер мог не забрать
+/// поставленный TRB, и его внутренний dequeue остался на нём. Set TR Dequeue
+/// Pointer возвращает контроллер ровно к нашему producer-указателю.
+fn msc_recover(ctrl: &mut Controller, slot_index: usize, slot_id: u8) -> bool {
+    let (iface, in_dci, out_dci, in_ring, out_ring, in_deq, out_deq) = {
+        let Some(slot) = ctrl.slots.get(slot_index) else {
+            return false;
+        };
+        let Some(msc) = slot.msc.as_ref() else {
+            return false;
+        };
+        (
+            msc.iface,
+            msc.in_dci,
+            msc.out_dci,
+            msc.in_ring.base_phys(),
+            msc.out_ring.base_phys(),
+            (msc.in_ring.enqueue, msc.in_ring.cycle),
+            (msc.out_ring.enqueue, msc.out_ring.cycle),
+        )
+    };
+    let recoveries = {
+        let Some(msc) = ctrl.slots.get_mut(slot_index).and_then(|s| s.msc.as_mut()) else {
+            return false;
+        };
+        msc.recoveries = msc.recoveries.saturating_add(1);
+        msc.recoveries
+    };
+    if recoveries > 3 {
+        if let Some(msc) = ctrl.slots.get_mut(slot_index).and_then(|s| s.msc.as_mut()) {
+            msc.dead.store(true, Ordering::SeqCst);
+        }
+        crate::warn!("usb-msc: 3 Reset Recovery attempts failed; device marked dead");
+        return false;
+    }
+    // Bulk-Only Mass Storage Reset — class-запрос на интерфейс, без data-стадии.
+    let reset_ok = control_no_data(ctrl, slot_index, 0x21, 0xFF, 0, iface as u16);
+    // CLEAR_FEATURE(ENDPOINT_HALT) для обеих точек; ошибку игнорируем, как
+    // предписывает BOT: не-halted эндпоинт отвечает STALL, и это нормально.
+    let in_addr = ep_addr_of_dci(in_dci);
+    let out_addr = ep_addr_of_dci(out_dci);
+    let _ = control_no_data(ctrl, slot_index, 0x02, 1, 0, in_addr as u16);
+    let _ = control_no_data(ctrl, slot_index, 0x02, 1, 0, out_addr as u16);
+    let in_ok = reset_endpoint(ctrl, slot_id, in_dci);
+    let out_ok = reset_endpoint(ctrl, slot_id, out_dci);
+    let in_ok = msc_set_dequeue(ctrl, slot_id, in_dci, in_ring, in_deq.0, in_deq.1) && in_ok;
+    let out_ok = msc_set_dequeue(ctrl, slot_id, out_dci, out_ring, out_deq.0, out_deq.1) && out_ok;
+    if let Some(msc) = ctrl.slots.get_mut(slot_index).and_then(|s| s.msc.as_mut()) {
+        // Новый тег после recovery: старый CSW, если он всё-таки придёт, не
+        // совпадёт и будет отвергнут, а не принят за ответ на новую команду.
+        msc.tag = msc.tag.wrapping_add(1).max(1);
+    }
+    crate::warn!(
+        "usb-msc: reset recovery {}/3 (bot-reset={} in-ep={} out-ep={})",
+        recoveries,
+        reset_ok,
+        in_ok,
+        out_ok
+    );
+    in_ok && out_ok
+}
+
+/// Адрес эндпоинта по DCI: `2 * ep_number + direction` (IN — 1).
+fn ep_addr_of_dci(dci: u8) -> u8 {
+    (dci / 2) | if dci & 1 != 0 { 0x80 } else { 0 }
+}
+
+/// xHCI Set TR Dequeue Pointer (TRB type 16) для одного DCI: указатель на
+/// следующий TRB кольца и DCS из его cycle bit.
+fn msc_set_dequeue(
+    ctrl: &mut Controller,
+    slot_id: u8,
+    dci: u8,
+    ring_phys: u64,
+    enqueue: usize,
+    cycle: u32,
+) -> bool {
+    let ptr = ring_phys + (enqueue * TRB_SIZE) as u64;
+    let dcs = if cycle == TRB_CYCLE { 1u32 } else { 0 };
+    let dw0 = (ptr as u32 & !0xF) | dcs;
+    let ev = command(
+        ctrl,
+        dw0,
+        (ptr >> 32) as u32,
+        (dci as u32) << 16,
+        ((16u32) << 10) | ((slot_id as u32) << 24),
+    );
+    matches!(ev, Some(ev) if ev.completion_code() == CC_SUCCESS)
+}
+
+/// Данные BOT-команды: IN пишется устройством в буфер, OUT читается из него.
+/// Один enum вместо двух почти одинаковых путей: retry/recovery не должны
+/// разъезжаться между чтением и записью.
+enum MscData<'a> {
+    In(&'a mut [u8]),
+    Out(&'a [u8]),
+}
+
+impl MscData<'_> {
+    fn len(&self) -> usize {
+        match self {
+            MscData::In(buf) => buf.len(),
+            MscData::Out(buf) => buf.len(),
+        }
+    }
+}
+
+/// Одна попытка BOT: CBW → data → CSW. Ошибки не лечатся здесь; вызывающий
+/// решает, повторять ли после recovery.
+fn msc_attempt(
+    ctrl: &mut Controller,
+    slot_index: usize,
+    cdb: &[u8],
+    data: &mut MscData<'_>,
+) -> Result<usize, MscBotError> {
+    let (
+        slot_id,
+        out_dci,
+        in_dci,
+        cbw_phys,
+        cbw_virt,
+        csw_phys,
+        csw_virt,
+        data_phys,
+        data_virt,
+        data_cap,
+    ) = {
+        let slot = ctrl
+            .slots
+            .get_mut(slot_index)
+            .ok_or(MscBotError::NoDevice)?;
+        let msc = slot.msc.as_mut().ok_or(MscBotError::NoDevice)?;
+        if msc.dead.load(Ordering::SeqCst) {
+            return Err(MscBotError::Dead);
+        }
+        if data.len() > msc.data.len() {
+            return Err(MscBotError::TooLong);
+        }
+        (
+            slot.id,
+            msc.out_dci,
+            msc.in_dci,
+            msc.cbw.phys(),
+            msc.cbw.virt(),
+            msc.csw.phys(),
+            msc.csw.virt(),
+            msc.data.phys,
+            msc.data.virt,
+            msc.data.len(),
+        )
+    };
+    let _ = data_cap;
+    let dir_in = matches!(data, MscData::In(_));
+    let direction = if dir_in {
+        usb_msc_proto::Direction::In
+    } else {
+        usb_msc_proto::Direction::Out
+    };
+    let tag = {
+        let Some(msc) = ctrl.slots[slot_index].msc.as_mut() else {
+            return Err(MscBotError::NoDevice);
+        };
+        let tag = msc.tag;
+        msc.tag = msc.tag.wrapping_add(1).max(1);
+        tag
+    };
+    let cbw = usb_msc_proto::encode_cbw(tag, data.len() as u32, direction, 0, cdb)
+        .ok_or(MscBotError::BadCdb)?;
+    // SAFETY: `cbw` — наша DMA-страница; 31 байт влезают, копия идёт до doorbell.
+    unsafe { core::ptr::copy_nonoverlapping(cbw.as_ptr(), cbw_virt as *mut u8, 31) };
+
+    // 1. CBW строго 31 байт в bulk-OUT.
+    let (cc, residual) = msc_bulk(ctrl, slot_id, out_dci, false, cbw_phys, 31, 5_000)?;
+    if cc != CC_SUCCESS {
+        return Err(map_cc(cc));
+    }
+    if residual != 0 {
+        return Err(MscBotError::Residue);
+    }
+
+    // 2. Data stage (если CBW объявил длину).
+    let mut got = 0usize;
+    if data.len() != 0 {
+        match data {
+            MscData::In(out) => {
+                let (cc, residual) =
+                    msc_bulk(ctrl, slot_id, in_dci, true, data_phys, out.len(), 10_000)?;
+                if cc != CC_SUCCESS && cc != CC_SHORT_PACKET {
+                    return Err(map_cc(cc));
+                }
+                got = out.len().saturating_sub(residual as usize).min(out.len());
+                // SAFETY: контроллер записал не больше `out.len()` байт в наш
+                // DMA-буфер и опубликовал transfer event; копия не переживает вызов.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(data_virt as *const u8, out.as_mut_ptr(), got);
+                }
+            }
+            MscData::Out(src) => {
+                // SAFETY: `data_virt` — наш DMA-буфер длиной не меньше `src.len()`;
+                // копия идёт до публикации TRB.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), data_virt as *mut u8, src.len());
+                }
+                let (cc, residual) =
+                    msc_bulk(ctrl, slot_id, out_dci, false, data_phys, src.len(), 10_000)?;
+                if cc != CC_SUCCESS && cc != CC_SHORT_PACKET {
+                    return Err(map_cc(cc));
+                }
+                if residual != 0 {
+                    return Err(MscBotError::Residue);
+                }
+                got = src.len();
+            }
+        }
+    }
+
+    // 3. CSW: ровно 13 байт из bulk-IN.
+    let (cc, residual) = msc_bulk(ctrl, slot_id, in_dci, true, csw_phys, 13, 30_000)?;
+    if cc != CC_SUCCESS && cc != CC_SHORT_PACKET {
+        return Err(map_cc(cc));
+    }
+    if residual != 0 {
+        return Err(MscBotError::Csw(usb_msc_proto::CswError::Short));
+    }
+    let mut buf = [0u8; usb_msc_proto::CSW_SIZE];
+    // SAFETY: `csw_virt` — наша 4-KiB DMA-страница; прочитано 13 байт, которые
+    // контроллер записал до публикации transfer event.
+    unsafe { core::ptr::copy_nonoverlapping(csw_virt as *const u8, buf.as_mut_ptr(), 13) };
+    match usb_msc_proto::decode_csw(&buf, tag) {
+        Ok(csw) => match csw.status {
+            usb_msc_proto::CswStatus::Passed => {
+                if let Some(msc) = ctrl.slots[slot_index].msc.as_mut() {
+                    msc.recoveries = 0;
+                }
+                Ok(got)
+            }
+            usb_msc_proto::CswStatus::Failed => Err(MscBotError::Failed),
+            usb_msc_proto::CswStatus::PhaseError => Err(MscBotError::PhaseError),
+            usb_msc_proto::CswStatus::Unknown(_) => Err(MscBotError::PhaseError),
+        },
+        Err(e) => Err(MscBotError::Csw(e)),
+    }
+}
+
+/// Виртуальный адрес физического адреса DMA-кадра, уже принадлежащего каналу.
+///
+/// `phys_to_virt` — чистая арифметика HHDM; проверка владения здесь не нужна,
+/// потому что адреса приходят только из полей `MscLink`.
+fn cbw_phys_virt(_ctrl: &Controller, phys: u64) -> usize {
+    crate::memory::vmm::phys_to_virt(phys) as usize
+}
+
+fn map_cc(cc: u8) -> MscBotError {
+    if cc == 6 {
+        MscBotError::Stall
+    } else {
+        MscBotError::Transfer(cc)
+    }
+}
+
+/// Выполнить SCSI-команду с IN data-стадией. Возвращает число полученных байт.
+/// Синхронно, под `CONTROLLER`; см. комментарий над секцией.
+pub fn msc_bot_in(slot_id: u8, cdb: &[u8], data: &mut [u8]) -> Result<usize, MscBotError> {
+    msc_bot_common(slot_id, cdb, MscData::In(data))
+}
+
+/// Выполнить SCSI-команду с OUT data-стадией (WRITE(10) и подобные).
+pub fn msc_bot_out(slot_id: u8, cdb: &[u8], data: &[u8]) -> Result<usize, MscBotError> {
+    msc_bot_common(slot_id, cdb, MscData::Out(data))
+}
+
+fn msc_bot_common(slot_id: u8, cdb: &[u8], mut data: MscData<'_>) -> Result<usize, MscBotError> {
+    let mut guard = CONTROLLER.lock();
+    let Some(ctrl) = guard.as_mut() else {
+        return Err(MscBotError::NoDevice);
+    };
+    let Some(slot_index) = ctrl.slots.iter().position(|s| s.id == slot_id) else {
+        return Err(MscBotError::NoDevice);
+    };
+    if ctrl.slots[slot_index]
+        .msc
+        .as_ref()
+        .map(|m| m.dead.load(Ordering::SeqCst))
+        .unwrap_or(true)
+    {
+        return Err(MscBotError::Dead);
+    }
+    // Одна повторная попытка после recovery — политика BOT §5.3.4. Счётчик
+    // recovery живёт в канале и сбрасывается успехом.
+    let mut attempt = 0u8;
+    loop {
+        match msc_attempt(ctrl, slot_index, cdb, &mut data) {
+            Ok(n) => return Ok(n),
+            Err(
+                e @ (MscBotError::Stall
+                | MscBotError::Csw(_)
+                | MscBotError::PhaseError
+                | MscBotError::Transfer(_)
+                | MscBotError::Timeout
+                | MscBotError::Residue),
+            ) => {
+                if attempt >= 1 {
+                    return Err(e);
+                }
+                attempt += 1;
+                if !msc_recover(ctrl, slot_index, slot_id) {
+                    return Err(MscBotError::Dead);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Вернуть остановленный контроллер: сбросить, снова указать на наши кольца,
 /// запустить.
 ///
@@ -3368,6 +4165,15 @@ fn restart_controller(ctrl: &mut Controller) -> bool {
     }
     // Сброс контроллера забывает все слоты и порты; кольца начинаются с первого TRB
     // снова с установленным cycle bit.
+    for slot in ctrl.slots.iter() {
+        if let Some(msc) = slot.msc.as_ref() {
+            msc.dead.store(true, Ordering::SeqCst);
+            MSC_REMOVED.lock().push(MscRemoval {
+                usb_index: msc.usb_index,
+                slot_id: slot.id,
+            });
+        }
+    }
     ctrl.slots.clear();
     // Сброс контроллера забыл все эндпоинты: RNDIS-канал больше не существует.
     usb_rndis::reset();

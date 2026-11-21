@@ -37,8 +37,12 @@ pub mod tty;
 pub mod usb_desc;
 pub mod usb_hid;
 pub mod usb_hid_report;
+pub mod usb_msc;
+pub mod usb_msc_proto;
 pub mod usb_rndis;
 pub mod usb_rndis_proto;
+pub mod usb_scsi;
+pub mod usb_storage;
 pub mod virtio;
 pub mod vt;
 /// Чистый ABI `/dev/vtconsole0` (128-байтный заголовок + 16-байтные клетки).
@@ -242,4 +246,30 @@ pub fn get_char(name: &str) -> Option<Arc<dyn CharacterDevice>> {
 /// Get a block device by name (mirrors [`get_char`]).
 pub fn get_block(name: &str) -> Option<Arc<dyn BlockDevice>> {
     DEVICE_MANAGER.lock().blocks.get(name).map(Arc::clone)
+}
+
+/// Снять с регистрации все имена USB-устройства `usbN` и его разделов
+/// (`usbNpM`).
+///
+/// Граница важна: `usb1` не должен снять `usb10`/`usb11`. Раздел — это ровно
+/// `usbN` + `p` + цифры, поэтому префикс проверяется по этой форме, а не
+/// `starts_with`.
+pub fn unregister_usb(prefix: &str) {
+    let mut manager = DEVICE_MANAGER.lock();
+    manager.blocks.retain(|name, _| {
+        if name == prefix {
+            return false;
+        }
+        match name.strip_prefix(prefix) {
+            Some(rest) if rest.starts_with('p') => {
+                let digits = &rest[1..];
+                if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                    return false;
+                }
+                true
+            }
+            _ => true,
+        }
+    });
+    crate::debug!("[DEVMGR] Unregistered USB block names for {}", prefix);
 }
