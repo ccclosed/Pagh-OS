@@ -11210,6 +11210,89 @@ mod terminal_session_tests {
         );
     }
 
+    /// Этап 2 (приёмка «полный shell в окне»): КАЖДАЯ команда реестра
+    /// исполняется в сессии окна, её вывод попадает в поверхность окна, а
+    /// boot-консоль не меняется.
+    ///
+    /// Это проверка маршрутизации, а не вывода: `shell_main_session` — тот же
+    /// REPL и тот же реестр, что у boot-shell, поэтому команда «не дошла» может
+    /// означать только одно из двух — ввод не попал в кольцо сессии либо её
+    /// `fb_print!`/`render` ушли в boot-писатель. Обе половины здесь и
+    /// проверяются: вывод ищется в сетке сессии и НЕ ищется в сетке boot.
+    pub fn window_commands_reach_session_shell() {
+        assert_kernel!(
+            !session::live(S),
+            "window session is not live before the test"
+        );
+        assert_kernel!(session::note_open(S), "open for the command-coverage test");
+        assert_kernel!(
+            wait_until(3000, || grid_text().contains("Welcome to pagh OS Shell!")),
+            "window session shell is ready before the commands"
+        );
+
+        // Boot-сетка фиксируется ДО набора: окно не имеет права писать в неё.
+        let boot_before = snapshot(framebuffer::writer_for(0));
+        let input = crate::vfs::desktop_dev::vtinput1();
+
+        // Пары «команда — маркер её вывода». Маркеры выбраны по заголовкам
+        // команд (а не по значениям вроде объёма диска), чтобы рутина не
+        // зависела от геометрии/разметки конкретной машины.
+        let cases: &[(&str, &str)] = &[
+            ("df", "Filesystem"),
+            ("ps", "STAT COMMAND"),
+            ("ps -ef", "UID   PID  PPID STAT"),
+            ("id", "uid="),
+            ("groups", "root"),
+            ("ls -la", "drwx"),
+            ("disk list", "DEVICE"),
+            ("help", "Available commands"),
+            ("echo win-cmd-ok", "win-cmd-ok"),
+        ];
+        for (cmd, needle) in cases {
+            let before = grid_occurrences(needle);
+            let line = alloc::format!("{}\n", cmd);
+            input.write(0, line.as_bytes());
+            assert_kernel!(
+                wait_until(4000, || grid_occurrences(needle) > before),
+                alloc::format!(
+                    "the window session executed `{}` and its output reached the session console",
+                    cmd
+                )
+            );
+        }
+
+        // `clear` — маршрутизируется так же, как любой вывод: сетка окна
+        // очищается (маркер предыдущей команды исчезает из живой сетки).
+        input.write(0, b"clear\n");
+        assert_kernel!(
+            wait_until(4000, || !grid_text().contains("Available commands")),
+            "`clear` erased the window console (not the boot one)"
+        );
+
+        // Голое имя, которого нет в PATH: диагностика обязана появиться В ОКНЕ
+        // (fallback #158), а не в boot-консоли и не как «Unknown command».
+        input.write(0, b"definitely-not-installed\n");
+        assert_kernel!(
+            wait_until(4000, || grid_text().contains("command not found in PATH")),
+            "the PATH fallback reports its miss into the window console"
+        );
+
+        // Ни одна из команд не тронула boot-сетку: ввод окна не дублируется в
+        // boot-shell, вывод — не в boot-писатель.
+        assert_eq_kernel!(
+            snapshot(framebuffer::writer_for(0)),
+            boot_before,
+            "window commands did not leak into the boot console"
+        );
+
+        session::note_close(S);
+        assert_kernel!(
+            wait_until(2000, || !session::live(S)),
+            "close after the command-coverage test reaps the session"
+        );
+        cleanup();
+    }
+
     /// Этап 3: `nano` в окне рисует в offscreen-поверхность и корректно
     /// возвращает управление shell'у по Esc.
     pub fn nano_draws_in_session() {
@@ -11719,6 +11802,10 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         (
             "terminal-session::nano draws in the session surface and exits on Esc",
             terminal_session_tests::nano_draws_in_session
+        ),
+        (
+            "terminal-session::registry commands route into the window session",
+            terminal_session_tests::window_commands_reach_session_shell
         ),
         // USB mass storage S1: BOT/SCSI/uevent layouts and the guest-path rule.
         // Pure encoding/parsing only — no hardware, no global state.

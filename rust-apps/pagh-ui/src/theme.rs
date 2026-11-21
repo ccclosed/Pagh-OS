@@ -110,7 +110,9 @@ pub struct Metrics {
     pub toolbar_height: i32,
     /// Высота строки состояния.
     pub status_height: i32,
-    /// Ширина боковой панели.
+    /// Ширина боковой панели. Files подписывает устройства путём монтирования
+    /// («Диск данных (/mnt)»), поэтому ширина обязана вмещать такую подпись:
+    /// меньше ~204 px — и `List` обрезает путь многоточием.
     pub sidebar_width: i32,
     /// Высота строки списка.
     pub row_height: i32,
@@ -199,7 +201,7 @@ impl Theme {
                 title_height: 30,
                 toolbar_height: 40,
                 status_height: 28,
-                sidebar_width: 196,
+                sidebar_width: 212,
                 row_height: 26,
                 menu_row_height: 28,
                 menu_padding: 6,
@@ -235,7 +237,7 @@ mod tests {
         assert_eq!(theme.palette.accent, Color::hex(0x2f9e94));
         assert_eq!(theme.palette.folder_front, Color::hex(0x3788c8));
         assert_eq!(theme.metrics.title_height, 30);
-        assert_eq!(theme.metrics.sidebar_width, 196);
+        assert_eq!(theme.metrics.sidebar_width, 212);
     }
 
     #[test]
