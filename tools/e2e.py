@@ -1599,6 +1599,16 @@ class Harness:
         self.ovmf_args = [str(arg) for arg in ovmf_args]
         argv = ["qemu-system-x86_64", "-cpu", a.cpu, "-m", a.memory]
         argv += ovmf_args
+        # An explicit EDID preferred mode makes a geometry run resolution-explicit:
+        # Limine picks it, so `--vga 1280x720` gives the guest a real 16:9
+        # framebuffer (and `/dev/fb0` reports it) instead of QEMU's 1280x800.
+        vga = getattr(a, "vga", "")
+        if vga:
+            mode = re.fullmatch(r"(\d+)x(\d+)", vga.strip().lower())
+            if not mode:
+                raise SetupError(f"--vga expects WxH (e.g. 1280x720), got {vga!r}")
+            argv += ["-device",
+                     f"VGA,edid=on,xres={mode.group(1)},yres={mode.group(2)}"]
         # NVMe is opt-in: the normal path stays virtio-blk (fast under TCG and
         # what the image layout is sized for), while `--nvme` exercises the
         # driver's PRP-list/queue-depth data path in the same harness.
@@ -4395,6 +4405,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--cpu", default=os.environ.get("PAGH_QEMU_CPU", "max"),
                    help="QEMU CPU model (default max: the TLS path needs RDSEED/RDRAND)")
     q.add_argument("--memory", default="1024M")
+    q.add_argument("--vga", default="",
+                   help="force the emulated VGA EDID preferred mode (WxH, e.g. "
+                        "1280x720); Limine then picks it as the framebuffer mode. "
+                        "Default: QEMU's own preferred mode (1280x800). Geometry "
+                        "scenarios use this to cover 16:9 as well as 16:10.")
     q.add_argument("--disk", default=None,
                    help="data disk image (default: per-run scratch copy of disk.img)")
     q.add_argument("--nvme", action="store_true",
