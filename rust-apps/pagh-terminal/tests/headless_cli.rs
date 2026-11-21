@@ -274,7 +274,7 @@ fn live_binary_talks_pdp1_and_exits_on_server_close() {
     let mut child = Command::new(binary())
         .args(["--socket"])
         .arg(&socket)
-        .args(["--size", "320x200", "--title", "Test"])
+        .args(["--size", "320x200", "--title", "Test", "--demo-shell"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

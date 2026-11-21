@@ -37,22 +37,23 @@ fn render_reference_triangle() -> (u64, u32, u32, Vec<u32>) {
     let (digest, center, corner) = {
         let surface = Surface::new(&mut fb, W, H).expect("64x64 is a valid surface");
         let ctx = Context::new(surface).expect("no other context in this test");
-        ctx.set_viewport(0, 0, W, H);
+        ctx.set_viewport(0, 0, W, H).expect("64x64 viewport");
         ctx.clear(0x0000_0000, 0);
         ctx.matrix_mode(MatrixMode::Projection);
         ctx.load_identity();
-        ctx.frustum(-1.0, 1.0, -1.0, 1.0, 1.0, 10.0);
+        ctx.frustum(-1.0, 1.0, -1.0, 1.0, 1.0, 10.0)
+            .expect("reference frustum");
         ctx.matrix_mode(MatrixMode::ModelView);
         ctx.load_identity();
-        ctx.translate(0.0, 0.0, -3.0);
-        ctx.begin(Primitive::Triangles);
+        ctx.translate(0.0, 0.0, -3.0).expect("finite translate");
+        ctx.begin(Primitive::Triangles).expect("begin");
         ctx.color3f(1.0, 0.0, 0.0);
         ctx.vertex3f(-1.0, -1.0, 0.0);
         ctx.color3f(0.0, 1.0, 0.0);
         ctx.vertex3f(1.0, -1.0, 0.0);
         ctx.color3f(0.0, 0.0, 1.0);
         ctx.vertex3f(0.0, 1.0, 0.0);
-        ctx.end();
+        ctx.end().expect("end");
         (
             pixel_digest(ctx.pixels()),
             ctx.pixels()[(32 * W + 32) as usize],
