@@ -18,7 +18,7 @@ use pagh_terminal::demo::{self, DemoShell};
 use pagh_terminal::keys::{self, KeyModes};
 use pagh_terminal::protocol::{buttons, InputEvent};
 use pagh_terminal::render::{
-    render_screen, render_screen_into, render_window, Canvas, RenderOptions, Theme,
+    render_screen, render_screen_into_cleared, render_window, Canvas, RenderOptions, Theme,
     VIEWPORT_PADDING,
 };
 use pagh_terminal::screen::SelectionMode;
@@ -268,7 +268,7 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
             let mut needs_full_frame = false;
             if let Some(frame) = shm.as_mut() {
                 frame.canvas.fill(theme.bg);
-                render_screen_into(
+                render_screen_into_cleared(
                     &mut frame.canvas,
                     VIEWPORT_PADDING,
                     VIEWPORT_PADDING,
@@ -294,7 +294,7 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                 let canvas = fallback
                     .get_or_insert_with(|| Canvas::new(width as usize, height as usize, theme.bg));
                 canvas.fill(theme.bg);
-                render_screen_into(
+                render_screen_into_cleared(
                     canvas,
                     VIEWPORT_PADDING,
                     VIEWPORT_PADDING,
@@ -846,7 +846,7 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
         if dirty && now.duration_since(last_commit) >= Duration::from_millis(40) {
             if let Some(frame) = shm.as_mut() {
                 frame.canvas.fill(theme.bg);
-                render_screen_into(
+                render_screen_into_cleared(
                     &mut frame.canvas,
                     VIEWPORT_PADDING,
                     VIEWPORT_PADDING,
@@ -870,7 +870,7 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
                 }
             } else if let Some(canvas) = fallback.as_mut() {
                 canvas.fill(theme.bg);
-                render_screen_into(
+                render_screen_into_cleared(
                     canvas,
                     VIEWPORT_PADDING,
                     VIEWPORT_PADDING,
@@ -893,7 +893,7 @@ fn render_frame(screen: &pagh_terminal::Screen, theme: &Theme, width: u32, heigh
     let width = width.max(1) as usize;
     let height = height.max(1) as usize;
     let mut canvas = Canvas::new(width, height, theme.bg);
-    render_screen_into(
+    render_screen_into_cleared(
         &mut canvas,
         VIEWPORT_PADDING,
         VIEWPORT_PADDING,
