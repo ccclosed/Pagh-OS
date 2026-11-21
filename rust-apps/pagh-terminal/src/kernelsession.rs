@@ -378,6 +378,14 @@ impl FileInput {
     }
 }
 
+impl FileInput {
+    /// Голый fd для `ioctl` (фокус клавиатуры). `None` после `close` перед
+    /// общим близнецом-`respawn` — ioctl тогда просто некуда слать.
+    pub fn file(&self) -> Option<&File> {
+        self.file.as_ref()
+    }
+}
+
 impl InputSink for FileInput {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         // Без flush: это символьное устройство, `write` уже отдал байты ядру.
@@ -647,6 +655,185 @@ impl<S: InputSink> KeyForwarder<S> {
     }
 
     /// Переоткрыть устройство ввода для новой сессии.
+    pub fn respawn(&mut self) -> io::Result<()> {
+        self.sink.respawn()
+    }
+}
+
+/// Длина записи указателя `/dev/vtmouse{N}` (ABI, см. `drivers/vt_mouse_abi`).
+pub const MOUSE_EVENT_LEN: usize = 16;
+/// Бит левой кнопки в записи указателя.
+pub const MOUSE_BTN_LEFT: u32 = 1;
+/// Бит правой кнопки.
+pub const MOUSE_BTN_RIGHT: u32 = 2;
+/// Бит средней кнопки.
+pub const MOUSE_BTN_MIDDLE: u32 = 4;
+
+/// Одна запись указателя сессии (16 байт little-endian).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MouseEvent {
+    /// X в пикселях поверхности сессии (не окна).
+    pub x: i32,
+    /// Y в пикселях поверхности сессии.
+    pub y: i32,
+    /// Абсолютное состояние кнопок ([`MOUSE_BTN_LEFT`] и т. д.).
+    pub buttons: u32,
+    /// Вертикальные щелчки с прошлой записи: `+` — от пользователя (старее).
+    pub wheel: i32,
+}
+
+/// Закодировать запись указателя (16 байт LE) — контракт `/dev/vtmouse{N}`.
+pub fn encode_mouse_event(event: &MouseEvent) -> [u8; MOUSE_EVENT_LEN] {
+    let mut out = [0u8; MOUSE_EVENT_LEN];
+    out[0..4].copy_from_slice(&event.x.to_le_bytes());
+    out[4..8].copy_from_slice(&event.y.to_le_bytes());
+    out[8..12].copy_from_slice(&event.buttons.to_le_bytes());
+    out[12..16].copy_from_slice(&event.wheel.to_le_bytes());
+    out
+}
+
+/// Маска удерживаемых кнопок PDP/1 (`buttons::MASK_*`) → биты ядра.
+///
+/// PDP/1 и vtmouse называют кнопки по-разному: первый — битовой маской
+/// `MASK_LEFT/MIDDLE/RIGHT`, второй — `1/2/4` в порядке ЛКМ/ПКМ/СКМ. Ошибка
+/// здесь — «нажал левую, выделилась правая», поэтому перевод один и тестируется.
+pub fn buttons_to_mask(buttons: u32) -> u32 {
+    use crate::protocol::buttons;
+    let mut mask = 0;
+    if buttons & buttons::MASK_LEFT != 0 {
+        mask |= MOUSE_BTN_LEFT;
+    }
+    if buttons & buttons::MASK_RIGHT != 0 {
+        mask |= MOUSE_BTN_RIGHT;
+    }
+    if buttons & buttons::MASK_MIDDLE != 0 {
+        mask |= MOUSE_BTN_MIDDLE;
+    }
+    mask
+}
+
+/// Колесо PDP/1 (`REL_WHEEL`: `+` — от пользователя) → колесо ядра.
+///
+/// Kernel-shell (`ps2_mouse`) использует PS/2-соглашение IntelliMouse, где
+/// «от пользователя» приходит **отрицательной** дельтой, а shell считает
+/// `lines = -delta` (положительное — старее). Клиент обязан отдать одно
+/// соглашение ядру, поэтому знак инвертируется ровно здесь.
+pub fn wheel_from_axis(vertical: i32) -> i32 {
+    -vertical
+}
+
+/// Координаты окна (content rect) → пиксели поверхности сессии.
+///
+/// Обратное к [`blit_xrgb`]: окно показывает `place`-прямоугольник поверхности,
+/// поэтому `sx = (x - place.x) * src_w / place.width`. Точки в letterbox'е
+/// (полях) прижимаются к краю: колесо/клик в поле не должны уводить указатель
+/// сессии за поверхность. Нулевые размеры (сессия без кадра) дают `(0, 0)`.
+pub fn window_to_surface(x: i32, y: i32, info: &VtFbInfo, place: &FitPlacement) -> (i32, i32) {
+    let src_w = info.width as i64;
+    let src_h = info.height as i64;
+    if src_w <= 0 || src_h <= 0 || place.width == 0 || place.height == 0 {
+        return (0, 0);
+    }
+    let rel_x = (x - place.x as i32).clamp(0, place.width.saturating_sub(1) as i32) as i64;
+    let rel_y = (y - place.y as i32).clamp(0, place.height.saturating_sub(1) as i32) as i64;
+    let sx = rel_x * src_w / place.width as i64;
+    let sy = rel_y * src_h / place.height as i64;
+    (sx.clamp(0, src_w - 1) as i32, sy.clamp(0, src_h - 1) as i32)
+}
+
+/// Пересылка указателя окна в `/dev/vtmouse{N}`.
+///
+/// Состояние (позиция/кнопки) живёт здесь, потому что PDP/1 присылает и
+/// движение, и нажатия с абсолютной маской — ядру нужна одна запись на каждое
+/// изменение, а колесо отдельной записью с дельтой.
+pub struct MouseForwarder<S: InputSink> {
+    sink: S,
+    width: u32,
+    height: u32,
+    place: FitPlacement,
+    x: i32,
+    y: i32,
+    buttons: u32,
+}
+
+impl<S: InputSink> MouseForwarder<S> {
+    pub fn new(sink: S, info: &VtFbInfo, place: FitPlacement) -> MouseForwarder<S> {
+        MouseForwarder {
+            sink,
+            width: info.width,
+            height: info.height,
+            place,
+            x: 0,
+            y: 0,
+            buttons: 0,
+        }
+    }
+
+    /// Новая геометрия окна/поверхности (Configure, ресайз).
+    pub fn set_geometry(&mut self, info: &VtFbInfo, place: FitPlacement) {
+        self.width = info.width;
+        self.height = info.height;
+        self.place = place;
+    }
+
+    /// Последняя точка в пикселях поверхности (диагностика/тесты).
+    pub fn pointer(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+
+    fn update(&mut self, x: i32, y: i32, buttons: u32) {
+        let info = VtFbInfo {
+            width: self.width,
+            height: self.height,
+            stride: self.width.saturating_mul(4),
+            bpp: 32,
+            generation: 0,
+        };
+        let (sx, sy) = window_to_surface(x, y, &info, &self.place);
+        self.x = sx;
+        self.y = sy;
+        self.buttons = buttons_to_mask(buttons);
+    }
+
+    fn flush(&mut self, wheel: i32) -> io::Result<()> {
+        let event = MouseEvent {
+            x: self.x,
+            y: self.y,
+            buttons: self.buttons,
+            wheel,
+        };
+        self.sink.send(&encode_mouse_event(&event))
+    }
+
+    /// Движение указателя внутри окна (без изменения кнопок).
+    pub fn motion(&mut self, x: i32, y: i32, buttons: u32) -> io::Result<()> {
+        self.update(x, y, buttons);
+        self.flush(0)
+    }
+
+    /// Нажатие/отпускание кнопки: запись несёт новую маску.
+    pub fn button(&mut self, x: i32, y: i32, buttons: u32) -> io::Result<()> {
+        self.update(x, y, buttons);
+        self.flush(0)
+    }
+
+    /// Прокрутка колеса: запись несёт дельту в соглашении ядра.
+    pub fn axis(&mut self, x: i32, y: i32, buttons: u32, vertical: i32) -> io::Result<()> {
+        self.update(x, y, buttons);
+        self.flush(wheel_from_axis(vertical))
+    }
+
+    /// Приёмник (для тестов: прочитать записанное).
+    pub fn sink(&self) -> &S {
+        &self.sink
+    }
+
+    /// Закрыть устройство указателя перед общим close-then-open respawn.
+    pub fn close(&mut self) -> io::Result<()> {
+        self.sink.close()
+    }
+
+    /// Переоткрыть устройство указателя для новой сессии (тот же слот).
     pub fn respawn(&mut self) -> io::Result<()> {
         self.sink.respawn()
     }
