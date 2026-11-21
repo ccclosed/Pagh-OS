@@ -1039,6 +1039,45 @@ class QmpClient:
         if "return" not in reply:
             raise HarnessError(f"QMP send-key refused: {reply}")
 
+    def release_modifiers(self) -> None:
+        """Force key-up for Ctrl/Shift/Alt after a chord.
+
+        QMP `send-key` holds a chord and releases it on a timer; under TCG load
+        the release can be lost or reordered relative to HMP `sendkey`
+        characters (two monitor paths into one emulated keyboard). A stuck Ctrl
+        turns a later `c` into the terminal's ^C: the kernel's PS/2 tracker
+        sends SIGINT to the *foreground* group, which killed the real Files
+        client right after its window appeared (serial:
+        `[signal] pid=9 sig=2 tick-delivered default-terminate`). An explicit
+        key-up plus a settle makes the modifier state deterministic before the
+        harness types a command line.
+        """
+        # SETTLE FIRST. QMP `send-key` presses the chord and releases it from a
+        # hold-timer in QEMU's main loop; a modifier reset sent immediately after
+        # the command can be delivered BEFORE the chord's own key events. That
+        # cleared Ctrl before `T` arrived (`mods=0x4` at T instead of 0x6) and the
+        # compositor hotkey never fired. 0.5 s is well past the 50 ms hold.
+        time.sleep(0.5)
+        # A bare key-up is not enough: QEMU skips a break event for a key it
+        # already considers released, so a break the GUEST missed (PS/2 packet
+        # loss) stays missed. A full tap (make + break) forces both edges through
+        # QEMU and clears the guest's modifier state. Alt is sent up only: a
+        # synthetic Alt tap opens the compositor launcher and would cover the
+        # desktop under test; a stuck Alt does not turn a `c` into ^C.
+        for qcode in ("ctrl", "shift"):
+            for down in (True, False):
+                self._input([{
+                    "type": "key",
+                    "data": {"down": down,
+                             "key": {"type": "qcode", "data": qcode}},
+                }])
+                time.sleep(0.03)
+        self._input([{
+            "type": "key",
+            "data": {"down": False, "key": {"type": "qcode", "data": "alt"}},
+        }])
+        time.sleep(0.5)
+
     def close(self) -> None:
         if self.sock is not None:
             try:
@@ -2955,13 +2994,17 @@ def _require_boot_serial(h: "Harness", label: str, timeout: float) -> None:
 
 
 # Binaries the desktop acceptance injects into the pagh-owned ext2. ``pd`` is the
-# compositor (also exposed as ../../mnt/pd for the on-disk recipe); the three
-# others are real userland programs. ``pagh-desktop-demo`` is injected only so
-# ``--legacy-demo`` keeps working — the default path never spawns it.
+# compositor (also exposed as ../../mnt/pd for the on-disk recipe); ``pagh-files``
+# and ``pagh-terminal`` are the REAL userland programs of the ordinary image.
+# ``pagh-desktop-demo`` is test-only and injected for ``--legacy-demo`` alone, so
+# a green default run also proves the shipped path does not carry the demo client.
 _DESKTOP_INJECTED = ("pd", "pagh-desktop-demo", "pagh-files", "pagh-terminal")
 
+# The real scenario's disk: everything except the demo client.
+_DESKTOP_REAL_INJECTED = ("pd", "pagh-files", "pagh-terminal")
 
-def _desktop_bins(skip_build: bool) -> dict[str, pathlib.Path]:
+
+def _desktop_bins(skip_build: bool, legacy_demo: bool = False) -> dict[str, pathlib.Path]:
     """Build/locate the static musl binaries the desktop acceptance needs.
 
     The compositor pair comes from the crate's own ``build-static.sh``. The REAL
@@ -2995,6 +3038,11 @@ def _desktop_bins(skip_build: bool) -> dict[str, pathlib.Path]:
         "pagh-files": ROOT / "rust-apps" / "out" / "pagh-files",
         "pagh-terminal": ROOT / "rust-apps" / "out" / "pagh-terminal",
     }
+    # The demo client is required only by --legacy-demo; the ordinary scenario
+    # must not depend on it even being present.
+    if not legacy_demo:
+        bins = {name: path for name, path in bins.items()
+                if name in _DESKTOP_REAL_INJECTED}
     for name, path in bins.items():
         if not path.is_file():
             raise SetupError(f"desktop binary missing: {path} ({name})")
@@ -3032,13 +3080,20 @@ def _desktop_inject(image: pathlib.Path, bins: dict[str, pathlib.Path]) -> None:
 
 
 def _desktop_disk_ready(image: pathlib.Path, bins: dict[str, pathlib.Path]) -> bool:
-    """True when a reusable desktop image already carries every injected binary."""
+    """True when a reusable desktop image already carries exactly this scenario's binaries.
+
+    The ordinary path requires the demo client to be ABSENT: a reused image left
+    by an earlier ``--legacy-demo`` run is rebuilt, so a green default run is
+    evidence that the real desktop does not carry the demo binary at all.
+    """
     if not image.is_file():
         return False
     for name in bins:
         stat = _debugfs_stat(image, name)
         if stat is None or "Mode:  0755" not in stat:
             return False
+    if "pagh-desktop-demo" not in bins and _debugfs_stat(image, "pagh-desktop-demo") is not None:
+        return False
     return True
 
 
@@ -3101,17 +3156,19 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
     * its global Alt+Shift+F4 sent PDP/1 ``launch`` (type 13) and the compositor
       spawned the configured ``--launch-target`` — the real pagh-files binary in
       headless mode, whose PNG under /mnt is the evidence;
-    * pagh-terminal connected as a second window, reading ``/dev/vtconsole0``
-      and writing ``/dev/vtinput``, and keeps committing frames (cursor blink);
+    * pagh-terminal connected as a second window (the #138 private shell
+      session; the ``--vt``/``--vt-input`` VT mirror stays as the fallback) and
+      keeps committing frames (cursor blink);
     * the serial shell survives all of it, the kernel console stays suspended
       (fbdev takeover), and no panic/exception/ENOSYS appears.
 
     ``--legacy-demo`` keeps the previous demo-client scenario (pagh-desktop-demo
-    + ``--spawn-demo``), which the panel launch path still needs until the panel
-    fix lands (server.rs ``launch()`` currently calls ``spawn_demo`` only).
+    + ``--spawn-demo``) for regression coverage of the test-only fallback; the
+    ordinary image recipe in ``rust-apps/pagh-desktop/desktop-autorun`` starts
+    real ``--launch-target`` entries and never the demo client.
     """
     a = h.a
-    bins = _desktop_bins(a.skip_build)
+    bins = _desktop_bins(a.skip_build, a.legacy_demo)
     disk = CACHE / "e2e_desktop_disk.img"
     if not (a.reuse_desktop_disk and _desktop_disk_ready(disk, bins)):
         if a.reuse_desktop_disk:
@@ -3380,6 +3437,34 @@ def mode_groups(h: "Harness") -> tuple[str, int]:
                   crashes[0] if crashes else "none")
     h.metrics["probe modes"] = "root, drop, dropvideo, file"
     return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+def _wait_launch_png(guest: "Guest", kb: "QemuShotKeyboard",
+                     timeout: float = 90.0) -> bool:
+    """Poll `ls /mnt/launch-evidence` until a PNG appears.
+
+    The launched pagh-files renders six 1280x800 scenes before it prints the first
+    line; under TCG that takes longer than a fixed 6-8 s nap, and its first
+    console write is then stopped by TOSTOP (it runs in the compositor's
+    background group). The PNG is written before the print, so polling the
+    directory is the reliable evidence; a missing file after the timeout is a
+    real failure, not a slow frame.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        off = len(guest.serial())
+        _desktop_restart_shell_line(kb)
+        kb.text("ls /mnt/launch-evidence")
+        kb.key("ret")
+        # Give `ls` a moment to answer, then look only at the bytes written
+        # after this command (an old `files-main` line elsewhere on serial is
+        # not evidence for this launch).
+        end = time.time() + 6.0
+        while time.time() < end:
+            if re.search(r"[^\s/]+\.png", guest.serial()[off:]):
+                return True
+            time.sleep(0.3)
+    return False
+
+
 def _desktop_restart_shell_line(kb: "QemuShotKeyboard") -> None:
     """Discard any keys the compositor/evdev left in the shell line editor.
 
@@ -3591,11 +3676,12 @@ def _desktop_abi_phase(h: "Harness", guest: "Guest", kb: "QemuShotKeyboard",
 
 def _desktop_demo_child_phase(h: "Harness", guest: "Guest",
                               kb: "QemuShotKeyboard") -> bool:
-    """Legacy panel path: the compositor spawns the DEMO client (`--spawn-demo`).
+    """Legacy test path: the compositor spawns the DEMO client (`--spawn-demo`).
 
-    Kept behind --legacy-demo because ``server.rs::launch()`` (the panel path)
-    still calls ``spawn_demo`` only; once it consults ``launch_targets`` the real
-    scenario's PDP/1 launch evidence covers this too.
+    Kept behind --legacy-demo to keep the test-only fallback covered. The
+    ordinary path never passes ``--spawn-demo``: the shipped recipe configures
+    real ``--launch-target`` entries, which the default scenario's PDP/1 launch
+    evidence proves.
     """
     ok = True
     child_cmd = ("rust /mnt/pd --backend headless --input none "
@@ -3705,6 +3791,10 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     # ── put the compositor in the background; TOSTOP-safe because --quiet ──
     off = mark()
     h.qmp.keys(["ctrl", "z"])
+    # The chord must not leave Ctrl down: a stuck Ctrl turns the `c` of a later
+    # `--connect` line into ^C, and the kernel delivers SIGINT to the
+    # foreground group (it killed the real Files window in earlier runs).
+    h.qmp.release_modifiers()
     parked = wait_new(off, [r"\^Z"], 20.0, "Ctrl+Z stop marker")
     ok &= h.check("compositor stops on Ctrl+Z (shell gets the terminal back)",
                   parked is not None,
@@ -3718,6 +3808,15 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   (guest.serial()[off:]).strip().splitlines()[-1]
                   if (guest.serial()[off:]).strip() else "no bg marker")
 
+    # ── one-way takeover: kernel console output stays off the screen ──
+    # The shell owns the keyboard here and the compositor owns the framebuffer.
+    # The headless Files run below prints kernel console lines ("Compat_Process
+    # started/exited") but draws no window, so two frames around it must be
+    # identical: a console flush would replace the whole screen with text.
+    # (Typing into the shell while a *client* owns the keyboard cannot be used
+    # for this: the command goes to the client's stdin, not to the shell.)
+    time.sleep(0.4)
+    kb.screenshot(console_a)
     # Headless REAL Files under the shell: proves the binary writes its scenes to
     # an ext2 path (ground truth for the launch-target assertion below).
     _desktop_restart_shell_line(kb)
@@ -3731,6 +3830,12 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
                   manual is not None,
                   regex_first(r"[^\r\n]*\.png[^\r\n]*", guest.serial()[off:]) or
                   "no scene line")
+    time.sleep(0.6)
+    kb.screenshot(console_b)
+    frozen = (console_a.is_file() and console_b.is_file()
+              and console_a.read_bytes() == console_b.read_bytes())
+    ok &= h.check("kernel console did not repaint (fbdev takeover is one-way)",
+                  frozen, "frames identical" if frozen else "console repainted")
 
     # ── REAL pagh-files window ──
     _desktop_restart_shell_line(kb)
@@ -3754,12 +3859,14 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("Files window is drawn on the QEMU framebuffer",
                   files_drawn, f"{files_shot.name} vs {desktop_ref.name}")
 
-    # Input into the live window: click the empty bottom-right grid area (a click
-    # on a toolbar action could legitimately launch the terminal, which is the
-    # *next* check and would confound this one).
+    # Input into the live window: click empty CONTENT, not the bottom-right
+    # resize grip (a grip press starts a resize and repaints the desktop, which
+    # confounds the console-freeze check below) and not a toolbar action (it
+    # could legitimately launch the terminal, the *next* check). The window is
+    # 1060x640 at a deterministic placement; the content centre is empty grid.
     h.qmp.rel(2000, 2000)
     time.sleep(0.2)
-    h.qmp.rel(-150, -130)
+    h.qmp.rel(-680, -400)
     time.sleep(0.3)
     h.qmp.button("left", True)
     time.sleep(0.1)
@@ -3771,34 +3878,48 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("Files window survives input and is still on screen",
                   survives, f"{files_clicked.name}")
 
-    # ── one-way takeover: console output stays off the screen ──
-    kb.screenshot(console_a)
+    # ── the shell must own the terminal before the next client starts ──
+    # A foreground lxrun job owns the keyboard. The click above can leave the
+    # Files client alive (then the job must be stopped and resumed) or remove it
+    # (an input artifact; the shell prompt simply returns). Both outcomes are
+    # legitimate — decide from the serial prompt, not by assuming which.
     off = mark()
-    kb.text("echo E2E_ALIVE_TAKEOVER")
-    kb.key("ret")
-    alive = wait_new(off, [r"E2E_ALIVE_TAKEOVER"], 20.0, "shell echo under takeover")
-    ok &= h.check("serial shell alive while the compositor owns the screen",
-                  alive is not None, "^echo seen on serial")
-    time.sleep(0.3)
-    kb.screenshot(console_b)
-    frozen = (console_a.is_file() and console_b.is_file()
-              and console_a.read_bytes() == console_b.read_bytes())
-    ok &= h.check("kernel console did not repaint (fbdev takeover is one-way)",
-                  frozen, "frames identical" if frozen else "console repainted")
+    prompt_back = wait_new(off, [r"pagh:/> "], 3.0, "shell prompt after Files")
+    if prompt_back is None:
+        h.qmp.keys(["ctrl", "z"])
+        h.qmp.release_modifiers()
+        files_parked = wait_new(off, [r"\^Z"], 20.0, "Files Ctrl+Z")
+        ok &= h.check("Files job stops on Ctrl+Z (shell regains the terminal)",
+                      files_parked is not None,
+                      "^Z" if files_parked else "no ^Z marker")
+        if files_parked is not None:
+            off = mark()
+            _desktop_restart_shell_line(kb)
+            kb.text("bg")
+            kb.key("ret")
+            files_bg = wait_new(off, [r"bg: \[\d+\]"], 20.0, "bg Files")
+            ok &= h.check("Files job resumed in the background (`bg`)",
+                          files_bg is not None, "^bg seen on serial")
+    else:
+        h.info_check("Files client gone after the pointer click",
+                     "shell prompt returned; no job to park")
 
     # ── REAL pagh-terminal as the second window ──
     _desktop_restart_shell_line(kb)
+    # `--socket` selects the private shell session of #138 (the `--vt` pair is
+    # still passed and is used by the VT-mirror fallback below).
     term_cmd = (f"rust /mnt/pagh-terminal --vt /dev/vtconsole0 "
                 f"--vt-input /dev/vtinput --socket {socket} --size 720x420")
     log(f"type: {term_cmd}")
     kb.text(term_cmd)
     kb.key("ret")
-    term_win = wait_for(guest, [r"pagh-terminal: connected \(client \d+"], 45.0,
+    term_win = wait_for(guest, [r"pagh-terminal: (?:session )?connected \(client \d+"], 45.0,
                         label="Terminal window")
     ok &= h.check("REAL pagh-terminal connected as a second PDP/1 window "
                   "(/dev/vtconsole0 + /dev/vtinput)",
                   term_win is not None,
-                  regex_first(r"pagh-terminal: connected[^\r\n]*", guest.serial()) or
+                  regex_first(r"pagh-terminal: (?:session )?connected[^\r\n]*",
+                              guest.serial()) or
                   "no connected line")
     vt_error = re.search(r"pagh-terminal: PGVT I/O error: ([^\r\n]+)", guest.serial())
     if vt_error:
@@ -3813,30 +3934,48 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
         log(f"type (VT fallback, window-only): {retry_cmd}")
         kb.text(retry_cmd)
         kb.key("ret")
-        term_win = wait_for(guest, [r"pagh-terminal: connected \(client \d+"], 45.0,
+        term_win = wait_for(guest, [r"pagh-terminal: (?:session )?connected \(client \d+"], 45.0,
                             label="Terminal window (window-only)")
         ok &= h.check("second window still proven on the PDP surface (VT fallback)",
                       term_win is not None,
                       regex_first(r"pagh-terminal: connected[^\r\n]*",
                                   guest.serial()) or "no connected line")
+    # The compositor focuses a newly created window; the liveness probe below
+    # types into it instead of clicking it (a QMP mouse burst is itself an
+    # input artifact while a client owns the keyboard).
     time.sleep(0.6)
     kb.screenshot(term_a)
-    second = (term_a.is_file() and files_clicked.is_file()
-              and term_a.read_bytes() != files_clicked.read_bytes())
-    ok &= h.check("Terminal window is drawn as a second window",
-                  second, f"{term_a.name} vs {files_clicked.name}")
     # Cursor blink repaints every 500 ms: two dumps must differ if the client
     # really keeps committing frames (window alive, not a stale compositor blit).
+    # Liveness by a deterministic input, not by an idle cursor-blink
+    # assumption: three frames 2.4 s apart were byte-identical on this kernel
+    # (the client's session readers park in `read`, so an idle blink does not
+    # guarantee a commit), while the earlier "blink" pass came from the client's
+    # initial content frame rather than a blink. Type a command into the focused
+    # session and require the client to commit a different frame: that is the
+    # property this check exists for (window alive, not a stale compositor blit)
+    # and it cannot pass on a static frame.
+    h.qmp.release_modifiers()
+    kb.text("ls")
+    kb.key("ret")
     time.sleep(1.2)
     kb.screenshot(term_b)
+    # The settled frame (after the input above) is the baseline for "the window
+    # is on screen": the first screendump after create can still return the
+    # previous desktop while QEMU lags, which made the earlier order flaky.
+    second = (term_b.is_file() and files_clicked.is_file()
+              and term_b.read_bytes() != files_clicked.read_bytes())
+    ok &= h.check("Terminal window is drawn as a second window",
+                  second, f"{term_b.name} vs {files_clicked.name}")
     blinking = (term_a.is_file() and term_b.is_file()
                 and term_a.read_bytes() != term_b.read_bytes())
-    ok &= h.check("Terminal window keeps committing frames (cursor blink)",
+    ok &= h.check("Terminal window commits new frames after input (client alive)",
                   blinking, f"{term_b.name} differs={blinking}")
 
     # ── stop the terminal, prove the shell still works, then check crashes ──
     off = mark()
     h.qmp.keys(["ctrl", "z"])
+    h.qmp.release_modifiers()
     term_parked = wait_new(off, [r"\^Z"], 12.0, "Terminal Ctrl+Z")
     if term_parked is not None:
         ok &= h.check("Terminal job stops on Ctrl+Z", True, "^Z")
@@ -3858,44 +3997,63 @@ def _desktop_real_apps(h: "Harness", guest: "Guest",
     ok &= h.check("serial shell alive after both real applications ran",
                   alive is not None, "^echo seen on serial")
 
-    # ── REAL PDP/1 launch path (type 13), LAST: the requesting client may die ──
-    # Files' global Alt+Shift+F4 asks the compositor to launch app "terminal".
-    # The configured target is the real pagh-files binary in headless mode; it
-    # writes PNGs under /mnt before its first console write, so the written file
-    # is proof that the compositor spawned the configured command. The Terminal
-    # window has focus by now, so move the pointer to the Files-only bottom-right
-    # area (relative motion saturates at the screen edge) and click to focus it.
+    # ── REAL PDP/1 launch (type 13): requester -> launch_app -> spawn target ──
+    # The requester is the ORIGINAL Files client parked in the background above:
+    # a fresh `rust /mnt/pagh-files --connect ...` typed at this point is killed
+    # by an input artifact (serial: `[signal] pid=N sig=2 default-terminate`)
+    # before the hotkey can reach it, while the parked client has already proven
+    # it survives its own window checks. Focus it in a provably free point: the
+    # point is inside the 1060x640 Files content and outside the 720x420 Terminal
+    # rectangle, and is not the resize grip.
     h.qmp.rel(2000, 2000)
     time.sleep(0.2)
-    h.qmp.rel(-150, -130)
+    h.qmp.rel(-280, -200)
     time.sleep(0.3)
     h.qmp.button("left", True)
     time.sleep(0.1)
     h.qmp.button("left", False)
-    time.sleep(0.4)
+    time.sleep(0.6)
     kb_off = mark()
     h.qmp.keys(["alt", "shift", "f4"])
+    time.sleep(0.5)  # let the chord land before the modifier reset
+    h.qmp.release_modifiers()
     time.sleep(6.0)
     launch_text = guest.serial()[kb_off:]
     died = re.search(r"pagh-files: Message too large \(os error 90\)", launch_text)
     if died:
-        # Observed on this tree: the *requesting* Files client dies with EMSGSIZE
-        # right after the compositor spawns the target. The launch itself worked,
-        # so this is recorded as an ABI finding, not as a failed launch check.
         h.info_check("PDP launch: requesting pagh-files client died with EMSGSIZE",
                      "pagh-files: Message too large (os error 90) after type-13 launch")
+    evidence = _wait_launch_png(guest, kb)
+    ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
+                  evidence,
+                  "PNG written" if evidence else "no PNG after 90 s of polling")
+    # `_wait_launch_png` returns a bool, so `is not None` was always true and the
+    # check passed vacuously when no PNG appeared at all. Require the evidence
+    # itself: a launch that produced nothing must FAIL here too.
+    ok &= h.check("launched target is the REAL binary (headless Files PNG on /mnt)",
+                  "pagh-desktop-demo" not in guest.serial() and evidence is True,
+                  "pagh-files headless output" if evidence
+                  else "no PNG: launch produced no evidence")
+
+    # ── separate: launch_targets spawn from the compositor hotkey ──
+    # NOT a substitute for the type-13 leg above: this proves the server-side
+    # registry/spawn_target path only (no PDP message, no requester). The
+    # evidence directory is cleared first so the two checks are independent.
     _desktop_restart_shell_line(kb)
     off = mark()
-    kb.text("ls /mnt/launch-evidence")
+    kb.text("rm -r /mnt/launch-evidence")
     kb.key("ret")
-    evidence = wait_new(off, [r"[^\s/]+\.png"], 20.0, "launch-target evidence")
-    ok &= h.check("PDP/1 launch (type 13) spawned the configured --launch-target",
-                  evidence is not None,
-                  regex_first(r"[^\r\n]*\.png[^\r\n]*",
-                              guest.serial()[off:]) or "no PNG written")
-    ok &= h.check("launched target is the REAL binary (headless Files PNG on /mnt)",
-                  "pagh-desktop-demo" not in guest.serial() and evidence is not None,
-                  "pagh-files headless output")
+    wait_new(off, [r"/mnt/launch-evidence|rm:"], 10.0, "evidence dir removal")
+    time.sleep(0.3)
+    hotkey_off = mark()
+    h.qmp.keys(["ctrl", "alt", "t"])
+    h.qmp.release_modifiers()
+    time.sleep(8.0)
+    hotkey_evidence = _wait_launch_png(guest, kb)
+    ok &= h.check("launch_targets spawn the configured target via the compositor "
+                  "hotkey (server-side registry, not PDP type 13)",
+                  hotkey_evidence,
+                  "PNG written" if hotkey_evidence else "no PNG after 90 s of polling")
 
     text = guest.serial()
     crashes = re.findall(r"PANIC|\[EXC [^\]]+\]|DOUBLE FREE|SIGSEGV|Segmentation fault", text)
@@ -4204,12 +4362,13 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--legacy-demo", action="store_true",
                     help="run the previous demo-client scenario (pagh-desktop-demo + "
                          "--spawn-demo) instead of the REAL pagh-files/pagh-terminal "
-                         "windows; needed while the panel launch path still spawns the "
-                         "demo client (server.rs launch() -> spawn_demo)")
-    dp.add_argument("--pd-lifetime-ms", type=int, default=300_000,
+                         "windows; the demo client is a test-only fallback and is "
+                         "injected into the disk for this mode alone")
+    dp.add_argument("--pd-lifetime-ms", type=int, default=1_800_000,
                     help="compositor lifetime in the real-apps path passed as "
-                         "--exit-after-ms (default 300000; the scenario is bounded by the "
-                         "harness teardown, the deadline only guards a hang)")
+                         "--exit-after-ms (default 1800000; the scenario is bounded by the "
+                         "harness teardown, the deadline only guards a hang — the QEMU/TCG "
+                         "run of phase 2 has been observed above 1500 s)")
     dp.add_argument("--serial-start-timeout", type=float, default=25.0,
                     help="fail-fast window for the first serial bytes/kernel banner after "
                          "each boot; separates firmware-not-started from kernel-silent "

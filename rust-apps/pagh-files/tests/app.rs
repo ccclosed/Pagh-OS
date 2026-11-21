@@ -201,6 +201,45 @@ fn double_click_file_returns_open_command() {
     );
 }
 
+/// Одиночный клик по папке только выделяет её и не открывает: синтез двойного
+/// клика не должен съедать одиночный press (F3.2 — поведение press'а по
+/// выделенному не меняется).
+#[test]
+fn single_click_selects_without_opening() {
+    let mut app = demo_app();
+    let index = entry_index(&app, "Documents");
+    let rect = app.item_rect(index).unwrap();
+    let commands = click(&mut app, rect.center(), MouseButton::Left);
+    assert!(commands.is_empty(), "{commands:?}");
+    assert_eq!(app.cwd(), "/home/user", "одиночный клик не входит в папку");
+    assert_eq!(
+        app.selected().map(|entry| entry.name.as_str()),
+        Some("Documents"),
+        "одиночный клик выделяет элемент"
+    );
+    // Открывает только двойной клик — тот же элемент, та же точка.
+    double_click(&mut app, rect.center());
+    assert_eq!(app.cwd(), "/home/user/Documents");
+}
+
+/// Двойной клик по папке открывает её (навигация), по файлу — `OpenPath`;
+/// раньше `on_double_click` был мёртвым кодом, потому что живой путь ввода не
+/// порождал `Event::DoubleClick` (синтез — `pagh-ui::client`, F3.1).
+#[test]
+fn double_click_directory_navigates_into_it() {
+    let mut app = demo_app();
+    let index = entry_index(&app, "Documents");
+    let rect = app.item_rect(index).unwrap();
+    let commands = double_click(&mut app, rect.center());
+    assert!(
+        commands.is_empty(),
+        "навигация не выходит наружу: {commands:?}"
+    );
+    assert_eq!(app.cwd(), "/home/user/Documents");
+    assert_eq!(app.location_label(), "Документы");
+    assert!(app.error().is_none(), "{:?}", app.error());
+}
+
 #[test]
 fn search_filters_entries_and_updates_status() {
     let mut app = demo_app();
