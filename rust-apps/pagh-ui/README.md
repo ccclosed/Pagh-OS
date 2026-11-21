@@ -124,6 +124,13 @@ loop {
 `launch("terminal", cwd)` отправляет композитору PDP/1 `launch (type 13)` —
 запуск известного приложения (см. [`PROTOCOL.md`](PROTOCOL.md)).
 
+Двойной клик протокол не передаёт: `DesktopClient` синтезирует
+`Event::DoubleClick` из двух нажатий левой кнопки (`client::ClickTracker`,
+`DOUBLE_CLICK_INTERVAL` = 400 мс, `DOUBLE_CLICK_SLOP` = 4 px), поэтому
+`InputEvent::Button × 2` доходят до приложения как `MouseDown` + `DoubleClick`.
+Правила и границы — в
+[`PROTOCOL.md`](PROTOCOL.md#двойной-клик--синтез-клиента).
+
 ## Детерминизм и screenshot-тесты
 
 Рендер чисто целочисленный (без плавающей точки в раскладке), шрифт встроен,

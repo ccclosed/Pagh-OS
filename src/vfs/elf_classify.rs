@@ -22,6 +22,13 @@
 /// x86_64 page size (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
+/// Длина ELF64-заголовка (`Ehdr`) в байтах.
+///
+/// Экспортируется, чтобы PATH-поиск `lxrun` мог прочитать только заголовок
+/// кандидата (см. [`looks_like_linux_elf`]) и не тянуть в память весь образ
+/// ради решения «это вообще ELF?».
+pub const HEADER_LEN: usize = EHDR_SIZE;
+
 /// Исключающая верхняя граница нижней половины канонического
 /// пользовательского диапазона (`User_Addr_Max`). Сегмент допустим, только если
 /// его диапазон, округлённый по страницам, строго ниже неё.
@@ -281,6 +288,35 @@ pub fn classify_elf(data: &[u8]) -> ElfVerdict {
         kind,
         bias_required: kind == ElfKind::Dyn,
     }
+}
+
+/// Дешёвый префиксный тест: начинается ли буфер с ELF64-заголовка Linux
+/// x86_64 `ET_EXEC`/`ET_DYN`, то есть может ли [`classify_elf`] вообще его
+/// принять.
+///
+/// Проверяются только поля `Ehdr` (магия, класс, порядок байт, `e_machine`,
+/// `e_type`) — таблица program headers и сегменты **не** просматриваются, для
+/// этого нужен весь образ. Поэтому `true` — это «кандидат для PATH-поиска
+/// `lxrun`», а не гарантия загрузки: окончательный вердикт по-прежнему даёт
+/// [`classify_elf`] на полном буфере внутри загрузчика, и негодный кандидат
+/// отвергается там с описательной причиной, а не запускается.
+///
+/// Нужен поиску, чтобы прочитать [`HEADER_LEN`] байт каждого кандидата, а не
+/// весь образ (несколько МиБ) до того, как имя найдено.
+pub fn looks_like_linux_elf(data: &[u8]) -> bool {
+    if data.len() < EHDR_SIZE {
+        return false;
+    }
+    if data[0] != 0x7F || &data[1..4] != b"ELF" {
+        return false;
+    }
+    if data[EI_CLASS] != ELFCLASS64 || data[EI_DATA] != ELFDATA2LSB {
+        return false;
+    }
+    if rd_u16(data, E_MACHINE_OFF) != Some(EM_X86_64) {
+        return false;
+    }
+    matches!(rd_u16(data, E_TYPE_OFF), Some(ET_EXEC) | Some(ET_DYN))
 }
 
 /// Выбирает выровненный по странице load-bias для static-PIE (`ET_DYN`) образа.
