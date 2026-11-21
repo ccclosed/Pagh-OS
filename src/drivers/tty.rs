@@ -139,6 +139,7 @@ pub fn init_shell_for(session: usize, pgid: u64) {
     let mut tty = TTY[s].lock();
     if tty.foreground() == UNOWNED {
         tty.set_foreground(pgid);
+        crate::info!("[tty] session {}: shell pgid {} owns the terminal", s, pgid);
     }
 }
 
@@ -187,7 +188,18 @@ pub fn foreground_pgid() -> u64 {
 /// target belongs to the caller
 /// ([`crate::arch::x86_64::linux::tty::may_set_foreground`]).
 pub fn set_foreground_pgid_for(session: usize, pgid: u64) {
-    TTY[slot(session)].lock().set_foreground(pgid);
+    let s = slot(session);
+    let old = {
+        let mut tty = TTY[s].lock();
+        let old = tty.foreground();
+        tty.set_foreground(pgid);
+        old
+    };
+    if old != pgid {
+        // Handoff evidence for live-QEMU runs; the value names the SESSION, so a
+        // log reader can tell boot console (0) from a terminal window (>= 1).
+        crate::info!("[tty] session {}: foreground pgid {} -> {}", s, old, pgid);
+    }
 }
 
 /// [`set_foreground_pgid_for`] для boot-консоли.

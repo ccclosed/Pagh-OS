@@ -36,9 +36,11 @@
 //! Честные границы v1 (подробнее — `TERMINAL.md`):
 //!
 //! * одно окно = одна сессия ядра; второй клиент получает ту же поверхность;
-//! * нет PTY/termios/job-control: `Ctrl+C`/`Ctrl+Z` — просто байты в
-//!   `/dev/vtinput1`, а `TIOCGWINSZ`/SIGWINCH неоткуда взять (размер знает
-//!   только ядро);
+//! * нет PTY и полного `struct termios`: управляющий терминал — kernel-консоль
+//!   сессии. `Ctrl+C`/`Ctrl+Z` клиент шлёт байтами в `/dev/vtinput1`, а `ISIG`
+//!   и signals применяет ядро к foreground-группе сессии; `winsize` клиент
+//!   сообщает через `TIOCSWINSZ` (окно resize → [`winsize_cells`] → SIGWINCH),
+//!   но пиксельная поверхность остаётся размером с экран и масштабируется;
 //! * клиент не наблюдает DEC-режимы (пиксели не говорят, хочет ли сессия
 //!   application-cursor keys), поэтому стрелки кодируются в normal-режиме
 //!   (`KeyModes::default()`), как kernel-shell и ожидает;
@@ -376,6 +378,25 @@ impl FileInput {
             path,
         })
     }
+
+    /// Дескриптор `/dev/vtinput1`: resize-путь шлёт по нему `TIOCSWINSZ`
+    /// (сам `ioctl` — unsafe, поэтому он в `devfs` рядом с `mmap`).
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+/// Размер терминала в клетках ядра (8×18 px): `(cols, rows)`.
+///
+/// Окно может быть меньше/больше поверхности: `cols/rows` — это сколько клеток
+/// помещается в клиентскую область окна, то есть достоверный `winsize` для
+/// приложения внутри сессии (`TIOCGWINSZ`). Деление целочисленное, минимум 1:
+/// нулевой размер заставил бы TUI делить на ноль. Значения клампятся в `u16`
+/// (`struct winsize` — четыре `u16`), пиксели не клампятся.
+pub fn winsize_cells(width: u32, height: u32) -> (u16, u16) {
+    let cols = (width as usize / CELL_W).max(1).min(u16::MAX as usize) as u16;
+    let rows = (height as usize / CELL_H).max(1).min(u16::MAX as usize) as u16;
+    (cols, rows)
 }
 
 impl InputSink for FileInput {
