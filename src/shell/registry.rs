@@ -349,6 +349,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         handler: super::commands::cmd_stat,
     },
     CommandSpec {
+        name: "exit",
+        description: "End a terminal session (the boot shell cannot exit)",
+        usage: "exit",
+        handler: super::commands::cmd_exit,
+    },
+    CommandSpec {
         name: "sleep",
         description: "Sleep for N seconds",
         usage: "sleep <seconds>",

@@ -10,12 +10,24 @@ use alloc::vec::Vec;
 
 use crate::sync::spinlock::Spinlock;
 
-/// Глобальный CWD shell.
+/// CWD каждой консольной сессии: `[0]` — boot/shell, `[i >= 1]` — окно.
+///
+/// Раньше CWD был один на ядро. С появлением второй сессии это стало бы общим
+/// состоянием двух окон: `cd` в одном менял бы промпт и относительные пути
+/// другого. Массив индексируется номером сессии текущей задачи
+/// ([`crate::drivers::session::current`]), поэтому команды (`cd`, `pwd`, `ls`,
+/// Tab-дополнение) остаются без изменений — они зовут те же `cwd`/`set_cwd`.
 ///
 /// Хранится нормализованным абсолютным путём. Инициализируется лениво: пустая
 /// строка (const-конструируемый дефолт) трактуется как корень `/`, так что
 /// наблюдаемый начальный CWD — `/` (R4.1) без runtime-инициализации.
-static CWD: Spinlock<String> = Spinlock::new(String::new());
+static CWDS: [Spinlock<String>; crate::drivers::session_route::MAX_SESSIONS] =
+    [const { Spinlock::new(String::new()) }; crate::drivers::session_route::MAX_SESSIONS];
+
+/// CWD конкретной сессии (`0` — boot).
+fn slot(session: usize) -> &'static Spinlock<String> {
+    &CWDS[if session < CWDS.len() { session } else { 0 }]
+}
 
 /// Свернуть абсолютный путь в каноническую форму.
 ///
@@ -86,7 +98,13 @@ pub fn resolve(base: &str, input: &str) -> String {
 /// неинициализированное хранилище читается как `/`.
 #[allow(dead_code)]
 pub fn cwd() -> String {
-    let guard = CWD.lock();
+    cwd_for(crate::drivers::session::current())
+}
+
+/// CWD указанной сессии (`0` — boot); см. [`cwd`].
+#[allow(dead_code)]
+pub fn cwd_for(session: usize) -> String {
+    let guard = slot(session).lock();
     if guard.is_empty() {
         String::from("/")
     } else {
@@ -98,7 +116,13 @@ pub fn cwd() -> String {
 /// глобальный инвариант (канонический абсолютный путь) сохранялся.
 #[allow(dead_code)]
 pub fn set_cwd(abs: &str) {
+    set_cwd_for(crate::drivers::session::current(), abs);
+}
+
+/// Сохранить CWD указанной сессии (`0` — boot).
+#[allow(dead_code)]
+pub fn set_cwd_for(session: usize, abs: &str) {
     let normalized = normalize(abs);
-    let mut guard = CWD.lock();
+    let mut guard = slot(session).lock();
     *guard = normalized;
 }

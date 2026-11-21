@@ -111,6 +111,15 @@ pub fn write_bytes(bytes: &[u8]) {
 }
 
 pub fn _kprint(args: fmt::Arguments) {
+    // Окно терминала не эхоит в serial. Serial — общий лог ядра (boot shell,
+    // драйверы, E2E-протокол); второй экземпляр приглашения и вывода команд от
+    // окна склеил бы чужие строки и сделал бы лог нечитаемым. Диагностика ядра
+    // идёт через `serial::console()` (`log::_log`), а не сюда, поэтому
+    // `[WARN]`/`[ERROR]` из окна по-прежнему видны. Boot-shell не меняется:
+    // `current_try()` для его задачи возвращает 0.
+    if crate::drivers::session::current_try() != crate::drivers::session_route::BOOT_SESSION {
+        return;
+    }
     use core::fmt::Write;
     struct SerialWriter;
     impl fmt::Write for SerialWriter {

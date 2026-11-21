@@ -506,7 +506,7 @@ fn read_evdev_event(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
 /// применил бы обработчик page fault. Настоящий отказ (адрес вне
 /// зарегистрированных регионов, `PROT_NONE`, read-only лист) остаётся `EFAULT`
 /// и по-прежнему приходит из [`copy_out_checked`].
-fn read_vtconsole(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
+fn read_snapshot_dev(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
     let (node, offset) = match resolve_fd(fd) {
         Some(Resolved::File { node, offset }) => (node, offset),
         _ => return Err(Errno::EBADF),
@@ -519,7 +519,7 @@ fn read_vtconsole(fd: u32, buf: u64, count: u64) -> Result<u64, Errno> {
     let mut kbuf = vec![0u8; copied as usize];
     let n = node.read(offset, &mut kbuf).map_err(|e| {
         crate::error!(
-            "[linux] vtconsole read failed: {:?} off={} len={}",
+            "[linux] device snapshot read failed: {:?} off={} len={}",
             e,
             offset,
             copied
@@ -555,8 +555,8 @@ pub fn sys_read(fd: u64, buf: u64, count: u64) -> Result<u64, Errno> {
         if node.is_evdev() {
             return read_evdev_event(fd as u32, buf, count);
         }
-        if node.is_vtconsole() {
-            return read_vtconsole(fd as u32, buf, count);
+        if node.is_vtconsole() || node.is_vtfb1() {
+            return read_snapshot_dev(fd as u32, buf, count);
         }
     }
     // PRESENT больше не требуется от всего `count`: `read(2)` копирует
@@ -1316,6 +1316,18 @@ fn open_resolved(abs: &str, flags: u64) -> Result<u64, Errno> {
         // получает снимок уже нарисованного shell-текста.
         crate::drivers::vtsurface::activate();
     }
+    if node.is_vtfb1() || node.is_vtinput1() {
+        // Первый open любого из двух устройств поднимает kernel-shell сессию
+        // (`/dev/vtfb1` + `/dev/vtinput1`). Поверхность аллоцируется здесь, в
+        // контексте открывающего, поэтому `mmap`/`ioctl` сразу после open видят
+        // готовую геометрию. Отказ (нет фреймбуфера/PMM) — честный ENODEV, а
+        // выделенный fd откатывается: иначе клиент получил бы дескриптор на
+        // мёртвое окно.
+        if !crate::drivers::session::note_open(1) {
+            let _ = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
+            return Err(Errno::ENODEV);
+        }
+    }
     Ok(fd as u64)
 }
 
@@ -1382,6 +1394,17 @@ fn open_path(path: &str, flags: u64, mode: u32) -> Result<u64, Errno> {
                 }
             }
             if node.is_vtinput() && flags & 0o3 == 0 {
+                return Err(Errno::EACCES);
+            }
+            // `/dev/vtfb1` — read-only поверхность сессии, `/dev/vtinput1` —
+            // write-only приём её ввода (та же дисциплина, что у `vtconsole0`/
+            // `vtinput`). Сама сессия поднимается в `open_resolved`, после
+            // успешной аллокации fd, — чтобы неудачный open не считался
+            // открытием окна.
+            if node.is_vtfb1() && flags & 0o3 != 0 {
+                return Err(Errno::EACCES);
+            }
+            if node.is_vtinput1() && flags & 0o3 == 0 {
                 return Err(Errno::EACCES);
             }
             if flags & O_TRUNC_FL != 0 && !node.is_directory() {
@@ -1480,11 +1503,22 @@ pub fn sys_close(fd: u64) -> Result<u64, Errno> {
         resolve_fd(fd as u32),
         Some(Resolved::File { ref node, .. }) if node.is_vtconsole()
     );
+    // `/dev/vtfb1`//`/dev/vtinput1`: последний close окна — запрос выхода
+    // сессии. Сама задача выйдет на границе своего цикла (`session::check_reap`),
+    // а не будет сорвана асинхронным kill'ом, который мог бы застать её с чужим
+    // ресурсом в руках.
+    let closing_session_dev = matches!(
+        resolve_fd(fd as u32),
+        Some(Resolved::File { ref node, .. }) if node.is_vtfb1() || node.is_vtinput1()
+    );
     let res = compat::with_current_compat(|cs| cs.fds.close(fd as u32));
     match res {
         Some(Ok(())) => {
             if closing_vtconsole {
                 crate::drivers::vtsurface::deactivate();
+            }
+            if closing_session_dev {
+                crate::drivers::session::note_close(1);
             }
             Ok(0)
         }
@@ -1525,7 +1559,12 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> Result<u64, Errno> {
             });
             Ok(offset)
         }
-        Some(Resolved::File { node, .. }) if node.is_vtconsole() || node.is_vtinput() => {
+        Some(Resolved::File { node, .. })
+            if node.is_vtconsole()
+                || node.is_vtinput()
+                || node.is_vtfb1()
+                || node.is_vtinput1() =>
+        {
             Err(Errno::ESPIPE)
         }
         Some(Resolved::File { node, offset: cur }) => {
@@ -1550,7 +1589,13 @@ pub fn sys_ftruncate(fd: u64, length: u64) -> Result<u64, Errno> {
     }
     match resolve_fd(fd as u32) {
         Some(Resolved::File { node, .. }) => {
-            if node.is_fbdev() || node.is_evdev() || node.is_vtconsole() || node.is_vtinput() {
+            if node.is_fbdev()
+                || node.is_evdev()
+                || node.is_vtconsole()
+                || node.is_vtinput()
+                || node.is_vtfb1()
+                || node.is_vtinput1()
+            {
                 return Err(Errno::EINVAL);
             }
             node.truncate(length).map_err(truncate_errno)?;
@@ -1826,7 +1871,13 @@ fn stat_mode_for(node: &Arc<dyn VfsNode>) -> u32 {
         S_IFDIR | perms
     } else if node.is_symlink() {
         S_IFLNK | perms
-    } else if node.is_fbdev() || node.is_evdev() || node.is_vtconsole() || node.is_vtinput() {
+    } else if node.is_fbdev()
+        || node.is_evdev()
+        || node.is_vtconsole()
+        || node.is_vtinput()
+        || node.is_vtfb1()
+        || node.is_vtinput1()
+    {
         // Символьные устройства варианта B: композитор видит S_IFCHR, как
         // `/dev/fb0`/`/dev/input/event0` в Linux, и может отличить их от
         // regular-файла до open.
@@ -2037,6 +2088,7 @@ pub fn sys_ioctl(fd: u64, request: u64, arg: u64) -> Result<u64, Errno> {
         Some(Resolved::File { node, .. }) if node.is_vtconsole() => {
             vtconsole_ioctl(&node, request, arg)
         }
+        Some(Resolved::File { node, .. }) if node.is_vtfb1() => vtfb_ioctl(&node, request, arg),
         Some(Resolved::Console) | Some(Resolved::Stdin) => tty_ioctl(request, arg),
         // Сетевые `SIOCGIF*` — на любом `AF_INET`-сокете, как в Linux. До этой
         // ветки они падали в общий ENOTTY, и `ifconfig` не видел ни адреса, ни
@@ -2147,6 +2199,23 @@ fn vtconsole_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u6
     };
     check_user_ptr_writable(arg, 32)?;
     copy_out(arg, &encode_info(&out))?;
+    Ok(0)
+}
+
+/// `ioctl(/dev/vtfb1)`: `VTFBIOGET_INFO` (0x4700, 24 байта LE).
+///
+/// Отдаёт геометрию, шаг, bpp и **текущее** поколение кадра: клиент по нему
+/// понимает, что поверхность изменилась после последнего блита, и не копирует
+/// её зря. Прочие запросы — `ENOTTY`; размер/формат поверхности задаёт только
+/// ядро.
+fn vtfb_ioctl(node: &Arc<dyn VfsNode>, request: u64, arg: u64) -> Result<u64, Errno> {
+    use crate::drivers::vtfb_abi::{encode_info, VTFBIOGET_INFO, VTFB_INFO_SIZE};
+    let info = node.vtfb_info().ok_or(Errno::ENODEV)?;
+    if request != VTFBIOGET_INFO {
+        return Err(Errno::ENOTTY);
+    }
+    check_user_ptr_writable(arg, VTFB_INFO_SIZE as u64)?;
+    copy_out(arg, &encode_info(&info))?;
     Ok(0)
 }
 

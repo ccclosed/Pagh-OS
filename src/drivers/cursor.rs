@@ -59,20 +59,50 @@ struct CursorState {
     saved: [u32; CURSOR_W * CURSOR_H],
 }
 
-static CURSOR: Spinlock<CursorState> = Spinlock::new(CursorState {
-    x: 0,
-    y: 0,
-    visible: false,
-    have_saved: false,
-    saved: [0; CURSOR_W * CURSOR_H],
-});
+/// Состояние курсора **на консоль**: `[0]` — boot/shell, `[i >= 1]` — окно.
+///
+/// Раньше состояние было одно на ядро. С двумя консолями это сломало бы
+/// контракт save/restore: `hide()` одного писателя восстановил бы пиксели,
+/// снятые с *другой* поверхности (boot scanout против offscreen-сессии), и в
+/// окне появился бы мусорный прямоугольник, а на экране — след стрелки.
+/// Массив индексируется номером сессии текущей задачи; курсор окна живёт в
+/// offscreen-поверхности окна.
+static CURSORS: [Spinlock<CursorState>; crate::drivers::session_route::MAX_SESSIONS] = [const {
+    Spinlock::new(CursorState {
+        x: 0,
+        y: 0,
+        visible: false,
+        have_saved: false,
+        saved: [0; CURSOR_W * CURSOR_H],
+    })
+};
+    crate::drivers::session_route::MAX_SESSIONS];
+
+/// Состояние курсора текущей консольной сессии.
+fn state() -> &'static Spinlock<CursorState> {
+    let session = crate::drivers::session::current();
+    &CURSORS[if session < CURSORS.len() { session } else { 0 }]
+}
+
+/// Реальный ли это экран: курсор окна не рисуется.
+///
+/// Указатель на экране рисует композитор (у него настоящая стрелка поверх всех
+/// окон), а offscreen-поверхность окна — только содержимое окна. Оверлей стрелки
+/// в ней был бы вторым, «фантомным» курсором, уехавшим на смещение окна.
+fn draws_pointer() -> bool {
+    crate::drivers::session::current() == crate::drivers::session_route::BOOT_SESSION
+}
 
 /// Restore the background under the cursor (if drawn) and mark it hidden.
 ///
 /// Call before drawing anything that lands under the current cursor position;
 /// follow with [`move_to`] to bring it back.
 pub fn hide() {
-    let mut c = CURSOR.lock();
+    // В окне стрелку рисует композитор, а не offscreen-поверхность.
+    if !draws_pointer() {
+        return;
+    }
+    let mut c = state().lock();
     if !c.have_saved {
         c.visible = false;
         return;
@@ -97,13 +127,16 @@ pub fn hide() {
 /// — to the device in one step. That is what makes the pointer continuous while it
 /// moves: there is no moment in which the device shows a frame without an arrow.
 pub fn place_deferred(x: usize, y: usize) {
+    if !draws_pointer() {
+        return;
+    }
     let (fw, fh) = framebuffer::dimensions();
     if fw == 0 {
         return;
     }
     let nx = x.min(fw.saturating_sub(1));
     let ny = y.min(fh.saturating_sub(1));
-    let mut c = CURSOR.lock();
+    let mut c = state().lock();
     let mut new_saved = [0u32; CURSOR_W * CURSOR_H];
     framebuffer::with(|fb| {
         for row in 0..CURSOR_H {
@@ -123,7 +156,7 @@ pub fn place_deferred(x: usize, y: usize) {
 /// [`place_deferred`] at the cursor's last known coordinates.
 pub fn place_here_deferred() {
     let (x, y) = {
-        let c = CURSOR.lock();
+        let c = state().lock();
         (c.x, c.y)
     };
     place_deferred(x, y);
@@ -138,7 +171,7 @@ pub fn place_here_deferred() {
 /// background.
 pub fn show() {
     let (x, y) = {
-        let c = CURSOR.lock();
+        let c = state().lock();
         (c.x, c.y)
     };
     move_to(x, y);
@@ -153,7 +186,10 @@ pub fn show() {
 /// "cursor flickers while it moves" complaint — while keeping the saved pixels
 /// consistent. Call [`redraw`] after the frame flush.
 pub fn hide_deferred() {
-    let mut c = CURSOR.lock();
+    if !draws_pointer() {
+        return;
+    }
+    let mut c = state().lock();
     if !c.have_saved {
         c.visible = false;
         return;
@@ -173,7 +209,7 @@ pub fn hide_deferred() {
 /// their flush so the pointer never vanishes for the duration of the repaint.
 pub fn redraw() {
     {
-        let mut c = CURSOR.lock();
+        let mut c = state().lock();
         c.have_saved = false;
     }
     show();
@@ -183,6 +219,9 @@ pub fn redraw() {
 /// background, and draw the arrow on top. Coordinates are clamped to the
 /// framebuffer.
 pub fn move_to(x: usize, y: usize) {
+    if !draws_pointer() {
+        return;
+    }
     let (fw, fh) = framebuffer::dimensions();
     if fw == 0 {
         return;
@@ -190,7 +229,7 @@ pub fn move_to(x: usize, y: usize) {
     let nx = x.min(fw.saturating_sub(1));
     let ny = y.min(fh.saturating_sub(1));
 
-    let mut c = CURSOR.lock();
+    let mut c = state().lock();
     // Idempotent: the shell calls this on every wake-up (once per timer tick),
     // and redrawing an arrow that has not moved would push the same rectangle to
     // the device for nothing.
@@ -258,19 +297,32 @@ struct TextGuard {
     redraw: bool,
 }
 
-static TEXT_GUARD: Spinlock<TextGuard> = Spinlock::new(TextGuard {
-    depth: 0,
-    redraw: false,
-});
+static TEXT_GUARDS: [Spinlock<TextGuard>; crate::drivers::session_route::MAX_SESSIONS] = [const {
+    Spinlock::new(TextGuard {
+        depth: 0,
+        redraw: false,
+    })
+};
+    crate::drivers::session_route::MAX_SESSIONS];
+
+/// Глубина text_begin/text_end текущей консольной сессии.
+fn guard_state() -> &'static Spinlock<TextGuard> {
+    let session = crate::drivers::session::current();
+    &TEXT_GUARDS[if session < TEXT_GUARDS.len() {
+        session
+    } else {
+        0
+    }]
+}
 
 /// Begin a console text write: on the outermost call, hide the arrow when it
 /// is currently visible (remembering that it must come back).
 pub fn text_begin() {
     let need_hide = {
-        let mut g = TEXT_GUARD.lock();
+        let mut g = guard_state().lock();
         g.depth += 1;
         if g.depth == 1 {
-            let visible = CURSOR.lock().visible;
+            let visible = state().lock().visible;
             g.redraw = visible;
             visible
         } else {
@@ -286,11 +338,11 @@ pub fn text_begin() {
 /// last position when `text_begin` hid it.
 pub fn text_end() {
     let redraw_at = {
-        let mut g = TEXT_GUARD.lock();
+        let mut g = guard_state().lock();
         g.depth = g.depth.saturating_sub(1);
         if g.depth == 0 && g.redraw {
             g.redraw = false;
-            let c = CURSOR.lock();
+            let c = state().lock();
             Some((c.x, c.y))
         } else {
             None

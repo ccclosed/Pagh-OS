@@ -273,6 +273,28 @@ pub trait VfsNode: Send + Sync {
     fn is_vtinput(&self) -> bool {
         false
     }
+
+    /// Является ли узел `/dev/vtfb1` (read-only пиксельная поверхность
+    /// терминальной сессии).
+    fn is_vtfb1(&self) -> bool {
+        false
+    }
+
+    /// Информация о пиксельной поверхности сессии (`VTFBIOGET_INFO`/`mmap`);
+    /// `None` — сессия не запущена (open/ioctl ответят `ENODEV`).
+    fn vtfb_info(&self) -> Option<crate::drivers::vtfb_abi::VtfbInfo> {
+        None
+    }
+
+    /// Физический кадр пиксельной поверхности для read-only `mmap`.
+    fn vtfb_page(&self, _index: u64) -> Option<u64> {
+        None
+    }
+
+    /// Является ли узел `/dev/vtinput1` (write-only приём VT-байтов сессии).
+    fn is_vtinput1(&self) -> bool {
+        false
+    }
 }
 
 // ─── /dev/null ────────────────────────────────────────────────────────────
@@ -532,6 +554,18 @@ impl VfsNode for MountNode {
     fn is_vtinput(&self) -> bool {
         self.inner.is_vtinput()
     }
+    fn is_vtfb1(&self) -> bool {
+        self.inner.is_vtfb1()
+    }
+    fn vtfb_info(&self) -> Option<crate::drivers::vtfb_abi::VtfbInfo> {
+        self.inner.vtfb_info()
+    }
+    fn vtfb_page(&self, index: u64) -> Option<u64> {
+        self.inner.vtfb_page(index)
+    }
+    fn is_vtinput1(&self) -> bool {
+        self.inner.is_vtinput1()
+    }
 }
 
 // ─── корневой каталог ───────────────────────────────────────────────────────
@@ -623,6 +657,13 @@ pub fn init() {
     crate::debug!("/dev/vtconsole0 — ready");
     let vtinput = desktop_dev::vtinput();
     crate::debug!("/dev/vtinput — ready");
+    // Терминальное окно desktop'а: пиксельная поверхность и ввод kernel-shell
+    // сессии 1. Узлы существуют всегда; `open` поднимает сессию, а на машине без
+    // фреймбуфера/PMM честно отвечает ENODEV.
+    let vtfb1 = desktop_dev::vtfb1();
+    crate::debug!("/dev/vtfb1 — ready");
+    let vtinput1 = desktop_dev::vtinput1();
+    crate::debug!("/dev/vtinput1 — ready");
     let dev = Arc::new(DevDirectory {
         children: vec![
             Arc::clone(&null),
@@ -633,6 +674,8 @@ pub fn init() {
             Arc::clone(&input),
             Arc::clone(&vtconsole),
             Arc::clone(&vtinput),
+            Arc::clone(&vtfb1),
+            Arc::clone(&vtinput1),
         ],
     }) as Arc<dyn VfsNode>;
     // Записываемый in-memory /tmp: Linux-userspace считает, что он есть, —
