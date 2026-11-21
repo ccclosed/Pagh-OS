@@ -1352,6 +1352,34 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
 ///   **в окне** и выход с кодом 2, без отката в демо;
 /// * `exit` в сессии (`ENODEV`): сообщение «сессия завершена», окно закрывается.
 ///   Реконнект — повторный запуск окна: первый `open` спавнит новую сессию.
+/// Сообщить ядру размер терминала в клетках (окно → `TIOCSWINSZ` → `SIGWINCH`).
+///
+/// Возвращает строку диагностики, только когда размер реально изменился (или
+/// ioctl отказал): клиент зовёт это на старте и на каждый `Configure`, а
+/// спамить одинаковым размером в `--log-file` незачем.
+fn forward_winsize(
+    sink: &FileInput,
+    width: u32,
+    height: u32,
+    reported: &mut Option<(u16, u16)>,
+) -> Option<String> {
+    let (cols, rows) = pagh_terminal::kernelsession::winsize_cells(width, height);
+    if *reported == Some((cols, rows)) {
+        return None;
+    }
+    match devfs::set_winsize(sink.file(), cols, rows) {
+        Ok(()) => {
+            *reported = Some((cols, rows));
+            Some(format!(
+                "terminal winsize {cols}x{rows} cells ({width}x{height} px)"
+            ))
+        }
+        // Старое ядро без per-session winsize: окно продолжает работать, размер
+        // просто остаётся тем, что сообщил сам kernel-shell.
+        Err(error) => Some(format!("TIOCSWINSZ {cols}x{rows} failed: {error}")),
+    }
+}
+
 fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
     let fb_path = args.vt_fb.as_str();
     let input_path = args.kernel_input();
@@ -1447,6 +1475,12 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         pagh_ui::damage::DEFAULT_TILE,
     );
     let mut forwarder = KeyForwarder::new(key_sink);
+    // Размер терминала сообщается ядру до первого кадра: приложение, которое
+    // уже работает в сессии, получает `SIGWINCH` и перестраивается под окно.
+    let mut reported_winsize: Option<(u16, u16)> = None;
+    if let Some(line) = forward_winsize(forwarder.sink(), width, height, &mut reported_winsize) {
+        note!("{line}");
+    }
     let mut dirty = true;
     let mut last_commit = Instant::now();
     let mut input_error_reported = false;
@@ -1553,6 +1587,11 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                             && frame.canvas.height == height as usize
                     });
                     if same_size {
+                        if let Some(line) =
+                            forward_winsize(forwarder.sink(), width, height, &mut reported_winsize)
+                        {
+                            note!("{line}");
+                        }
                         frame.invalidate();
                         dirty = true;
                         continue;
@@ -1573,6 +1612,13 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     // Масштаб под новый content rect меняется — полный блит.
                     frame.invalidate();
                     dirty = true;
+                    // Окно resize → winsize в клетках → `SIGWINCH` приложению
+                    // в сессии. Это не косметика: TUI перестраивается по нему.
+                    if let Some(line) =
+                        forward_winsize(forwarder.sink(), width, height, &mut reported_winsize)
+                    {
+                        note!("{line}");
+                    }
                 }
                 Event::ShmRelease {
                     window_id,

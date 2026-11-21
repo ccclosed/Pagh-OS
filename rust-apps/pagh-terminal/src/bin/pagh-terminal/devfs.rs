@@ -24,6 +24,45 @@ const PROT_READ: c_int = 0x1;
 /// `MAP_SHARED` — единственный честный вариант для поверхности ядра: копия не
 /// нужна, ядро владеет записью.
 const MAP_SHARED: c_int = 0x1;
+/// `TIOCSWINSZ` — сообщить ядру размер терминала в клетках (Linux UAPI).
+const TIOCSWINSZ: c_ulong = 0x5414;
+
+/// `struct winsize` UAPI: четыре `u16` (`ws_row`, `ws_col`, `ws_xpixel`,
+/// `ws_ypixel`). `#[repr(C)]`, как в Linux.
+#[repr(C)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+/// Сообщить ядру размер терминала окна: окно resize → `winsize` → `SIGWINCH`.
+///
+/// `file` — `/dev/vtinput1` (`O_WRONLY`); ioctl на нём адресует терминал
+/// сессии 1, а не stdin вызывающего. `ENOTTY` означает ядро без per-session
+/// winsize (старое) — вызывающий логирует и продолжает, это не фатально.
+pub fn set_winsize(file: &File, cols: u16, rows: u16) -> io::Result<()> {
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `file` — живой fd; ioctl получает указатель на локальную
+    // `#[repr(C)]`-структуру ровно того размера, который читает ядро (8 байт).
+    let rc = unsafe {
+        ioctl(
+            file.as_raw_fd(),
+            TIOCSWINSZ,
+            &ws as *const Winsize as *mut c_void,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> c_int;
