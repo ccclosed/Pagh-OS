@@ -606,6 +606,32 @@ fn a_finished_session_restarts_in_the_same_frame() {
     );
 }
 
+/// `Box<dyn FrameSource>` (как в бинаре) обязан пробрасывать close/respawn в
+/// источник: дефолт трейта отвечает `Ended`, и окно «перезапускается и сразу
+/// умирает» без ошибки ядра.
+#[test]
+fn boxed_source_forwards_close_and_respawn() {
+    let mut fb = MockFb::new(info(2, 2, 10), (0, 0, 0));
+    fb.failure = Some("ended");
+    fb.fail_after = 2;
+    let boxed: Box<dyn FrameSource> = Box::new(fb);
+    let mut frame = KernelFrame::open(boxed).expect("open");
+    let theme = Theme::default();
+    let mut canvas = Canvas::new(2, 2, theme.bg);
+    frame.draw_if_changed(&mut canvas, &theme).unwrap();
+    assert!(frame
+        .draw_if_changed(&mut canvas, &theme)
+        .unwrap_err()
+        .is_ended());
+    frame.close_source().expect("close through the box");
+    let info = frame.respawn().expect("respawn through the box");
+    assert_eq!(info.generation, 1);
+    assert_eq!(
+        frame.draw_if_changed(&mut canvas, &theme).unwrap(),
+        Draw::Drawn { generation: 1 }
+    );
+}
+
 /// Переоткрытие ввода после `ENODEV`: пишем уже в новую сессию.
 #[test]
 fn input_device_is_reopened_for_the_new_session() {

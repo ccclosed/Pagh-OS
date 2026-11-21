@@ -275,6 +275,18 @@ impl<T: FrameSource + ?Sized> FrameSource for Box<T> {
     fn with_pixels(&mut self, f: &mut dyn FnMut(&[u8])) -> Result<(), VtFbError> {
         (**self).with_pixels(f)
     }
+
+    // Проброс обязателен: без него `Box<dyn FrameSource>` (как в bin) берёт
+    // ДЕФОЛТНЫЕ `close`/`respawn` из трейта, и respawn молча отвечает `Ended`,
+    // не доходя до настоящего устройства — «окно перезапускается и сразу
+    // умирает» без единой ошибки от ядра.
+    fn close(&mut self) -> Result<(), VtFbError> {
+        (**self).close()
+    }
+
+    fn respawn(&mut self) -> Result<(), VtFbError> {
+        (**self).respawn()
+    }
 }
 
 /// `read()`-fallback поверхности: `pread` заголовка + пикселей.
