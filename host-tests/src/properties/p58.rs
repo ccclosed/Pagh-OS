@@ -125,8 +125,14 @@ proptest! {
         for user in &users {
             let display = groups_for_user(&users, &groups, &user.name).unwrap();
             let supp = supplementary_groups_for_user(&users, &groups, &user.name).unwrap();
+            // Both queries resolve the name by FIRST passwd match, so the
+            // primary gid is `display[0]`, not this entry's `gid`. The small
+            // alphabet can emit one name twice with different primary groups
+            // (uid/gid in 0..8); only the first entry is the resolved user, and
+            // comparing against the second entry's gid asserts a rule the code
+            // never promised.
             for gid in &supp {
-                prop_assert_ne!(*gid, user.gid);
+                prop_assert_ne!(*gid, display[0]);
                 prop_assert!(display.contains(gid));
             }
             // Every non-primary display gid is present exactly once.

@@ -161,6 +161,8 @@ pub struct DesktopClient {
     tx_buffer: Vec<u8>,
     /// Необязательная трассировка отправленных/принятых сообщений.
     trace: Option<Trace>,
+    /// Распознаватель двойного клика (синтез `Event::DoubleClick`, F3.1).
+    clicks: ClickTracker,
 }
 
 impl DesktopClient {
@@ -192,6 +194,7 @@ impl DesktopClient {
             pending: VecDeque::new(),
             tx_buffer: Vec::with_capacity(64 * 1024),
             trace,
+            clicks: ClickTracker::new(),
         })
     }
 
@@ -337,6 +340,8 @@ impl DesktopClient {
         self.window_id = window_id;
         self.width = size.w as u32;
         self.height = size.h as u32;
+        // Пара кликов в другом окне не должна достраиваться в этом.
+        self.clicks.reset();
         self.send(&Message::Create {
             window_id,
             width: size.w as u32,
@@ -823,9 +828,13 @@ impl DesktopClient {
                 if window_id != self.window_id && self.window_id != 0 {
                     return Ok(());
                 }
-                push_input_events(event, window_id, incoming);
+                push_input_events(event, window_id, incoming, &mut self.clicks, Instant::now());
             }
             Message::Focus { window_id, focused } => {
+                if !focused {
+                    // Клик, отданный другому окну, пару в этом не продолжает.
+                    self.clicks.reset();
+                }
                 incoming.push(Incoming::Focus { window_id, focused });
             }
             Message::Close { window_id, reason } => {
@@ -916,13 +925,83 @@ impl DesktopClient {
     }
 }
 
+/// Максимальный интервал между нажатиями двойного клика.
+pub const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Максимальное смещение между нажатиями двойного клика, пиксели.
+pub const DOUBLE_CLICK_SLOP: i32 = 4;
+
+/// Распознаватель двойного клика: цепочка из двух нажатий левой кнопки.
+///
+/// Протокол PDP/1 двойного клика не знает, поэтому клиент синтезирует
+/// [`Event::DoubleClick`] сам (F3.1). Состояние — только одно начало пары:
+///
+/// * первый press становится началом пары и доставляет `MouseDown`;
+/// * второй press в пределах [`DOUBLE_CLICK_INTERVAL`] и [`DOUBLE_CLICK_SLOP`]
+///   доставляет `DoubleClick` (позиция — текущего, второго нажатия) и
+///   **сбрасывает** пару: третий press снова одиночный, а не «тройной клик»;
+/// * слишком поздний или далёкий press — обычный `MouseDown`, и он сам
+///   становится началом новой пары (клики распознаются попарно).
+///
+/// `Motion` пару не рвёт: настоящая мышь дрожит на несколько пикселей между
+/// кликами, а смещение всё равно проверяется при press. Нажатие другой кнопки
+/// рвёт цепочку через [`ClickTracker::reset`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClickTracker {
+    /// Момент и позиция последнего press'а левой кнопки, ждущего пару.
+    anchor: Option<(Instant, Point)>,
+}
+
+impl ClickTracker {
+    /// Пустой распознаватель.
+    pub fn new() -> ClickTracker {
+        ClickTracker { anchor: None }
+    }
+
+    /// Учесть press левой кнопки в `pos` в момент `at`.
+    ///
+    /// Возвращает `true`, если press завершает двойной клик.
+    pub fn press(&mut self, pos: Point, at: Instant) -> bool {
+        let double = match self.anchor {
+            Some((start, origin)) => {
+                at.checked_duration_since(start)
+                    .is_some_and(|elapsed| elapsed <= DOUBLE_CLICK_INTERVAL)
+                    && (pos.x - origin.x).abs() <= DOUBLE_CLICK_SLOP
+                    && (pos.y - origin.y).abs() <= DOUBLE_CLICK_SLOP
+            }
+            None => false,
+        };
+        self.anchor = if double { None } else { Some((at, pos)) };
+        double
+    }
+
+    /// Забыть незавершённую пару (другая кнопка, смена окна, потеря фокуса).
+    pub fn reset(&mut self) {
+        self.anchor = None;
+    }
+}
+
 /// Перевести событие ввода PDP/1 в события приложения.
 ///
 /// Клавиши приходят evdev-кодами без текста; печатные символы восстанавливаются
 /// по US-раскладке (Shift учитывается, Caps Lock и другие раскладки — нет).
 /// На нажатие печатной клавиши без Ctrl/Alt приходит пара `Key::Char` +
 /// [`Event::Text`], чтобы поля ввода и горячие клавиши работали одинаково.
-fn push_input_events(event: InputEvent, window_id: u32, incoming: &mut Vec<Incoming>) {
+///
+/// Двойной клик распознаётся здесь же, на клиенте (F3.1): PDP/1 передаёт только
+/// отдельные `Button`, счётчика кликов в протоколе нет. Второй press **левой**
+/// кнопки не позже [`DOUBLE_CLICK_INTERVAL`] и не дальше [`DOUBLE_CLICK_SLOP`]
+/// пикселей от первого доставляется как [`Event::DoubleClick`] вместо второго
+/// `MouseDown`, поэтому приложения получают двойной клик, не зная о протоколе.
+/// [`ClickTracker`] держит цепочку нажатий; мышь дрожит между кликами, поэтому
+/// `Motion` её не рвёт — дистанцию проверяет сам press.
+fn push_input_events(
+    event: InputEvent,
+    window_id: u32,
+    incoming: &mut Vec<Incoming>,
+    clicks: &mut ClickTracker,
+    now: Instant,
+) {
     match event {
         InputEvent::Motion { x, y, .. } => incoming.push(Incoming::Event {
             window_id,
@@ -941,14 +1020,19 @@ fn push_input_events(event: InputEvent, window_id: u32, incoming: &mut Vec<Incom
                 return;
             };
             let pos = Point::new(x, y);
-            incoming.push(Incoming::Event {
-                window_id,
-                event: if pressed {
-                    Event::MouseDown { pos, button }
-                } else {
-                    Event::MouseUp { pos, button }
-                },
-            });
+            let event = if !pressed {
+                Event::MouseUp { pos, button }
+            } else if button == MouseButton::Left && clicks.press(pos, now) {
+                Event::DoubleClick { pos }
+            } else {
+                // Правая/средняя кнопка двойной клик не завершает и не
+                // продолжает: цепочку левой кнопки она рвёт.
+                if button != MouseButton::Left {
+                    clicks.reset();
+                }
+                Event::MouseDown { pos, button }
+            };
+            incoming.push(Incoming::Event { window_id, event });
         }
         InputEvent::Axis { x, y, vertical, .. } => incoming.push(Incoming::Event {
             window_id,
@@ -1436,5 +1520,321 @@ mod tests {
             "не поддерживается"
         );
         assert_eq!(close_name(close_reason::SERVER), "композитор");
+    }
+
+    // ───────────────── синтез двойного клика (F3.1) ─────────────────
+
+    /// Окно, которому адресованы события в тестах синтеза.
+    const SYNTH_WINDOW: u32 = 3;
+
+    fn left(pos: Point) -> Event {
+        Event::MouseUp {
+            pos,
+            button: MouseButton::Left,
+        }
+    }
+
+    /// Прогнать один `Button` через общий перевод ввода и вернуть доставленные
+    /// события приложения (без обёртки [`Incoming`]).
+    fn button(
+        clicks: &mut ClickTracker,
+        button: u32,
+        pos: Point,
+        pressed: bool,
+        at: Instant,
+    ) -> Vec<Event> {
+        let mut incoming = Vec::new();
+        push_input_events(
+            InputEvent::Button {
+                x: pos.x,
+                y: pos.y,
+                button,
+                pressed,
+                buttons: 0,
+            },
+            SYNTH_WINDOW,
+            &mut incoming,
+            clicks,
+            at,
+        );
+        incoming
+            .into_iter()
+            .map(|incoming| match incoming {
+                Incoming::Event { window_id, event } => {
+                    assert_eq!(window_id, SYNTH_WINDOW);
+                    event
+                }
+                other => panic!("ожидалось событие ввода, получено {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Полный клик левой кнопкой: press в `at`, release через 60 мс.
+    fn left_click(clicks: &mut ClickTracker, pos: Point, at: Instant) -> (Vec<Event>, Vec<Event>) {
+        let press = button(clicks, buttons::LEFT, pos, true, at);
+        let release = button(
+            clicks,
+            buttons::LEFT,
+            pos,
+            false,
+            at + Duration::from_millis(60),
+        );
+        (press, release)
+    }
+
+    fn mouse_down(pos: Point) -> Event {
+        Event::MouseDown {
+            pos,
+            button: MouseButton::Left,
+        }
+    }
+
+    /// Два быстрых близких press'а дают `MouseDown` + `DoubleClick` (позиция
+    /// второго нажатия), а не два `MouseDown`; внутри — обычные `MouseUp`.
+    #[test]
+    fn fast_close_presses_synthesize_double_click() {
+        let start = Instant::now();
+        let mut clicks = ClickTracker::new();
+        let first = Point::new(40, 50);
+        let second = Point::new(42, 53);
+
+        let (press, release) = left_click(&mut clicks, first, start);
+        assert_eq!(press, vec![mouse_down(first)]);
+        assert_eq!(release, vec![left(first)]);
+
+        let (press, release) = left_click(&mut clicks, second, start + Duration::from_millis(150));
+        assert_eq!(
+            press,
+            vec![Event::DoubleClick { pos: second }],
+            "второй press в пределах интервала и допуска — двойной клик"
+        );
+        assert_eq!(release, vec![left(second)]);
+    }
+
+    /// Третий быстрый press после двойного клика — одиночный: пара
+    /// сбрасывается на `DoubleClick`, поэтому «тройной клик» не копится.
+    #[test]
+    fn triple_click_is_double_then_single() {
+        let start = Instant::now();
+        let mut clicks = ClickTracker::new();
+        let pos = Point::new(7, 9);
+
+        let (first, _) = left_click(&mut clicks, pos, start);
+        let (second, _) = left_click(&mut clicks, pos, start + Duration::from_millis(100));
+        let (third, _) = left_click(&mut clicks, pos, start + Duration::from_millis(200));
+        let (fourth, _) = left_click(&mut clicks, pos, start + Duration::from_millis(300));
+
+        assert_eq!(first, vec![mouse_down(pos)]);
+        assert_eq!(second, vec![Event::DoubleClick { pos }]);
+        assert_eq!(third, vec![mouse_down(pos)], "третий press — одиночный");
+        assert_eq!(
+            fourth,
+            vec![Event::DoubleClick { pos }],
+            "четвёртый press начинает новую пару"
+        );
+    }
+
+    /// Медленный второй press (больше [`DOUBLE_CLICK_INTERVAL`]) — два
+    /// отдельных `MouseDown`, и он сам становится началом новой пары.
+    #[test]
+    fn slow_press_is_a_second_single_click() {
+        let start = Instant::now();
+        let mut clicks = ClickTracker::new();
+        let pos = Point::new(10, 10);
+
+        let (first, _) = left_click(&mut clicks, pos, start);
+        let late = start + DOUBLE_CLICK_INTERVAL + Duration::from_millis(1);
+        let (second, _) = left_click(&mut clicks, pos, late);
+
+        assert_eq!(first, vec![mouse_down(pos)]);
+        assert_eq!(second, vec![mouse_down(pos)], "401 мс — уже не двойной");
+        // Поздний press запомнен: следующий быстрый к нему — двойной клик.
+        let (third, _) = left_click(&mut clicks, pos, late + Duration::from_millis(100));
+        assert_eq!(third, vec![Event::DoubleClick { pos }]);
+    }
+
+    /// Далеко поставленный второй press (> [`DOUBLE_CLICK_SLOP`]) — не двойной
+    /// клик, даже если он быстрый.
+    #[test]
+    fn far_press_is_a_second_single_click() {
+        let start = Instant::now();
+        let mut clicks = ClickTracker::new();
+        let first = Point::new(10, 10);
+        let far = Point::new(10 + DOUBLE_CLICK_SLOP + 1, 10);
+
+        let (press, _) = left_click(&mut clicks, first, start);
+        let (second, _) = left_click(&mut clicks, far, start + Duration::from_millis(100));
+
+        assert_eq!(press, vec![mouse_down(first)]);
+        assert_eq!(second, vec![mouse_down(far)], "5 px — другой элемент");
+    }
+
+    /// Границы включительные: ровно 400 мс и ровно 4 px по каждой оси — ещё
+    /// двойной клик.
+    #[test]
+    fn thresholds_are_inclusive() {
+        let start = Instant::now();
+        let mut clicks = ClickTracker::new();
+        let first = Point::new(100, 200);
+        let edge = Point::new(first.x + DOUBLE_CLICK_SLOP, first.y - DOUBLE_CLICK_SLOP);
+
+        let (_, _) = left_click(&mut clicks, first, start);
+        let (press, _) = left_click(&mut clicks, edge, start + DOUBLE_CLICK_INTERVAL);
+        assert_eq!(press, vec![Event::DoubleClick { pos: edge }]);
+    }
+
+    /// Правая кнопка никогда не становится двойным кликом и рвёт цепочку левой.
+    #[test]
+    fn other_buttons_break_the_chain_and_are_never_double() {
+        let start = Instant::now();
+        let mut clicks = ClickTracker::new();
+        let pos = Point::new(30, 30);
+
+        let (_, _) = left_click(&mut clicks, pos, start);
+        let right = button(
+            &mut clicks,
+            buttons::RIGHT,
+            pos,
+            true,
+            start + Duration::from_millis(100),
+        );
+        assert_eq!(
+            right,
+            vec![Event::MouseDown {
+                pos,
+                button: MouseButton::Right
+            }]
+        );
+        let (after, _) = left_click(&mut clicks, pos, start + Duration::from_millis(150));
+        assert_eq!(
+            after,
+            vec![mouse_down(pos)],
+            "правая кнопка сбросила пару левой"
+        );
+
+        // Два быстрых press'а правой — два MouseDown.
+        let quick =
+            |clicks: &mut ClickTracker, at: Instant| button(clicks, buttons::RIGHT, pos, true, at);
+        assert_eq!(quick(&mut clicks, start).len(), 1);
+        assert!(matches!(
+            quick(&mut clicks, start + Duration::from_millis(50)).as_slice(),
+            [Event::MouseDown {
+                button: MouseButton::Right,
+                ..
+            }]
+        ));
+    }
+
+    /// Дрожание указателя между кликами пару не рвёт: пара проверяется по
+    /// расстоянию между press'ами, а не по отсутствию `Motion`.
+    #[test]
+    fn motion_between_presses_keeps_the_pair() {
+        let start = Instant::now();
+        let mut clicks = ClickTracker::new();
+        let pos = Point::new(50, 60);
+
+        let (_, _) = left_click(&mut clicks, pos, start);
+        let mut incoming = Vec::new();
+        push_input_events(
+            InputEvent::Motion {
+                x: pos.x + 1,
+                y: pos.y - 1,
+                dx: 1,
+                dy: -1,
+                buttons: 0,
+            },
+            SYNTH_WINDOW,
+            &mut incoming,
+            &mut clicks,
+            start + Duration::from_millis(100),
+        );
+        assert!(matches!(
+            incoming.as_slice(),
+            [Incoming::Event {
+                event: Event::MouseMove { .. },
+                ..
+            }]
+        ));
+        let (press, _) = left_click(
+            &mut clicks,
+            Point::new(pos.x + 2, pos.y - 2),
+            start + Duration::from_millis(200),
+        );
+        assert_eq!(
+            press,
+            vec![Event::DoubleClick {
+                pos: Point::new(pos.x + 2, pos.y - 2)
+            }]
+        );
+    }
+
+    /// Живой путь: два `Button` от композитора проходят через
+    /// `handle_message`/`poll` и доходят до приложения как `MouseDown` +
+    /// `DoubleClick` — синтез работает не только в чистой функции.
+    #[test]
+    fn poll_synthesizes_double_click_from_compositor_input() {
+        let path = socket_path("dblclick");
+        let listener = UnixListener::bind(&path).unwrap();
+        let presses = [Point::new(12, 34), Point::new(14, 36)];
+        serve(listener, move |stream| {
+            for (index, pos) in presses.iter().enumerate() {
+                for pressed in [true, false] {
+                    let event = InputEvent::Button {
+                        x: pos.x,
+                        y: pos.y,
+                        button: buttons::LEFT,
+                        pressed,
+                        buttons: if pressed { buttons::MASK_LEFT } else { 0 },
+                    };
+                    stream
+                        .write_all(
+                            &Message::Input {
+                                window_id: 0,
+                                event,
+                            }
+                            .encode(),
+                        )
+                        .unwrap();
+                }
+                // Оба клика — в одном залпе: заведомо быстрее 400 мс.
+                assert!(index < presses.len());
+            }
+            stream
+                .write_all(
+                    &Message::Close {
+                        window_id: 0,
+                        reason: close_reason::SERVER,
+                    }
+                    .encode(),
+                )
+                .unwrap();
+        });
+        thread::sleep(Duration::from_millis(20));
+
+        let mut client = DesktopClient::connect(&path, "pagh-ui-test").unwrap();
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            for incoming in client.poll(Duration::from_millis(50)).unwrap() {
+                if let Incoming::Event { event, .. } = incoming {
+                    events.push(event);
+                }
+            }
+            if events.len() >= 4 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                mouse_down(presses[0]),
+                left(presses[0]),
+                Event::DoubleClick { pos: presses[1] },
+                left(presses[1]),
+            ],
+            "press/release/press/release → MouseDown, MouseUp, DoubleClick, MouseUp"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -14,6 +14,10 @@ pub(crate) mod cat;
 pub(crate) mod complete;
 pub(crate) mod disk;
 pub(crate) mod editor;
+// Чистый getopt-парсер (host-свойство `getopt_args`): таблица опций команды →
+// разобранные флаги/операнды, `--`, группировка `-la`, честная ошибка на
+// неизвестную опцию.
+pub(crate) mod getopt;
 pub(crate) mod history;
 // Сессионная идентичность фазы 1 (`id`/`groups`/`su`): чистый разбор
 // `/etc/passwd` + `/etc/group` (`identity_db`, host-тестируемый) и VFS-слой
@@ -22,6 +26,10 @@ pub(crate) mod identity;
 pub(crate) mod identity_db;
 pub(crate) mod jobs;
 pub(crate) mod keys;
+// Чистый поиск программы по PATH (`lxrun <program>` и shell-fallback для голого
+// имени): список каталогов/кандидатов, host-свойство `lxpath_paths`. Проба VFS и
+// запуск — в `commands.rs`.
+pub(crate) mod lxpath;
 pub(crate) mod nano;
 pub(crate) mod nano_config;
 pub(crate) mod paint;
@@ -151,9 +159,14 @@ fn list_candidates(
 ///
 /// Строка токенизируется через `split_whitespace`: `parts[0]` — имя команды,
 /// `parts[1..]` — аргументы обработчика. Пустая строка или строка из пробелов —
-/// no-op. Неизвестная команда называет виновный токен (R7.1) и, если есть близкое
-/// совпадение, добавляет подсказку «did you mean»
-/// (R7.2).
+/// no-op.
+///
+/// Если имя не встроенное и не содержит `/`, это может быть установленная
+/// Linux-программа: диспетчер делает тот же PATH-поиск, что `lxrun`
+/// (`lxpath`/`commands::find_path_program`), и запускает найденный ELF через
+/// `commands::run_lxrun`. Имя с `/` остаётся путём. Ненайденная команда называет
+/// токен, каталоги, где искали, и — если есть близкое совпадение — подсказку
+/// «did you mean» (R7.1/R7.2).
 fn execute_command(cmd: &str) {
     // Минимальная цепочка `&&`: выполнять части последовательно, останавливаясь
     // на первом наблюдаемом сигнале сбоя (неизвестная команда). Используется
@@ -180,9 +193,31 @@ fn execute_command(cmd: &str) {
             (spec.handler)(&mut ctx, args);
         }
         None => {
-            // Неизвестная команда: назвать токен (R7.1), затем предложить
-            // ближайшую команду реестра в небольшом пороге edit-distance (R7.2).
-            render::error_line(&format!("Unknown command: '{}'", name));
+            // Не встроенная команда. Голое имя (без `/`) может быть
+            // установленной Linux-программой: shell сам делает ТОТ ЖЕ поиск по
+            // PATH, что `lxrun` (`execvp`-семантика), и запускает найденный ELF
+            // общим путём — без обязательного префикса `lxrun`. Встроенные
+            // команды сюда не доходят (реестр выше), поэтому fallback не может
+            // затереть `nano`/`id`/`df`/`ps`/`rust`.
+            if lxpath::is_bare_name(name) {
+                let dirs = lxpath::search_dirs(None);
+                if let Some(path) = commands::find_path_program(name, &dirs) {
+                    commands::run_lxrun(&path, &parts);
+                    return;
+                }
+                // Не нашли: назвать токен, сказать ГДЕ искали и не запускать
+                // ничего другого (никакого «ближайшего бинаря»).
+                render::error_line(&format!(
+                    "{}: command not found in PATH (searched: {})",
+                    name,
+                    lxpath::display_dirs(&dirs)
+                ));
+            } else {
+                // Путь — не команда: PATH-поиск к нему не применяется.
+                render::error_line(&format!("Unknown command: '{}'", name));
+            }
+            // Подсказка ближайшей встроенной команды — отдельно от диагностики
+            // поиска, чтобы опечатка в `ls` не выглядела как «нет такого файла».
             let names: Vec<&str> = registry::command_names().collect();
             if let Some(suggestion) = suggest::nearest_command(name, &names, 2) {
                 render::error_line(&format!("did you mean '{}'?", suggestion));

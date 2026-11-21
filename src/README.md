@@ -76,7 +76,8 @@ boot через Limine. Корень крейта — `lib.rs`, вся init-по
     feature-словам, чужой ext2 — по отсутствию WAL. Затем
     `vfs::mount_at_named("/mnt", root, "ext2")`; `fs_boot_demo()`; `provision::seed()`.
 13. `net::init()` + echo-сервисы на порту 7 (UDP и TCP).
-`kernel_main`: спавн `shell_thread` (PID 1), `net::net_thread`, `drivers::xhci::usb_thread` и
+`kernel_main`: спавн `shell_thread` (PID 1), `drivers::inputd::inputd_thread` (диспетчер
+физического ввода), `net::net_thread` (`netd`), `drivers::xhci::usb_thread` и
 `logfile::flush_thread`; feature-гейтнутые selftest-хуки; `enable_interrupts()`; main-поток —
 `halt_loop()`. `shell_thread` после стабилизации запускает shell (никаких вопросов на
 консоли: юзерленд ставится из shell через `apt`).
