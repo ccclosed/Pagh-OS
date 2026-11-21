@@ -49,6 +49,53 @@ fn parser_for(session: usize) -> &'static Spinlock<KeyParser> {
     &PARSERS[if session < PARSERS.len() { session } else { 0 }]
 }
 
+/// `ioctl(fd, VTINPUT_SET_FOCUS, on)` — окно сообщает ядру, что композитор
+/// отдал ему клавиатуру (или забрал).
+///
+/// Зачем это ядру: физические клавиши приходят в IRQ1/USB и по-прежнему
+/// кладутся в boot-кольцо (композитор читает их из `/dev/input/event0`
+/// независимо). Пока фокус у терминального окна, клиент возвращает те же
+/// клавиши через `/dev/vtinput{N}`, поэтому прямой путь в boot-shell обязан
+/// молчать — иначе каждая буква, набранная в терминале, попадала бы и в
+/// boot-консоль (двойное эхо/двойная история, «ввод ушёл в boot VT»).
+pub const VTINPUT_SET_FOCUS: u64 = 0x4710;
+
+/// Фокус клавиатуры по сессиям: `[0]` не используется.
+static FOCUS: [AtomicBool; crate::drivers::session_route::MAX_SESSIONS] =
+    [const { AtomicBool::new(false) }; crate::drivers::session_route::MAX_SESSIONS];
+
+/// Запомнить фокус окна (`on == false` — композитор забрал клавиатуру).
+pub fn set_focus(session: usize, on: bool) {
+    if session != crate::drivers::session_route::BOOT_SESSION && session < FOCUS.len() {
+        FOCUS[session].store(on, Ordering::Relaxed);
+    }
+}
+
+/// Есть ли сейчас сфокусированное терминальное окно с живой сессией.
+///
+/// Проверка дешёвая (атомики) и вызывается из `inputd` на каждый скан-код:
+/// фокус умершего клиента не должен навсегда «съесть» клавиатуру boot-shell,
+/// поэтому живучесть сессии проверяется здесь же. Выход сессии сбрасывает
+/// фокус явно ([`reset_session`]).
+pub fn session_focused() -> bool {
+    for (session, flag) in FOCUS.iter().enumerate().skip(1) {
+        if flag.load(Ordering::Relaxed) && crate::drivers::session::live(session) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Забыть состояние сессии (выход/переоткрытие окна): фокус и недособранная
+/// ESC-последовательность не должны переживать генерацию.
+pub fn reset_session(session: usize) {
+    if session == crate::drivers::session_route::BOOT_SESSION || session >= PARSERS.len() {
+        return;
+    }
+    parser_for(session).lock().reset();
+    FOCUS[session].store(false, Ordering::Relaxed);
+}
+
 /// PID userspace-владельца клавиатуры (последний писавший в `/dev/vtinput`).
 static CLIENT_PID: AtomicU64 = AtomicU64::new(0);
 /// Быстрый признак для IRQ1 (без локов и без `compat_exists`): физические
