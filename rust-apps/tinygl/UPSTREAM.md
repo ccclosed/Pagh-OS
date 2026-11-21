@@ -102,6 +102,48 @@ FP-reassociation при идентичной геометрии (тот же `ce
 фиксируются здесь. Другой `center`/площадь/цвет = **FAIL**, PR1 блокируется до
 решения lead'а.
 
+## 6b. Зафиксированные дайджесты PR3 (текстуры + display lists)
+
+Сцены — `tests/textures.rs`, кадр 64×64, FNV-1a 64 с offset basis эталона
+(`1469598103934665603`, как в PR1). Текстура — 8×8 RGB из четырёх квадрантов
+(красный/зелёный/синий/белый), upstream ресемплит её в 256×256 **без
+интерполяции**; режим `GL_DECAL`, wrap `REPEAT`, фильтр `NEAREST`. Кадр `n` =
+угол `n * 15°` (кадры по счёту, не по времени). `coverage` — число пикселей,
+не равных цвету очистки.
+
+| Сцена | digest | center | coverage |
+|---|---|---|---|
+| textured quad (полный экран) | `0xd42374727addc383` | `0x0000ff00` | 4096 |
+| textured cube, frame 0 | `0x72e1d21459ce58e1` | `0x0000ff00` | 1444 |
+| textured cube, frame 1 | `0x07f06296f1d4e322` | `0x0000ff00` | 1289 |
+| textured cube, frame 2 | `0x8951d89da48f33bb` | `0x0000ff00` | 1226 |
+| textured cube, frame 3 | `0xcdfaa1257a63ab64` | `0x0000ff00` | 1321 |
+| textured cube, frame 4 | `0x8edfac07e245ebbd` | `0x00ff0000` | 1352 |
+| textured cube, frame 5 | `0xe40990fcec6b8835` | `0x00ff0000` | 1288 |
+
+Ориентация: загруженная строка 0 оказывается **внизу** кадра (t=0 — низ, как в
+GL; upstream данные не переворачивает). Квадранты на экране: верх-лево синий,
+верх-право белый, низ-лево красный, низ-право зелёный — это проверяет
+`texture_quadrants_and_orientation`.
+
+**Host и musl совпали байт-в-байт** (все 53 теста зелёные на обоих):
+host `gcc 16.2.1` (`x86_64-unknown-linux-gnu`) и musl `musl-gcc 12.2.0`
+(Debian 12.2.0-14+deb12u1, контейнер `debian:bookworm-slim` + `musl-tools`,
+toolchain `nightly-2026-07-12`). Расхождения интерполяции не наблюдается,
+классифицировать нечего.
+
+Display lists отдельного «внешнего» дайджеста не имеют: `tests/display_lists.rs`
+требует **точного равенства** digest и пикселей между immediate-рендером и
+рендером через `GL_COMPILE`/`GL_COMPILE_AND_EXECUTE` (включая вложенные списки
+и список вершин, вызванный внутри `glBegin`).
+
+**Профиль тестов musl.** `[profile.release] panic = "abort"` несовместим с
+test-harness (`panic_unwind`/duplicate `panic_impl`), поэтому musl-приёмка —
+это `cargo test --target x86_64-unknown-linux-musl` (**debug**) для тестов и
+`cargo build --release` для бинаря; static-pie/`INTERP` проверяется на
+release-пробе. Для debug-сборки build-скриптам std нужен ещё и host `gcc`
+(`apt install build-essential musl-tools`), не только `musl-gcc`.
+
 ## 7. Что не патчим (осознанно)
 
 * `gl_fatal_error` (`src/error.c`) вызывает `exit(1)` — upstream-поведение,
@@ -111,3 +153,16 @@ FP-reassociation при идентичной геометрии (тот же `ce
   игнорирует `glClearDepth`.
 * `-ffast-math` и любые FP-флаги, меняющие результаты, не включаются: они
   сломали бы criterion 6.
+* текстуры — строго upstream: единственное сочетание
+  RGB/`UNSIGNED_BYTE`/level 0/border 0/components 3, ресайз в 256×256 без
+  интерполяции, фильтры `GL_TEXTURE_MIN_FILTER`/`MAG_FILTER` **не
+  сохраняются** (`glopTexParameter` их молча игнорирует — всегда NEAREST),
+  wrap всегда REPEAT, `GL_DECAL` — единственный режим. `GL_TEXTURE_2D` без
+  загруженной картинки в upstream разыменовывает `NULL` — это закрывает наш
+  слой, а не патч C.
+* `glDeleteTextures(0)` в upstream оставляет `current_texture` висячим
+  указателем (UAF) — наш слой не передаёт имя `0` в C.
+* `glDeleteLists` в 0.4.1 — пустой `inline` в `gl.h`; символа нет, `delete_list`
+  в `list.c` статический. Наш `delete_lists` — эмуляция имён (см. README).
+* `glGenLists` возвращает `0` и при успехе (диапазон с нуля), и при отказе —
+  наш слой ведёт зеркало занятости слотов и сверяет предсказание с C.
