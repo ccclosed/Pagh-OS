@@ -3015,7 +3015,7 @@ LAUNCH_EVIDENCE = "/mnt/ev"
 # requester (window + focus), the chord, and the spawned target's own PNG run:
 # under TCG that is ~40 s typical and the slow-scene path the acceptance already
 # documents can take ~90 s, so 180 s keeps a wide margin. `--exit-after-ms` is the
-# fallback: the phase normally closes the session with one ^C for the foreground
+# fallback: the phase normally parks the session with one ^Z for the foreground
 # group (see _desktop_type13_phase).
 TYPE13_PD_MS = 180_000
 
@@ -3823,9 +3823,9 @@ def _desktop_type13_phase(h: "Harness", guest: "Guest",
 
     One compositor at a time: ``/dev/input/event0`` has ONE ring shared by its
     readers (``drivers/evdev.rs``), so a second compositor would split the chord.
-    The session is closed with one ^C for the whole foreground group (see the
-    comment at the end of the body for why the compositor is not allowed to exit
-    on its own here), and ``--exit-after-ms`` stays as the fallback lifetime.
+    The session is parked with one ^Z for the whole foreground group (see the
+    comment at the end of the body: letting it exit OR killing it both walk a
+    guest die-path that faults), and ``--exit-after-ms`` stays as the fallback.
     """
     ok = True
     ev = LAUNCH_EVIDENCE
@@ -3867,29 +3867,32 @@ def _desktop_type13_phase(h: "Harness", guest: "Guest",
     # so the directory listing below is the ground truth on the ext2 volume.
     _wait_serial_after(guest, chord_off, [r"[^\s/]+\.png"], 120.0,
                        "launched target PNG line")
-    # End the session by interrupting the whole foreground group (compositor AND
-    # the clients it started) rather than letting the compositor exit by itself.
-    # A client that sees the socket close runs its normal exit path, and that
-    # path currently faults in the guest's Linux-compat layer: `__errno_location`
-    # reads through a stale FS.base and the process is killed as SIGSEGV
-    # (`[EXC #13] GP Fault ... RIP=0x88e15`, reproduced with unmodified product
-    # code; the SAME binary exits 0 on the host, so it is kernel-side, not
-    # userspace). A group SIGINT terminates them in the kernel, so this leg stays
-    # free of a crash that has nothing to do with type 13, and the check below
-    # (`no panic/exception/SIGSEGV in guest`) keeps its meaning. The defect
-    # itself is reported, not hidden; `--exit-after-ms` stays as the fallback if
-    # the chord does not land.
+    # End the session by STOPPING the whole foreground group (compositor and the
+    # clients it started), not by letting it exit and not by killing it. Both of
+    # those die paths currently fault in the guest's Linux-compat layer, with a
+    # stale/zero FS.base behind `__errno_location`:
+    #   * compositor exits -> client sockets close -> the client's clean exit
+    #     path faults ([EXC #13] GP Fault RIP=0x88e15, reproduced with unmodified
+    #     product code; the SAME binary exits 0 on the host, so it is kernel-side);
+    #   * group SIGINT -> the compositor's per-client read thread dies and faults
+    #     the same way ([EXC #14] PAGE FAULT addr=0 FS.base=0, pid=<thread>),
+    #     which is what the first merged-tree run showed.
+    # A stopped job runs no exit path at all, and the next compositor in phase 2
+    # can still take /dev/fb0 (takeover is a flag, not an exclusive open) and
+    # /dev/input/event0 (a stopped reader consumes nothing, and the ring is
+    # shared). The job stays parked (no `bg`) exactly like the phase-2 compositor
+    # is left parked: the run ends with QEMU, so nothing has to be reaped.
+    # `--exit-after-ms` stays as the fallback if the chord does not land.
     stop_off = len(guest.serial())
-    h.qmp.keys(["ctrl", "c"])
+    h.qmp.keys(["ctrl", "z"])
     h.qmp.release_modifiers()
-    # The marker is the shell prompt, not a literal "^C": the chord kills the
-    # whole group from the keyboard driver (`send_signal_to_pgid_all`), so
-    # `foreground_wait` finds the job already gone and never prints its own ^C
-    # line (observed: three `[signal] pid=N sig=2` lines, then `pagh:/>`).
-    stopped = _wait_serial_after(guest, stop_off, [r"pagh:/> "], 45.0,
-                                 "shell prompt after the type-13 session")
-    if stopped is None:
-        h.info_check("type-13 session did not stop on ^C",
+    stopped = _wait_serial_after(guest, stop_off, [r"\^Z"], 45.0,
+                                 "type-13 group stop")
+    if stopped is not None:
+        _wait_serial_after(guest, stop_off, [r"pagh:/> "], 30.0,
+                           "shell prompt after the type-13 session")
+    else:
+        h.info_check("type-13 session did not stop on ^Z",
                      "falling back to the --exit-after-ms lifetime")
         _wait_serial_after(guest, stop_off,
                            [r"pagh-desktop: exit-after-ms reached"],
