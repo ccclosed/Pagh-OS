@@ -1,0 +1,4 @@
+# Ordinary Pagh-OS desktop media: this file is /mnt/etc/autorun inside disk.img
+# (the kernel shell runs it once at boot). Real applications only — demo flags
+# (--spawn-demo / --demo-window) are test-only and must never appear here.
+lxrun /mnt/pd --backend fbdev --input evdev --launch-target files=/mnt/pagh-files|--socket|{socket} --launch-target terminal=/mnt/pagh-terminal|--vt|/dev/vtconsole0|--vt-input|/dev/vtinput|--socket|{socket} --autostart files
