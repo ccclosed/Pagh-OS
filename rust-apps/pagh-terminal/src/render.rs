@@ -225,6 +225,30 @@ impl Canvas {
         self.pixels[i + 3] = pixel[3];
     }
 
+    /// Записать пиксель RGBA без блендинга.
+    ///
+    /// Вход для блита внешней поверхности (kernel-session): цвет приходит
+    /// байтами из чужого framebuffer'а, а не из темы, поэтому `put(Rgb)` не
+    /// подходит — нужен точный контроль над всеми четырьмя байтами.  Для
+    /// mapped-поверхности (`ShmSurface`) порядок тот же, что у `put`: провод
+    /// ждёт XRGB8888 little-endian (`B,G,R,0`).
+    pub fn set_pixel_rgba(&mut self, x: usize, y: usize, rgba: [u8; 4]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        if let Some(mapping) = &mut self.mapping {
+            let i = y * self.stride + x * 4;
+            let bytes = mapping.as_mut_slice();
+            bytes[i] = rgba[2];
+            bytes[i + 1] = rgba[1];
+            bytes[i + 2] = rgba[0];
+            bytes[i + 3] = 0;
+            return;
+        }
+        let i = (y * self.width + x) * 4;
+        self.pixels[i..i + 4].copy_from_slice(&rgba);
+    }
+
     /// Alpha-blend `color` over the existing pixel.
     pub fn blend_pixel(&mut self, x: usize, y: usize, color: Rgb, alpha: u8) {
         if x >= self.width || y >= self.height || alpha == 0 {
