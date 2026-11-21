@@ -4156,6 +4156,12 @@ def _debugfs_write_text(image: pathlib.Path, guest_path: str, text: str) -> None
                          f"{(proc.stdout or '') + (proc.stderr or '')}")
 
 
+def _debugfs_rm(image: pathlib.Path, path: str) -> None:
+    """Remove a guest file from the ext2 image (missing file is fine)."""
+    subprocess.run(["debugfs", "-w", "-R", f"rm {path}", str(image)],
+                   capture_output=True, text=True)
+
+
 def _debugfs_cat(image: pathlib.Path, path: str) -> str | None:
     """Read one file straight out of the ext2 image the guest just wrote.
 
@@ -4207,6 +4213,13 @@ def mode_termwindow(h: "Harness") -> tuple[str, int]:
                f"--autostart terminal "
                f"--exit-after-ms {a.pd_lifetime_ms} --selfcheck-ms {a.selfcheck_ms}\n")
     _debugfs_write_text(disk, "/etc/autorun", autorun)
+    # A previous (possibly interrupted) run leaves nano's lock file and the saved
+    # buffers behind; nano then opens with "File ... is being edited by root ...
+    # open anyway?" and the editor never reaches its normal loop. Same names are
+    # used every run, so clear them before booting.
+    for stale in ("/.linux-nano.txt.swp", "/linux-nano.txt",
+                  "/win-nano.txt", "/win-nano.txt.bak"):
+        _debugfs_rm(disk, stale)
     log(f"autorun: {autorun.strip()}")
 
     h.boot(need_keyboard=False, disk=disk, net=not a.no_net)
@@ -4346,12 +4359,10 @@ def mode_termwindow(h: "Harness") -> tuple[str, int]:
         kb.text("QTERM-NANO-OK")
         time.sleep(1.0)
         shot("13-nano-typed")
-        h.qmp.keys(["ctrl", "s"])           # kernel nano: save
-        h.qmp.release_modifiers()
+        kb.key("ctrl-s")                    # kernel nano: save (HMP chord)
         time.sleep(a.term_settle)
         shot("14-nano-saved")
-        h.qmp.keys(["ctrl", "q"])           # kernel nano: quit
-        h.qmp.release_modifiers()
+        kb.key("ctrl-q")                    # kernel nano: quit (HMP chord)
         closed = wait_new(offset, [diag("nano", "done")], 60.0, "nano exit")
         ok &= h.check("kernel nano opened, edited, saved and returned to the shell",
                       opened is not None and closed is not None,
@@ -4361,8 +4372,24 @@ def mode_termwindow(h: "Harness") -> tuple[str, int]:
         if not a.no_distro:
             ok &= run_in_window("15-ppkg-update", "ppkg update", "ppkg",
                                 timeout=a.ppkg_timeout)
-            ok &= run_in_window("16-ppkg-install", "ppkg install nano fastfetch", "ppkg",
+            # ncurses-base carries the terminfo database nano looks up through
+            # the TERMINFO the kernel exports; without it ncurses programs abort
+            # with "Error opening terminal: xterm.".
+            ok &= run_in_window("16-ppkg-install", "ppkg install nano fastfetch ncurses-base", "ppkg",
                                 timeout=a.ppkg_timeout)
+
+            # Bare `fastfetch` first: no `lxrun` prefix, the shell resolves it in
+            # PATH. It is independent of the interactive editor below, so a slow
+            # TUI cannot starve the evidence for it.
+            ok &= run_in_window("19-fastfetch", "fastfetch", "fastfetch",
+                                timeout=180.0)
+            time.sleep(5.0)
+            shot("19b-fastfetch-settled")
+            fastfetch_out = guest.serial()[offset:]
+            ok &= h.check("bare `fastfetch` produced output (compat stdout on serial)",
+                          len(fastfetch_out.strip()) > 120,
+                          f"{len(fastfetch_out)} bytes after the command")
+            ok &= run_in_window("20-sync", "sync", "sync")
 
             # Linux nano by bare name through lxrun: Ctrl+O saves, Enter keeps the
             # name, Ctrl+X exits — the real ncurses binary, not the kernel editor.
@@ -4371,30 +4398,39 @@ def mode_termwindow(h: "Harness") -> tuple[str, int]:
             kb.text("lxrun nano /mnt/linux-nano.txt")
             kb.key("ret")
             opened = wait_new(offset, [diag("lxrun", "command")], 60.0, "lxrun nano start")
-            time.sleep(a.term_settle * 2)
+            # Sync on the kernel's own evidence that the editor reached its raw
+            # read loop: until then the tty line discipline (cooked, echoing)
+            # owns the keys, and typing early made the whole line disappear into
+            # a cooked read instead of the editor. The watchdog line is printed
+            # for a compat process parked in read(2), which is exactly nano
+            # waiting for a key.
+            editor_ready = wait_new(offset, [r"\[WATCHDOG\] pid=\d+ stuck in syscall read"],
+                                    240.0, "Linux nano read loop")
+            ok &= h.check("Linux nano reached its input loop (kernel watchdog read(2))",
+                          editor_ready is not None,
+                          editor_ready or "nano never blocked in read(2)")
+            time.sleep(3.0)
             shot("17-lxrun-nano-open")
             kb.text("QTERM-LINUX-NANO-OK")
-            time.sleep(1.5)
-            h.qmp.keys(["ctrl", "o"])
-            h.qmp.release_modifiers()
-            time.sleep(1.5)
+            time.sleep(4.0)
+            shot("17b-lxrun-nano-typed")
+            kb.key("ctrl-o")                # Linux nano: write out
+            time.sleep(4.0)
             kb.key("ret")                   # accept the offered filename
-            time.sleep(2.0)
+            time.sleep(6.0)
             shot("18-lxrun-nano-saved")
-            h.qmp.keys(["ctrl", "x"])
-            h.qmp.release_modifiers()
-            closed = wait_new(offset, [diag("lxrun", "done")], 120.0, "lxrun nano exit")
-            ok &= h.check("`lxrun nano` (real Linux nano) runs in the window and exits",
-                          opened is not None and closed is not None,
-                          regex_first(diag("lxrun", "done"), guest.serial()[offset:]) or "no lxrun round trip")
+            kb.key("ctrl-x")                # Linux nano: exit
+            closed = wait_new(offset, [diag("lxrun", "done")], 600.0, "lxrun nano exit")
+            # If nano had aborted, the text typed above would have landed on the
+            # shell prompt and been dispatched as a command of its own — that
+            # DIAG line is the negative control for "nano really held the input".
+            shell_leak = regex_first(diag("QTERM-LINUX-NANO-OK"),
+                                     guest.serial()[offset:])
+            ok &= h.check("`lxrun nano` (real Linux nano) holds the input and exits cleanly",
+                          opened is not None and closed is not None and shell_leak is None,
+                          "typed text never reached the shell prompt" if shell_leak is None
+                          else "nano exited early; the typed text became a shell command")
 
-            # Bare `fastfetch`: no `lxrun` prefix, the shell resolves it in PATH.
-            ok &= run_in_window("19-fastfetch", "fastfetch", "fastfetch",
-                                timeout=180.0)
-            fastfetch_out = guest.serial()[offset:]
-            ok &= h.check("bare `fastfetch` produced output (compat stdout on serial)",
-                          len(fastfetch_out.strip()) > 120,
-                          f"{len(fastfetch_out)} bytes after the command")
 
         # ── routing assertions on the serial log ──
         text = guest.serial()
@@ -4408,7 +4444,7 @@ def mode_termwindow(h: "Harness") -> tuple[str, int]:
                       crashes[0] if crashes else "none")
 
         # Flush the ext2 journal before reading the image from the host.
-        run_in_window("20-sync", "sync", "sync")
+        run_in_window("21-sync", "sync", "sync")
 
         # ── files written by nano are read straight from the image ──
         guest.stop()
