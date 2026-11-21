@@ -2761,8 +2761,11 @@ fn clamp_menu_origin(theme: &Theme, menu: &Menu, origin: Point, bounds: Rect) ->
 /// ФС-бэкенда в Files нет, поэтому она открывается пустой с честным
 /// «Нет сетевых ресурсов» (см. [`FilesApp::reload`]), без фальшивого листинга.
 ///
-/// Устройства — реальные точки монтирования Pagh: `/` — корень VFS, `/mnt` —
-/// смонтированный ext2 (см. `boot.rs`); пункт, которого нет в VFS, отсеивает
+/// Устройства — реальные точки монтирования Pagh, подписанные по-человечески
+/// и всегда вместе с путём, чтобы их нельзя было спутать ни с разделами
+/// Windows («Basic data partition»), ни с демо-путями: `/` — «Системный диск
+/// (/)» (корень VFS), `/mnt` — «Диск данных (/mnt)» (смонтированный ext2, см.
+/// `boot.rs`). Пункт, которого нет в VFS, отсеивает
 /// [`FilesApp::prune_missing_devices`]. Ни `/boot`, ни `/mnt/basic` в дереве
 /// ядра не существуют, поэтому их здесь нет.
 fn default_places(home: &str) -> Vec<Place> {
@@ -2832,14 +2835,14 @@ fn default_places(home: &str) -> Vec<Place> {
         },
         Place {
             id: 10,
-            label: "root".to_string(),
+            label: "Системный диск (/)".to_string(),
             glyph: FluentIcon::Drive,
             path: "/".to_string(),
             kind: PlaceKind::Device,
         },
         Place {
             id: 11,
-            label: "Basic data partition".to_string(),
+            label: "Диск данных (/mnt)".to_string(),
             glyph: FluentIcon::Drive,
             path: "/mnt".to_string(),
             kind: PlaceKind::Device,
@@ -2906,6 +2909,13 @@ mod tests {
             button: MouseButton::Left,
         });
         place.path
+    }
+
+    fn entry_index(app: &FilesApp, name: &str) -> usize {
+        app.entries()
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("нет записи {name:?}"))
     }
 
     fn temp_home(tag: &str) -> std::path::PathBuf {
@@ -3190,14 +3200,140 @@ mod tests {
         );
     }
 
-    /// Смонтированный `/mnt` показывается и открывается.
+    /// Смонтированный `/mnt` показывается подписанным по-человечески и
+    /// открывает настоящий листинг этой точки монтирования — не пустую
+    /// заглушку и не прежний каталог.
     #[test]
     fn mounted_device_opens() {
-        let mut app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
-        assert!(app.places().iter().any(|place| place.path == "/mnt"));
-        let path = click_place(&mut app, "Basic data partition");
+        let mut vfs = FakeVfs::new();
+        vfs.file_with_contents("/mnt/маркер.txt", b"disk")
+            .expect("файл на диске данных");
+        let mut app = FilesApp::new(Box::new(vfs), SIZE);
+
+        let place = app
+            .places()
+            .iter()
+            .find(|place| place.path == "/mnt")
+            .expect("устройство /mnt");
+        assert_eq!(place.kind, PlaceKind::Device);
+        assert_eq!(place.label, "Диск данных (/mnt)");
+
+        let path = click_place(&mut app, "Диск данных (/mnt)");
         assert_eq!(path, "/mnt");
         assert_eq!(app.cwd(), "/mnt");
         assert!(app.error().is_none(), "{:?}", app.error());
+        let names: Vec<&str> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(names.contains(&"маркер.txt"), "листинг /mnt: {names:?}");
+        assert!(names.contains(&"basic"), "листинг /mnt: {names:?}");
+    }
+
+    /// Двойной клик по каталогу в сетке — настоящая навигация: меняется cwd,
+    /// перечитывается содержимое, история позволяет вернуться.
+    #[test]
+    fn double_click_directory_in_grid_changes_cwd() {
+        let mut vfs = FakeVfs::new();
+        vfs.file_with_contents("/home/user/Documents/план.txt", b"ok")
+            .expect("файл в Documents");
+        let mut app = FilesApp::new(Box::new(vfs), SIZE);
+        assert_eq!(app.cwd(), "/home/user");
+
+        let index = entry_index(&app, "Documents");
+        let rect = app.item_rect(index).expect("ячейка Documents");
+        app.handle_event(&Event::DoubleClick { pos: rect.center() });
+
+        assert_eq!(app.cwd(), "/home/user/Documents");
+        assert_eq!(app.title(), "Документы — Files");
+        assert!(app.can_go_back());
+        let names: Vec<&str> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["план.txt"]);
+    }
+
+    /// Enter по выделенному каталогу навигирует: выделение ставится обычным
+    /// кликом, открытие идёт тем же `open_entries`, что и двойной клик.
+    #[test]
+    fn enter_on_selected_directory_navigates() {
+        let mut vfs = FakeVfs::new();
+        vfs.file_with_contents("/home/user/Documents/план.txt", b"ok")
+            .expect("файл в Documents");
+        let mut app = FilesApp::new(Box::new(vfs), SIZE);
+
+        let index = entry_index(&app, "Documents");
+        let rect = app.item_rect(index).expect("ячейка Documents");
+        app.handle_event(&Event::MouseDown {
+            pos: rect.center(),
+            button: MouseButton::Left,
+        });
+        assert_eq!(
+            app.selected().map(|entry| entry.name.as_str()),
+            Some("Documents")
+        );
+
+        app.handle_event(&Event::Key {
+            key: Key::Enter,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        });
+        assert_eq!(app.cwd(), "/home/user/Documents");
+        let names: Vec<&str> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["план.txt"]);
+    }
+
+    /// Корень VFS («Системный диск (/)») тоже открывает реальный листинг:
+    /// маркер, созданный в корне, виден, а записи домашнего каталога — нет.
+    #[test]
+    fn system_disk_opens_root_listing() {
+        let mut vfs = FakeVfs::new();
+        vfs.mkdir_all("/srv").expect("каталог в корне");
+        let mut app = FilesApp::new(Box::new(vfs), SIZE);
+
+        let path = click_place(&mut app, "Системный диск (/)");
+        assert_eq!(path, "/");
+        assert_eq!(app.cwd(), "/");
+        assert!(app.error().is_none(), "{:?}", app.error());
+        let names: Vec<&str> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(names.contains(&"srv"), "листинг /: {names:?}");
+        assert!(names.contains(&"mnt"), "листинг /: {names:?}");
+        assert!(!names.contains(&"Documents"), "листинг /: {names:?}");
+    }
+
+    /// Подпись устройства несёт путь монтирования, поэтому пункт нельзя
+    /// спутать ни с разделом Windows, ни с демо-каталогом.
+    #[test]
+    fn device_labels_carry_mount_paths() {
+        let app = FilesApp::new(Box::new(FakeVfs::new()), SIZE);
+        let devices: Vec<(&str, &str)> = app
+            .places()
+            .iter()
+            .filter(|place| place.kind == PlaceKind::Device)
+            .map(|place| (place.label.as_str(), place.path.as_str()))
+            .collect();
+        assert_eq!(
+            devices,
+            [("Системный диск (/)", "/"), ("Диск данных (/mnt)", "/mnt"),]
+        );
+        for (label, path) in devices {
+            assert!(
+                label.contains(&format!("({path})")),
+                "подпись {label:?} не содержит путь {path:?}"
+            );
+            assert_ne!(label, "root");
+            assert_ne!(label, "Basic data partition");
+        }
     }
 }

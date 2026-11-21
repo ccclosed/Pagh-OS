@@ -48,6 +48,25 @@ pub struct FbInfo {
     pub transp_length: u32,
 }
 
+/// Куда [`FramebufferWriter`] отправляет готовый кадр.
+///
+/// Boot/shell-консоль пишет в Limine-scanout (MMIO, `flush` копирует байты в
+/// устройство). Терминальная сессия desktop'а пишет в **свою** offscreen-копию
+/// экрана (кадры PMM, `super::offscreen`): композитор блитит её в окно, а
+/// kernel-консоль на реальном экране при этом не трогается.
+///
+/// Различие несущее: у offscreen-писателя (а) нет валидного `fb_addr`, (б) flush
+/// обязан работать при активном `/dev/fb0`-takeover (экран у композитора — это
+/// и есть штатный режим окна), (в) он не публикует свою сетку в `/dev/vtconsole0`
+/// (эта поверхность — контракт boot-консоли, а не окна).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FbTarget {
+    /// Реальный scanout: `flush` двигает пиксели в MMIO.
+    Mmio,
+    /// Offscreen-поверхность сессии (индекс `>= 1` в [`WRITERS`]).
+    Offscreen(usize),
+}
+
 /// Снимок текстовой сетки консоли для `/dev/vtconsole0` (ABI v1).
 ///
 /// `cols`/`rows` — размер *консольной* сетки (100×text_rows), а не всей
@@ -268,6 +287,8 @@ pub struct FramebufferWriter {
     /// Снимок геометрии/формата для `/dev/fb0`; `phys` — HHDM-адрес минус
     /// смещение, то есть физическая база scanout.
     info: FbInfo,
+    /// Куда уходит flush: реальный scanout или offscreen-поверхность сессии.
+    target: FbTarget,
 }
 
 impl FramebufferWriter {
@@ -335,12 +356,29 @@ impl FramebufferWriter {
             transp_length: 0,
         };
 
-        Some(FramebufferWriter {
-            fb_addr: address,
-            width: width as usize,
-            height: height as usize,
-            pitch: pitch as usize,
-            bpp: (bpp / 8) as usize,
+        Some(Self::with_info(info, FbTarget::Mmio, address))
+    }
+
+    /// Построить писателя поверх готовой геометрии.
+    ///
+    /// Одна реализация для обоих экземпляров: boot-консоль передаёт `info`
+    /// Limine-scanout и [`FbTarget::Mmio`], offscreen-сессия — геометрию того же
+    /// экрана (окно имеет размер экрана по контракту `vtfb1`) и
+    /// [`FbTarget::Offscreen`]. Расхождение только в том, куда уходит [`Self::flush`].
+    ///
+    /// `fb_addr` — уже замапленный (HHDM) адрес scanout для boot-писателя; у
+    /// offscreen-писателя его нет, и он равен нулю.
+    fn with_info(info: FbInfo, target: FbTarget, fb_addr: u64) -> Self {
+        let width = info.width as usize;
+        let height = info.height as usize;
+        let pitch = info.pitch as usize;
+        let bpp = (info.bpp / 8) as usize;
+        FramebufferWriter {
+            fb_addr,
+            width,
+            height,
+            pitch,
+            bpp,
             col: 0,
             row: 0,
             fg_color: DEFAULT_FG,
@@ -359,11 +397,17 @@ impl FramebufferWriter {
             // buffer of `width * bpp` per row would be read at the wrong stride
             // whenever the device pads its rows (which it does), and the flush would
             // copy garbage.
-            back: alloc::vec![0u8; (pitch as usize) * (height as usize)],
+            back: alloc::vec![0u8; pitch * height],
             dirty: None,
             quiet: false,
             info,
-        })
+            target,
+        }
+    }
+
+    /// Куда писатель отправляет кадр (см. [`FbTarget`]).
+    pub fn target(&self) -> FbTarget {
+        self.target
     }
 
     /// Геометрия/формат scanout для `/dev/fb0`.
@@ -398,6 +442,9 @@ impl FramebufferWriter {
     /// Вызывается после scroll/clear/repaint: инкрементально публикуются только
     /// одиночные клетки, а сдвиг строк меняет всю матрицу.
     fn publish_all(&self) {
+        if !self.owns_vt_surface() {
+            return;
+        }
         let snap = self.text_snapshot();
         crate::drivers::vtsurface::publish_shell_full(
             &snap.cells,
@@ -441,8 +488,19 @@ impl FramebufferWriter {
             self.width.saturating_sub(1),
             self.height.saturating_sub(1),
         ));
-        crate::drivers::vtsurface::publish_shell_clear(self.fg_color, self.bg_color);
-        crate::drivers::vtsurface::publish_shell_cursor(0, 0, true);
+        if self.owns_vt_surface() {
+            crate::drivers::vtsurface::publish_shell_clear(self.fg_color, self.bg_color);
+            crate::drivers::vtsurface::publish_shell_cursor(0, 0, true);
+        }
+    }
+
+    /// Публикует ли этот писатель свою сетку в `/dev/vtconsole0`.
+    ///
+    /// Только boot-консоль: `vtconsole0` — её контракт с desktop-композитором
+    /// (снимок единственной kernel-консоли). Offscreen-сессия рисует своё окно и
+    /// не имеет права перезаписывать чужую shared-поверхность.
+    fn owns_vt_surface(&self) -> bool {
+        matches!(self.target, FbTarget::Mmio)
     }
 
     /// Record `ch` at grid cell `(col, row)`; out-of-range writes are dropped.
@@ -453,13 +511,15 @@ impl FramebufferWriter {
             self.grid_fg[idx] = self.fg_color;
             // Инкрементальная публикация в /dev/vtconsole0. Пока поверхности
             // никто не открыл, `publish_shell_cell` — один atomic load.
-            crate::drivers::vtsurface::publish_shell_cell(
-                col,
-                row,
-                ch,
-                self.fg_color,
-                self.bg_color,
-            );
+            if self.owns_vt_surface() {
+                crate::drivers::vtsurface::publish_shell_cell(
+                    col,
+                    row,
+                    ch,
+                    self.fg_color,
+                    self.bg_color,
+                );
+            }
         }
     }
 
@@ -539,7 +599,9 @@ impl FramebufferWriter {
             }
             _ => {}
         }
-        crate::drivers::vtsurface::publish_shell_cursor(self.col, self.row, true);
+        if self.owns_vt_surface() {
+            crate::drivers::vtsurface::publish_shell_cursor(self.col, self.row, true);
+        }
     }
 
     /// Number of text rows the console may use, leaving room for the bottom
@@ -622,7 +684,10 @@ impl FramebufferWriter {
     /// [`Self::flush_rect`]. A bug that bypasses `put_pixel` would show as a stale
     /// rectangle, so keep new drawing primitives going through it.
     pub fn flush(&mut self) -> bool {
-        if takeover_active() {
+        // Только реальный scanout отдаётся композитору: offscreen-сессия пишет в
+        // свою RAM-поверхность, и это и есть штатный режим работы окна при
+        // захваченном экране.
+        if self.owns_vt_surface() && takeover_active() {
             // Экран у userspace-композитора: погасить накопленный dirty-box,
             // чтобы после явного `release_takeover` (selftest) не выстрелить
             // устаревшим кадром поверх чужой отрисовки.
@@ -663,31 +728,49 @@ impl FramebufferWriter {
     /// on the device (the software cursor) does not force a frame flush later.
     /// Rectangles are clipped to the surface; an empty intersection is a no-op.
     pub fn flush_rect(&mut self, x: usize, y: usize, w: usize, h: usize) {
-        if takeover_active()
-            || self.bpp < 3
-            || w == 0
-            || h == 0
-            || x >= self.width
-            || y >= self.height
-        {
+        if self.bpp < 3 || w == 0 || h == 0 || x >= self.width || y >= self.height {
             return;
         }
         let x1 = (x + w).min(self.width);
         let y1 = (y + h).min(self.height);
         let row_bytes = (x1 - x) * self.bpp;
         let src_base = y * self.pitch + x * self.bpp;
-        // SAFETY: `x1 <= width` and `y1 <= height`, so every offset stays inside
-        // the `pitch * height` shadow buffer and inside the device surface of the
-        // same geometry; the spans do not overlap (kernel RAM vs MMIO).
-        unsafe {
-            let fb = self.fb_addr as *mut u8;
-            for row in 0..(y1 - y) {
-                let offset = src_base + row * self.pitch;
-                core::ptr::copy_nonoverlapping(
-                    self.back.as_ptr().add(offset),
-                    fb.add(offset),
-                    row_bytes,
+        match self.target {
+            // Offscreen-сессия: кадры поверхности не смежны физически, поэтому
+            // прямоугольник раскладывается по страницам (`offscreen::write_rect`)
+            // и каждый flush двигает `generation` — контракт `vtfb1`.
+            FbTarget::Offscreen(session) => {
+                super::offscreen::write_rect(
+                    session,
+                    x,
+                    y,
+                    x1 - x,
+                    y1 - y,
+                    &self.back,
+                    self.pitch,
+                    self.bpp,
                 );
+            }
+            FbTarget::Mmio => {
+                // Экран у userspace-композитора: kernel-консоль не рисует поверх
+                // его кадра (см. `flush`).
+                if takeover_active() {
+                    return;
+                }
+                // SAFETY: `x1 <= width` and `y1 <= height`, so every offset stays inside
+                // the `pitch * height` shadow buffer and inside the device surface of the
+                // same geometry; the spans do not overlap (kernel RAM vs MMIO).
+                unsafe {
+                    let fb = self.fb_addr as *mut u8;
+                    for row in 0..(y1 - y) {
+                        let offset = src_base + row * self.pitch;
+                        core::ptr::copy_nonoverlapping(
+                            self.back.as_ptr().add(offset),
+                            fb.add(offset),
+                            row_bytes,
+                        );
+                    }
+                }
             }
         }
     }
@@ -911,7 +994,9 @@ impl FramebufferWriter {
         let (cols, rows) = self.text_grid();
         self.col = col.min(cols.saturating_sub(1));
         self.row = row.min(rows.saturating_sub(1));
-        crate::drivers::vtsurface::publish_shell_cursor(self.col, self.row, true);
+        if self.owns_vt_surface() {
+            crate::drivers::vtsurface::publish_shell_cursor(self.col, self.row, true);
+        }
     }
 
     /// Number of character columns on one text row, and the number of text rows
@@ -1296,6 +1381,20 @@ impl FbWriter {
         }
     }
 
+    /// Подменить содержимое писателя (сессия окна: свой offscreen-экземпляр).
+    ///
+    /// Писатель строится ДО взятия лока: `FramebufferWriter::with_info` не
+    /// логирует, но правило одно на модуль — не держать нереентерабельный
+    /// спинлок через построение и логирование.
+    pub fn replace(&self, writer: FramebufferWriter) {
+        *self.inner.lock() = Some(writer);
+    }
+
+    /// Погасить писателя (задача сессии вышла).
+    pub fn replace_none(&self) {
+        *self.inner.lock() = None;
+    }
+
     pub fn init(&self) {
         if self.inner.lock().is_some() {
             return;
@@ -1584,21 +1683,121 @@ impl crate::drivers::Console for FbWriter {
     }
 }
 
-static FB_WRITER: FbWriter = FbWriter::new();
+/// Писатели консолей: `[0]` — boot/shell-консоль на scanout, `[i >= 1]` —
+/// offscreen-поверхности терминальных сессий desktop'а.
+///
+/// Массив — потому что выбор писателя делается по **задаче** (см.
+/// [`writer_for_current`]), а не по месту вызова: `fb_print!`, `with`, `flush`,
+/// `dimensions` и `console()` одинаковы для обеих сессий, и именно это позволяет
+/// `nano`/`paint`/командам shell работать в окне без правок их кода.
+static WRITERS: [FbWriter; crate::drivers::session_route::MAX_SESSIONS] =
+    [const { FbWriter::new() }; crate::drivers::session_route::MAX_SESSIONS];
+
+/// Писатель текущей задачи.
+///
+/// Boot-сессия (`0`) — это прежнее единственное поведение: тот же статический
+/// писатель, тот же scanout. Сессия окна получает свой экземпляр.
+pub fn writer_for_current() -> &'static FbWriter {
+    writer_for(crate::drivers::session::current())
+}
+
+/// Писатель конкретной сессии (`0` — boot).
+pub fn writer_for(session: usize) -> &'static FbWriter {
+    let index = if session < WRITERS.len() { session } else { 0 };
+    &WRITERS[index]
+}
 
 pub fn init() {
-    FB_WRITER.init();
+    WRITERS[0].init();
 }
 
-/// Accessor returning the static framebuffer [`Console`](crate::drivers::Console)
-/// handle, for use by the logging facade and other consumers.
+/// Поднять offscreen-консоль сессии `session >= 1`.
+///
+/// Геометрия берётся у boot-экрана (окно имеет размер экрана по контракту
+/// `vtfb1`), пиксели — из [`super::offscreen`]. Повторный вызов пересоздаёт
+/// писателя на уже аллоцированных кадрах: переоткрытие окна после `exit`
+/// начинает с чистого кадра, но не занимает новые страницы PMM.
+///
+/// `false` — поверхность не поднялась (нет PMM/фреймбуфера); `open(/dev/vtfb1)`
+/// тогда честно вернёт `ENODEV`.
+pub fn init_session(session: usize) -> bool {
+    if session == crate::drivers::session_route::BOOT_SESSION
+        || session >= crate::drivers::session_route::MAX_SESSIONS
+    {
+        return false;
+    }
+    let Some(info) = boot_info() else {
+        return false;
+    };
+    let Some(geometry) = super::offscreen::alloc(
+        session,
+        info.width as usize,
+        info.height as usize,
+        // `FbInfo.bpp` — БИТЫ (32); геометрия поверхности считает БАЙТЫ на
+        // пиксель (3..=4), как `FramebufferWriter::bpp`. Путаница единиц здесь
+        // делала бы `geometry()` отказом и `init_session` всегда false — окно
+        // не поднималось бы вовсе.
+        (info.bpp / 8) as usize,
+    ) else {
+        return false;
+    };
+    // Поверхность обязана иметь ту же раскладку, что писатель: никакого
+    // выравнивания строки (см. `FbInfo` ниже), иначе flush и клиент разойдутся
+    // в stride.
+    let offscreen_info = FbInfo {
+        phys: 0,
+        smem_len: geometry.total_bytes as u64,
+        width: geometry.width as u32,
+        height: geometry.height as u32,
+        pitch: geometry.stride as u32,
+        bpp: 32,
+        red_offset: info.red_offset,
+        red_length: info.red_length,
+        green_offset: info.green_offset,
+        green_length: info.green_length,
+        blue_offset: info.blue_offset,
+        blue_length: info.blue_length,
+        transp_offset: 0,
+        transp_length: 0,
+    };
+    super::offscreen::clear(session);
+    writer_for(session).replace(FramebufferWriter::with_info(
+        offscreen_info,
+        FbTarget::Offscreen(session),
+        0,
+    ));
+    true
+}
+
+/// Погасить писателя сессии (задача вышла / окно закрыто).
+///
+/// Кадры поверхности при этом НЕ освобождаются: их могут держать живые
+/// mmap-отображения клиента (контракт `vtfb1` — кадры не возвращаются в PMM,
+/// пока отображены).
+pub fn reset_session(session: usize) {
+    if session == crate::drivers::session_route::BOOT_SESSION
+        || session >= crate::drivers::session_route::MAX_SESSIONS
+    {
+        return;
+    }
+    writer_for(session).replace_none();
+}
+
+/// Геометрия boot-экрана (не зависит от текущей задачи).
+pub fn boot_info() -> Option<FbInfo> {
+    WRITERS[0].with(|w| w.info())
+}
+
+/// Accessor returning the framebuffer [`Console`](crate::drivers::Console) handle
+/// of the **current task's** session, for use by the logging facade and other
+/// consumers.
 pub fn console() -> &'static FbWriter {
-    &FB_WRITER
+    writer_for_current()
 }
 
-/// Whether the framebuffer console can display anything yet.
+/// Whether the framebuffer console of the current task can display anything yet.
 pub fn is_initialized() -> bool {
-    FB_WRITER.is_ready()
+    writer_for_current().is_ready()
 }
 
 pub fn _print(args: fmt::Arguments) {
@@ -1607,7 +1806,7 @@ pub fn _print(args: fmt::Arguments) {
     // Push on every explicit print: callers of `fb_print!` are reacting to
     // something (boot progress, a command's output, a prompt) and expect it on
     // screen when the call returns, not whenever the next frame flush happens.
-    FB_WRITER.write_fmt_now(args);
+    writer_for_current().write_fmt_now(args);
     crate::drivers::cursor::text_end();
 }
 
@@ -1616,8 +1815,8 @@ pub fn clear_screen() {
     // the screen while the cursor is drawn leaves its saved pixels describing the
     // old frame, and the next `hide()` would blit that stale square back.
     crate::drivers::cursor::text_begin();
-    FB_WRITER.clear();
-    FB_WRITER.flush();
+    writer_for_current().clear();
+    writer_for_current().flush();
     crate::drivers::cursor::text_end();
 }
 
@@ -1628,19 +1827,19 @@ pub fn clear_screen() {
 /// thousands of uncached MMIO stores into a few linear row copies, and it is why
 /// callers must flush once at the end of a repaint.
 pub fn flush() {
-    FB_WRITER.flush();
+    writer_for_current().flush();
 }
 
 /// Sets the framebuffer foreground (glyph) color via the global writer.
 /// Mirrors [`clear_screen`]; serial output is unaffected (color is
 /// framebuffer-only).
 pub fn set_fg_color(color: u32) {
-    FB_WRITER.set_fg_color(color);
+    writer_for_current().set_fg_color(color);
 }
 
 /// Sets the console background colour (unlit glyph pixels and the `clear` fill).
 pub fn set_bg_color(color: u32) {
-    FB_WRITER.set_bg_color(color);
+    writer_for_current().set_bg_color(color);
 }
 
 /// Makes the console paint glyphs only, leaving the pixels behind them alone.
@@ -1648,12 +1847,12 @@ pub fn set_bg_color(color: u32) {
 /// Used by `shell::theme` when a wallpaper is active; the shell reinstates opaque
 /// painting when the wallpaper is switched back off.
 pub fn set_opaque_bg(opaque: bool) {
-    FB_WRITER.set_opaque_bg(opaque);
+    writer_for_current().set_opaque_bg(opaque);
 }
 
 /// Sets the status-bar strip colours via the global writer.
 pub fn set_status_colors(bg: u32, fg: u32) {
-    FB_WRITER.set_status_colors(bg, fg);
+    writer_for_current().set_status_colors(bg, fg);
 }
 
 /// Redraw the retained text grid into the shadow buffer and push it out.
@@ -1661,73 +1860,79 @@ pub fn set_status_colors(bg: u32, fg: u32) {
 /// Call after anything that wipes the pixels behind the text (wallpaper, theme
 /// switch, `clear`): the model is the only record of what was on screen.
 pub fn repaint_grid() {
-    FB_WRITER.repaint_grid();
-    FB_WRITER.flush();
+    writer_for_current().repaint_grid();
+    writer_for_current().flush();
 }
 
 /// Framebuffer dimensions in pixels via the global writer, `(0, 0)` if the
 /// framebuffer never initialized.
 pub fn dimensions() -> (usize, usize) {
-    FB_WRITER.dimensions()
+    writer_for_current().dimensions()
 }
 
 /// Геометрия Limine-фреймбуфера для `/dev/fb0`; `None` на serial-only boot.
 pub fn fb_info() -> Option<FbInfo> {
-    FB_WRITER.with(|w| w.info())
+    // Всегда boot-экземпляр: `/dev/fb0` — это scanout, и его геометрия не
+    // зависит от консольной сессии вызывающего (иначе open из задачи окна отдал
+    // бы offscreen-геометрию с `phys = 0`).
+    boot_info()
 }
 
 /// Снимок живой текстовой сетки для `/dev/vtconsole0`; `None` на serial-only
 /// boot (тогда поверхность живёт сеткой 80×25 и остаётся пустой).
 pub fn text_snapshot() -> Option<TextSnapshot> {
-    FB_WRITER.with(|w| w.text_snapshot())
+    // Всегда boot-экземпляр: `vtconsole0` — снимок единственной kernel-консоли.
+    // Маршрутизация по задаче была бы утечкой содержимого окна в чужую
+    // shared-поверхность.
+    WRITERS[0].with(|w| w.text_snapshot())
 }
 
 /// The console's current foreground and background colours (see
 /// [`FbWriter::colors`]).
 pub fn colors() -> (u32, u32) {
-    FB_WRITER.colors()
+    writer_for_current().colors()
 }
 
 /// The console's current text cursor cell, or `None` when serial-only.
 pub fn cursor_cell() -> Option<(usize, usize)> {
-    FB_WRITER.cursor_cell()
+    writer_for_current().cursor_cell()
 }
 
 /// Place the console's text cursor at a cell (see [`FbWriter::set_cursor_cell`]).
 pub fn set_cursor_cell(col: usize, row: usize) {
-    FB_WRITER.set_cursor_cell(col, row);
+    writer_for_current().set_cursor_cell(col, row);
 }
 
 /// Run `f` with exclusive raw access to the framebuffer. See
 /// [`FbWriter::with`]. Returns `None` if the framebuffer never initialized.
 pub fn with<R>(f: impl FnOnce(&mut FramebufferWriter) -> R) -> Option<R> {
-    FB_WRITER.with(f)
+    writer_for_current().with(f)
 }
 
 /// Repaint the bottom status bar with left/right aligned text.
 pub fn draw_status_bar(left: &str, right: &str) {
-    FB_WRITER.draw_status_bar(left, right);
+    writer_for_current().draw_status_bar(left, right);
 }
 
 /// Scroll the console view by `delta` rows (positive = older text); returns
 /// whether anything moved. The caller is responsible for flushing.
 pub fn scroll_view(delta: i32) -> bool {
-    FB_WRITER.scroll_view(delta)
+    writer_for_current().scroll_view(delta)
 }
 
 /// Return the console view to the live bottom; returns whether it moved.
 pub fn scroll_reset() -> bool {
-    FB_WRITER.scroll_reset()
+    writer_for_current().scroll_reset()
 }
 
 /// `(view offset, retained history rows)` for the status bar and diagnostics.
 pub fn scroll_state() -> (usize, usize) {
-    FB_WRITER.scroll_state()
+    writer_for_current().scroll_state()
 }
 
 /// Text of the top visible history row while scrolled (diagnostics only).
 pub fn scroll_top_text() -> Option<alloc::string::String> {
-    FB_WRITER.scroll_top_text()
+    writer_for_current().scroll_top_text()
 }
 
 #[macro_export]

@@ -1,0 +1,24 @@
+[package]
+name = "tinygl"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Thin Rust FFI over vendored TinyGL 0.4.1 (CPU-only fixed-function OpenGL 1.1 subset) for Pagh-OS"
+links = "tinygl"
+build = "build.rs"
+
+[workspace]
+
+[build-dependencies]
+# `cc` уже vendored в корне репозитория (`vendor/cc-1.2.0`); C-компилятор нужен
+# ТОЛЬКО этому крейту — системная сборка (`tools/build-rust-app.sh`) не меняется.
+cc = "1.2.0"
+
+[profile.release]
+# Как у остальных render-крейтов rust-apps/: горячий путь — C-циклы TinyGL,
+# через границу C/Rust LTO не работает; главное — `-O2` в build.rs.
+panic = "abort"
+opt-level = 3
+lto = true
+strip = true
