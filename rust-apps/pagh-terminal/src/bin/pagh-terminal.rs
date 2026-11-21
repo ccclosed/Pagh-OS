@@ -126,6 +126,8 @@ struct Args {
     vt_mouse: Option<String>,
     /// `--vt-fb` задан явно: не перебирать слоты сессий.
     vt_fb_explicit: bool,
+    /// `--window-id` задан явно: не выводить id из pid.
+    window_id_explicit: bool,
     /// Pixel surface of the kernel shell session (default `/dev/vtfb1`).
     vt_fb: String,
     /// Log every drawn kernel frame (generation evidence for live runs).
@@ -176,6 +178,7 @@ impl Default for Args {
             vt_mouse: None,
             vt_fb: KERNEL_FB.to_string(),
             vt_fb_explicit: false,
+            window_id_explicit: false,
             vt_trace: false,
             log_file: None,
             size: (900, 600),
@@ -1545,9 +1548,19 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         welcome.screen_width,
         welcome.screen_height
     );
+    // Идентификатор окна выбирает клиент, и композитор отвергает занятый.
+    // Фиксированный 101 переживал выход старого процесса (окно могло ещё
+    // существовать) и следующий запуск терминала не мог создать окно. Ядро
+    // pid'ов уникально среди живых процессов, поэтому id из pid не конфликтует;
+    // `--window-id` остаётся для тестов/скриптов, которым нужен точный id.
+    let my_window_id = if args.window_id_explicit {
+        args.window_id
+    } else {
+        1000 + (std::process::id() % 90_000)
+    };
     client
-        .create_window(args.window_id, args.size.0, args.size.1, &args.title)
-        .map_err(|e| format!("create_window: {e}"))?;
+        .create_window(my_window_id, args.size.0, args.size.1, &args.title)
+        .map_err(|error| format!("create_window: {error}"))?;
     // Ядро игнорирует SO_RCVTIMEO (см. TERMINAL.md), поэтому окно обязано
     // опрашивать сокет неблокирующе и само возвращаться к кадру поверхности.
     client
@@ -1788,7 +1801,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     window_id,
                     generation,
                 } => {
-                    if window_id == args.window_id
+                    if window_id == my_window_id
                         && shm
                             .as_ref()
                             .is_some_and(|frame| frame.generation == generation)
@@ -2183,7 +2196,10 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             "--no-window" => out.window = false,
             "--unfocused" => out.focused = false,
             "--title" => out.title = next_value(&mut args, "--title")?,
-            "--window-id" => out.window_id = parse_u32(&next_value(&mut args, "--window-id")?)?,
+            "--window-id" => {
+                out.window_id = parse_u32(&next_value(&mut args, "--window-id")?)?;
+                out.window_id_explicit = true;
+            }
             "--feed" => out.feed = Some(PathBuf::from(next_value(&mut args, "--feed")?)),
             "--screenshots" => {
                 out.screenshots = Some(PathBuf::from(next_value(&mut args, "--screenshots")?))
@@ -2292,7 +2308,8 @@ HEADLESS:
 LIVE:
   --socket PATH    AF_UNIX control socket of pagh-desktop
   --size WxH       initial window content size (default 900x600)
-  --window-id N    client-chosen window id (default 101)
+  --window-id N    client-chosen window id (default: derived from pid in
+                   kernel-session mode, 101 elsewhere)
   --feed FILE      preload terminal output into the demo shell
   --demo-shell     explicit demo-shell window (screenshots, A/B comparison)
   --pipe-shell     explicit userspace shell over two pipes (fallback/test mode;

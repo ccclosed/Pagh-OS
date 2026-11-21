@@ -840,14 +840,14 @@ fn pdp_button_mask_maps_to_the_kernels_button_bits() {
 }
 
 #[test]
-fn wheel_axis_is_translated_to_the_ps2_convention() {
-    // PDP/1 REL_WHEEL: +1 = away from the user (scroll up, older text).
-    // PS/2 IntelliMouse: away from the user is -1, and the kernel shell
-    // computes `lines = -delta` (positive = older), so the client negates.
-    assert_eq!(wheel_from_axis(1), -1);
-    assert_eq!(wheel_from_axis(-1), 1);
+fn wheel_axis_is_forwarded_unchanged() {
+    // `Axis.vertical` is the kernel's own REL_WHEEL value (its PS/2 decoder
+    // produced it); /dev/vtmouse wants exactly that. Inverting here made
+    // wheel-up scroll towards newer text.
+    assert_eq!(wheel_from_axis(1), 1);
+    assert_eq!(wheel_from_axis(-1), -1);
     assert_eq!(wheel_from_axis(0), 0);
-    assert_eq!(wheel_from_axis(3), -3);
+    assert_eq!(wheel_from_axis(3), 3);
 }
 
 #[test]
@@ -911,7 +911,7 @@ fn mouse_forwarder_sends_position_buttons_and_wheel() {
         MOUSE_BTN_LEFT
     );
     let third = &written[2 * MOUSE_EVENT_LEN..];
-    assert_eq!(i32::from_le_bytes(third[12..16].try_into().unwrap()), -2);
+    assert_eq!(i32::from_le_bytes(third[12..16].try_into().unwrap()), 2);
 }
 
 #[test]
@@ -941,4 +941,110 @@ fn help_names_the_pointer_device_and_session_scan() {
         text.contains("first free /dev/vtfbN"),
         "help must explain session auto-attach: {text}"
     );
+}
+
+/// Композитор для kernel-session: окно обязано получить id, производный от
+/// pid (фиксированный 101 мог остаться занятым окном прошлого запуска).
+fn spawn_fake_desktop_kernel_id(socket: &Path) -> std::thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        match protocol::read_message(&mut stream).unwrap() {
+            Message::Hello { .. } => {}
+            other => panic!("expected hello, got {other:?}"),
+        }
+        stream
+            .write_all(
+                &Message::Welcome {
+                    version: 1,
+                    client_id: 9,
+                    width: 1280,
+                    height: 720,
+                    flags: welcome_flags::FORMAT_XRGB8888,
+                }
+                .encode(),
+            )
+            .unwrap();
+        let window_id = match protocol::read_message(&mut stream).unwrap() {
+            Message::Create { window_id, .. } => {
+                assert_ne!(window_id, 101, "kernel mode must not use the fixed demo id");
+                assert!(
+                    (1000..=91_000).contains(&window_id),
+                    "id derives from pid: {window_id}"
+                );
+                window_id
+            }
+            other => panic!("expected create, got {other:?}"),
+        };
+        for message in [
+            Message::Focus {
+                window_id,
+                focused: true,
+            },
+            Message::Configure {
+                window_id,
+                x: 0,
+                y: 0,
+                width: 320,
+                height: 200,
+                flags: configure_flags::FOCUSED,
+            },
+        ] {
+            stream.write_all(&message.encode()).unwrap();
+        }
+        // Дать клиенту отправить хотя бы один кадр, затем закрыть окно.
+        match protocol::read_message(&mut stream).unwrap() {
+            Message::Commit { .. } | Message::ShmOffer { .. } => {}
+            other => panic!("expected a frame, got {other:?}"),
+        }
+        stream
+            .write_all(
+                &Message::Close {
+                    window_id,
+                    reason: protocol::close_reason::SERVER,
+                }
+                .encode(),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    })
+}
+
+#[test]
+fn kernel_mode_uses_a_pid_derived_window_id() {
+    let dir = temp_dir("dupid");
+    let socket = dir.join("desktop.sock");
+    let surface = dir.join("vtfb1");
+    let info = info(8, 6, 1);
+    std::fs::write(
+        &surface,
+        encode_snapshot(info, &solid_pixels(&info, (0x20, 0x30, 0x40))),
+    )
+    .unwrap();
+    let input = dir.join("vtinput1");
+    std::fs::write(&input, b"").unwrap();
+    let server = spawn_fake_desktop_kernel_id(&socket);
+    let out = Command::new(binary())
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["--size", "320x200"])
+        .arg("--vt-fb")
+        .arg(&surface)
+        .arg("--vt-input")
+        .arg(&input)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the client must exit cleanly on Close: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
