@@ -1,0 +1,46 @@
+[package]
+name = "pagh-gl-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "CPU TinyGL demo for Pagh-OS: triangle/cube/gears rendered straight into a PDP/1 ShmSurface"
+
+# Отдельный workspace: корневой workspace собирает bare-metal ядро под
+# кастомный target и с -Zbuild-std (см. корневой .cargo/config.toml), а
+# пользовательские приложения собираются под хост (тесты) и статический musl.
+[workspace]
+
+[lib]
+name = "pagh_gl_demo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pagh-gl-demo"
+path = "src/main.rs"
+
+[dependencies]
+# Безопасная обёртка над vendored upstream TinyGL 0.4.1 (MIT) + C-растеризатор.
+tinygl = { path = "../tinygl" }
+# Клиентская половина PDP/1: ShmSurface (memfd/mmap/SCM_RIGHTS), протокол,
+# damage. Композитор не трогаем — только публичный протокол.
+pagh-ui = { path = "../pagh-ui" }
+
+[dev-dependencies]
+# Только для e2e: поднимаем реальный headless-композитор host-сборкой и
+# подключаем к нему собранный бинарник демо по настоящему AF_UNIX-сокету.
+pagh-desktop = { path = "../pagh-desktop" }
+
+# Как у остальных render-крейтов rust-apps/: горячий путь — C-циклы TinyGL,
+# через границу C/Rust LTO не работает; главное — `-O2` в build.rs tinygl.
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+strip = true
+
+[profile.release.package.tinygl]
+opt-level = 3
+
+[profile.release.package.pagh-ui]
+opt-level = 3

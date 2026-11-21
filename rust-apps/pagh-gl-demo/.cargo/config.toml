@@ -1,0 +1,11 @@
+# Демо — обычное host/musl std-приложение, а не часть bare-metal ядра.
+# Корневой `.cargo/config.toml` задаёт target x86_64-unknown-none.json и
+# -Zbuild-std; cargo обходит дерево вверх и складывает массивы build-std,
+# поэтому здесь (как в `rust-apps/pagh-ui/.cargo/config.toml`) переопределяем
+# target и дополняем набор до полного std, чтобы std и core собирались из
+# одного исходника. Для другой архитектуры хоста: cargo test --target <triple>.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[unstable]
+build-std = ["std", "panic_abort"]

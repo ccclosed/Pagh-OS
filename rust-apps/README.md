@@ -52,8 +52,9 @@ the real Files binary over an `AF_UNIX` socket. See `pagh-ui/README.md`,
 `rust-apps/tinygl` vendors upstream **TinyGL 0.4.1** (MIT, Fabrice Bellard) and
 wraps it in a thin Rust FFI layer. It renders **on the CPU only** into a dense
 `0x00RRGGBB` (`XRGB8888`) buffer — the compositor's pixel format — so a client
-can draw straight into its memfd and commit damage. This is PR1 (build-probe):
-upstream C 0.4.1 + `build.rs` for this crate only, no system build changes.
+can draw straight into its memfd and commit damage. PR1–PR3 built the
+vendored C + safe FFI (matrices, immediate mode, depth/culling, textures,
+display lists); PR5 adds fixed-function lighting and the demo client below.
 
 Honest limits: fixed-function GL 1.1 subset, no shaders/GLSL/GL 2.0+, no
 FBO/VBO/`glDrawArrays`, 16-bit Z, `stride == width*4`, `width % 4 == 0`,
@@ -72,3 +73,26 @@ The musl build needs a C compiler for `x86_64-unknown-linux-musl`
 it and prints the install instructions if missing. The ELF is static-pie
 (`INTERP` gate: `tinygl-probe --check-interp` plus the existing
 `tools/build-rust-app.sh` check).
+
+
+## CPU TinyGL demo: `pagh-gl-demo`
+
+`rust-apps/pagh-gl-demo` is the PDP/1 client that renders the three CPU scenes
+(`triangle`, `cube`, `gears`) **straight into the window's
+`mmap(MAP_SHARED)` memfd** through `tinygl`; only `COMMIT` + `DAMAGE` travel
+over the socket (PDP/1 `ShmSurface`, no frame copy). Frames are indexed, not
+timed: frame `n` has a fixed angle, so FNV-1a pixel digests are reproducible on
+the host, in QEMU and on musl. Without `--connect` it runs headless into
+`Vec<u32>` and prints `TINYGL <scene> frame=<n> digest=0x…`; with `--connect
+/tmp/pagh-desktop.sock` it opens a live window.
+
+```bash
+cd rust-apps/pagh-gl-demo && cargo test
+cargo run --bin pagh-gl-demo -- gears --hash
+tools/build-rust-app.sh rust-apps/pagh-gl-demo   # static-pie musl
+```
+
+Honest limits (also in its README): CPU only, fixed-function GL 1.1 subset,
+16-bit Z, `stride == width*4`, `width % 4 == 0`, one GL context per process,
+and no full-frame fallback — a compositor without `ShmSurface` makes the demo
+fail with an explicit error.
