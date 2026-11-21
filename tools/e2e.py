@@ -150,6 +150,10 @@ MODE_DEFAULTS = {
     # real getgroups/setgroups/access/open decisions from ring 3 as root and as
     # uid 1000 (both with and without supplementary groups).
     "groups": {"timeout": 300.0, "serial": "serial_groups.log"},
+    # Stage-4 terminal window: UX (history/editing/wheel/selection/nano) and
+    # lifecycle (exit/restart, 20 close+reopen cycles, two-window isolation).
+    # Generous: every cycle boots a kernel shell session and runs one command.
+    "termux": {"timeout": 2400.0, "serial": "serial_termux.log"},
 }
 
 # Features a mode cannot work without; `--features` only ADDS to this list.
@@ -3200,6 +3204,409 @@ def mode_desktop(h: "Harness") -> tuple[str, int]:
         kb.close()
 
 
+# ── terminal UX/lifecycle live acceptance (stage 4) ──────────────────────────
+
+
+def _termux_ppm(kb: "QemuShotKeyboard", path: pathlib.Path) -> tuple[int, int, bytes]:
+    """Framebuffer dump as raw RGB (PPM), for pointer calibration/diffing."""
+    if path.exists():
+        path.unlink()
+    kb._guard("screendump ppm", kb.mon.command, f"screendump {path}")
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        if path.exists() and path.stat().st_size > 0:
+            time.sleep(0.25)  # QEMU finishes flushing the file
+            return ppm_rgb(path)
+        time.sleep(0.1)
+    raise HarnessError(f"termux: screendump produced no {path}")
+
+
+class TermuxPointer:
+    """Tracked relative pointer over the compositor's absolute pointer.
+
+    QEMU's monitor has no absolute pointing device for PS/2, so the acceptance
+    must move the pointer by deltas. The compositor starts its pointer at the
+    screen centre; `calibrate` confirms the QEMU-unit -> pixel factor by moving
+    once and locating the cursor in two framebuffer dumps, so every later click
+    is aimed, not guessed.
+    """
+
+    def __init__(self, h: "Harness", kb: "QemuShotKeyboard", w: int, hgt: int) -> None:
+        self.h = h
+        self.kb = kb
+        self.w = w
+        self.hgt = hgt
+        self.x = w // 2
+        self.y = hgt // 2
+        self.scale_x = 1.0
+        self.scale_y = 1.0
+
+    def _rel(self, dx: float, dy: float) -> None:
+        if not dx and not dy:
+            return
+        self.h.qmp.rel(int(round(dx)), int(round(dy)))
+        time.sleep(0.12)
+
+    def calibrate(self) -> tuple[float, float]:
+        a = _termux_ppm(self.kb, CACHE / "termux_ptr_a.ppm")
+        self._rel(60, 40)
+        b = _termux_ppm(self.kb, CACHE / "termux_ptr_b.ppm")
+        w, hgt, ra = a
+        _, _, rb = b
+        ox, oy = w // 2, hgt // 2
+        changed = []
+        for y in range(0, max(1, hgt - 60), 2):
+            row = y * w * 3
+            for x in range(0, w, 2):
+                off = row + x * 3
+                if ra[off:off + 3] != rb[off:off + 3]:
+                    changed.append((x, y))
+        far = [(x, y) for (x, y) in changed if abs(x - ox) + abs(y - oy) > 24]
+        if not far:
+            raise HarnessError("termux: pointer calibration found no cursor in the dump")
+        nx = sum(x for x, _ in far) / len(far)
+        ny = sum(y for _, y in far) / len(far)
+        self.scale_x = max(0.25, min(4.0, (nx - ox) / 60.0))
+        self.scale_y = max(0.25, min(4.0, (ny - oy) / 40.0))
+        self.x, self.y = int(round(nx)), int(round(ny))
+        return self.scale_x, self.scale_y
+
+    def move_to(self, x: int, y: int) -> None:
+        x = max(0, min(self.w - 1, int(x)))
+        y = max(0, min(self.hgt - 1, int(y)))
+        self._rel((x - self.x) / self.scale_x, (y - self.y) / self.scale_y)
+        self.x, self.y = x, y
+
+    def click(self, x: int, y: int) -> None:
+        self.move_to(x, y)
+        self.h.qmp.button("left", True)
+        time.sleep(0.1)
+        self.h.qmp.button("left", False)
+        time.sleep(0.25)
+
+    def drag(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        self.move_to(x0, y0)
+        self.h.qmp.button("left", True)
+        time.sleep(0.12)
+        # Several intermediate moves: the kernel selection follows every record.
+        steps = 6
+        for step in range(1, steps + 1):
+            self.move_to(x0 + (x1 - x0) * step // steps, y0 + (y1 - y0) * step // steps)
+        time.sleep(0.1)
+        self.h.qmp.button("left", False)
+        time.sleep(0.25)
+
+    def wheel(self, notches: int) -> None:
+        self.h.qmp.wheel(notches)
+        time.sleep(0.3)
+
+
+def _termux_line(kb: "QemuShotKeyboard", qmp: "QmpClient", line: str,
+                 settle: float = 0.9) -> None:
+    """Type one shell line and press Enter (HMP text + QMP for shifted braces)."""
+    _desktop_type(kb, qmp, line)
+    kb.key("ret")
+    time.sleep(settle)
+
+
+def _termux_shot(kb: "QemuShotKeyboard", path: pathlib.Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kb.screenshot(path)
+
+
+def _termux_debugfs_cat(image: pathlib.Path, name: str) -> str:
+    proc = subprocess.run(["debugfs", "-R", f"cat /{name}", str(image)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
+
+
+def _first_line(text: str, needle: str) -> str:
+    for line in text.splitlines():
+        if needle in line:
+            return line.strip()[:160]
+    return "not found"
+
+
+TERMUX_CLOSE_CYCLES = 20
+
+
+def mode_termux(h: "Harness") -> tuple[str, int]:
+    """Stage-4 acceptance of the terminal window: UX + lifecycle, live.
+
+    Runs the real compositor and the real pagh-terminal on a prepared disk and
+    drives the window through QEMU's PS/2 keyboard/pointer. Every interaction
+    ends with a command that writes a marker file on the ext2 data disk, so the
+    verdict is read from the disk afterwards instead of from "the screen looked
+    right": history recall, Home/End/backspace editing, mouse selection +
+    Ctrl+Y paste, nano (alternate screen), exit -> notice -> Enter restart, 20
+    close/reopen cycles and two-window input isolation all leave files or log
+    lines. Screenshots are evidence; the serial must stay free of the typed
+    text (that is the boot-VT isolation check).
+    """
+    a = h.a
+    bins = _desktop_bins(a.skip_build)
+    disk = CACHE / "e2e_termux_disk.img"
+    if not (a.reuse_desktop_disk and _desktop_disk_ready(disk, bins)):
+        _desktop_prepare_disk(h, disk, bins)
+    else:
+        log(f"termux: reusing {rel(disk)}")
+
+    ev = CACHE / "termux_evidence"
+    ev.mkdir(parents=True, exist_ok=True)
+    h.boot(need_keyboard=False, disk=disk, net=False)
+    assert h.guest is not None
+    _require_boot_serial(h, "termux boot", a.serial_start_timeout)
+    guest = h.guest
+    kb = QemuShotKeyboard(h.monitor, 0.1)
+    try:
+        kb.connect(timeout=min(a.boot_timeout, 180.0))
+        if not wait_for_shell(guest, kb, a, a.boot_timeout):
+            raise HarnessError(f"termux: shell never appeared; serial tail:\n"
+                               f"{tail(guest.serial())}")
+        h.qmp = QmpClient(h.qmp_path)
+        h.qmp.connect()
+        _termux_shot(kb, ev / "00-boot-shell.png")
+
+        pd_cmd = (
+            f"rust /mnt/pd --backend fbdev --input evdev --quiet --full-render "
+            f"--launch-target terminal=/mnt/pagh-terminal|--socket|{{socket}}"
+            f"|--log-file|/mnt/term.log --exit-after-ms 3600000 --selfcheck-ms 500"
+        )
+        log(f"type: {pd_cmd}")
+        _desktop_type(kb, h.qmp, pd_cmd)
+        kb.key("ret")
+        boot_off = len(guest.serial())
+        if wait_for(guest, [r"pagh-desktop: fbdev selfcheck (PASS|FAIL)"], 120.0,
+                    label="compositor selfcheck") is None:
+            raise HarnessError("termux: compositor never reached its fbdev selfcheck")
+        text = guest.serial()[boot_off:]
+        h.check("compositor selfcheck PASS", "fbdev selfcheck PASS" in text,
+                regex_first(r"pagh-desktop: fbdev selfcheck [^\r\n]*", text) or "")
+
+        # Background the compositor: with a foreground compat process the kernel
+        # routes /dev/vtinput writes to that process's stdin instead of the
+        # session ring (documented boundary), so the window's input only works
+        # once the shell owns the console again.
+        _termux_shot(kb, ev / "01-desktop-foreground.png")
+        h.qmp.keys(["ctrl", "z"])
+        h.qmp.release_modifiers()
+        parked = wait_for(guest, [r"\^Z"], 20.0, label="Ctrl+Z")
+        h.check("compositor stops on Ctrl+Z", bool(parked), parked or "no ^Z marker")
+        _desktop_restart_shell_line(kb)
+        kb.text("bg")
+        kb.key("ret")
+        bg = wait_for(guest, [r"bg: \[\d+\]"], 20.0, label="bg")
+        h.check("compositor resumes in the background", bool(bg), bg or "no bg marker")
+        time.sleep(1.0)
+        _termux_shot(kb, ev / "02-desktop-background.png")
+
+        # Screen geometry and pointer calibration before any window exists: the
+        # terminal's blinking cursor would otherwise pollute the diff.
+        w, hgt, _ = _termux_ppm(kb, CACHE / "termux_screen.ppm")
+        pointer = TermuxPointer(h, kb, w, hgt)
+        sx, sy = pointer.calibrate()
+        log(f"termux: screen {w}x{hgt}, pointer scale {sx:.2f}/{sy:.2f}")
+        h.check("pointer calibration is sane", 0.5 <= sx <= 2.0 and 0.5 <= sy <= 2.0,
+                f"scale {sx:.2f}/{sy:.2f}")
+
+        def open_terminal(tag: str, wait: float = 7.0) -> None:
+            h.qmp.keys(["ctrl", "alt", "t"])
+            h.qmp.release_modifiers()
+            time.sleep(wait)
+            pointer.move_to(5, 5)
+            _termux_shot(kb, ev / f"{tag}.png")
+
+        def focus_window(index: int) -> None:
+            # Title bars do not overlap even when the cascaded frames do: the
+            # second window starts 36 px lower, so window 1 is focused by a click
+            # on its own title bar (y < second window's top).
+            if index == 1:
+                pointer.click(500, 80)
+            else:
+                pointer.click(700, 116)
+            time.sleep(0.3)
+
+        def close_window(index: int) -> None:
+            if index == 1:
+                pointer.click(978, 80)
+            else:
+                pointer.click(1020, 116)
+            time.sleep(1.6)
+
+        # Window 1: history, editing, scrollback, selection, nano, exit/restart.
+        open_terminal("03-terminal-open")
+        _termux_shot(kb, ev / "04-terminal-banner.png")
+        focus_window(1)
+        _termux_line(kb, h.qmp, "echo history-1 > /mnt/q1")
+        kb.key("up")
+        time.sleep(0.3)
+        _termux_shot(kb, ev / "05-history-recalled.png")
+        kb.key("ret")
+        time.sleep(0.8)
+        _termux_shot(kb, ev / "06-history-rerun.png")
+
+        # Home + right/insert + End + backspace: the resulting file NAME proves
+        # Home/End (caret moved to start and back to the end) and its content
+        # proves the insert position.
+        _desktop_type(kb, h.qmp, "echo AB > /mnt/q2")
+        kb.key("home")
+        for _ in range(5):
+            kb.key("right")
+        _desktop_type(kb, h.qmp, "CD")
+        kb.key("end")
+        kb.key("backspace")
+        _desktop_type(kb, h.qmp, "2Z")
+        _termux_shot(kb, ev / "07-editing-line.png")
+        kb.key("ret")
+        time.sleep(0.8)
+
+        # Scrollback: a screenful of `help`, wheel up, then back to the live view.
+        _termux_line(kb, h.qmp, "help", settle=2.0)
+        _termux_shot(kb, ev / "08-help-screenful.png")
+        pointer.move_to(w // 2, hgt // 2 - 100)
+        pointer.wheel(4)
+        _termux_shot(kb, ev / "09-scrollback-wheel-up.png")
+        pointer.wheel(-4)
+        _termux_shot(kb, ev / "10-scrollback-wheel-down.png")
+
+        # Selection + Ctrl+Y paste: clear the screen, run an APPENDING command
+        # (so a successful paste is visible as the second line of /mnt/q4), then
+        # drag over the command line on row 0 and paste it.
+        _termux_line(kb, h.qmp, "clear", settle=1.0)
+        _termux_shot(kb, ev / "11-cleared-screen.png")
+        _termux_line(kb, h.qmp, "echo SEL >> /mnt/q4")
+        pointer.move_to(5, 5)
+        _termux_shot(kb, ev / "12-before-selection.png")
+        row0_y = 95 + 19 + 9  # content origin + letterbox + half an 18 px cell
+        pointer.drag(110, row0_y, 430, row0_y)
+        _termux_shot(kb, ev / "13-selection.png")
+        h.qmp.keys(["ctrl", "y"])
+        h.qmp.release_modifiers()
+        time.sleep(0.3)
+        _termux_shot(kb, ev / "14-paste-ctrl-y.png")
+        kb.key("ret")
+        time.sleep(0.9)
+        _termux_shot(kb, ev / "15-paste-executed.png")
+
+        # nano: full-screen (kernel) editor, cursor keys + typing, Esc back.
+        _termux_line(kb, h.qmp, "nano", settle=2.0)
+        _termux_shot(kb, ev / "16-nano.png")
+        for name in ("down", "down", "right", "right"):
+            kb.key(name)
+        _desktop_type(kb, h.qmp, "XYZ")
+        _termux_shot(kb, ev / "17-nano-cursor-keys.png")
+        kb.key("esc")
+        time.sleep(1.0)
+        _termux_shot(kb, ev / "18-nano-exit.png")
+        _termux_line(kb, h.qmp, "echo after-nano > /mnt/q6")
+
+        # exit -> ENODEV notice -> Enter restarts the session in the same window.
+        _termux_line(kb, h.qmp, "exit", settle=1.5)
+        _termux_shot(kb, ev / "19-session-ended-notice.png")
+        kb.key("ret")
+        time.sleep(2.5)
+        _termux_shot(kb, ev / "20-session-restarted.png")
+        _termux_line(kb, h.qmp, "echo after-restart > /mnt/q7")
+
+        # Close/reopen x20: every reopen must run a command, so /mnt/r ends with
+        # 20 lines. A crash (#PF/panic) or a failed respawn loses a line.
+        for cycle in range(1, TERMUX_CLOSE_CYCLES + 1):
+            close_window(1)
+            if cycle % 5 == 0:
+                _termux_shot(kb, ev / f"21-closed-{cycle:02d}.png")
+            open_terminal(f"22-reopened-{cycle:02d}", wait=6.0)
+            _termux_line(kb, h.qmp, f"echo C{cycle}>>/mnt/r", settle=1.2)
+        _termux_shot(kb, ev / "23-after-20-reopens.png")
+
+        # Two windows: each must get its own session; typing in one must not
+        # reach the other nor the boot shell (serial check below).
+        h.qmp.keys(["ctrl", "alt", "t"])
+        h.qmp.release_modifiers()
+        time.sleep(7.0)
+        focus_window(2)
+        _termux_line(kb, h.qmp, "echo two > /mnt/q9two")
+        _termux_shot(kb, ev / "24-two-windows-window2.png")
+        focus_window(1)
+        # After the raise, window 1's content is on top at its own frame.
+        pointer.click(400, 300)
+        time.sleep(0.3)
+        _termux_line(kb, h.qmp, "echo one > /mnt/q9one")
+        _termux_shot(kb, ev / "25-two-windows-window1.png")
+
+        # Give the shell/desktop a moment to flush, then stop the guest and read
+        # the disk: the verdict is the marker files, not a screenshot.
+        time.sleep(1.0)
+        _termux_shot(kb, ev / "26-final-desktop.png")
+        serial = guest.serial()
+        (ev / "serial.log").write_text(serial)
+        guest.stop()
+        h.guest = None
+
+        def cat(name: str) -> str:
+            return _termux_debugfs_cat(disk, name)
+
+        files = {
+            "q1": cat("q1"),
+            "q2Z": cat("q2Z"),
+            "q4": cat("q4"),
+            "q6": cat("q6"),
+            "q7": cat("q7"),
+            "q9one": cat("q9one"),
+            "q9two": cat("q9two"),
+            "r": cat("r"),
+            "term.log": cat("term.log"),
+        }
+        for name, body in files.items():
+            (ev / f"disk-{name.replace('.', '_')}.txt").write_text(body)
+        (ev / "markers.json").write_text(json.dumps(files, indent=2))
+
+        ok = True
+        ok &= h.check("history: recalled command re-executed",
+                      "history-1" in files["q1"], files["q1"].strip())
+        ok &= h.check("editing: Home/End/backspace shaped the command",
+                      "CDAB" in files["q2Z"], files["q2Z"].strip() or "q2Z missing")
+        ok &= h.check("selection + Ctrl+Y pasted the command again",
+                      files["q4"].count("SEL") >= 2, files["q4"].strip())
+        ok &= h.check("nano exited and the shell continued",
+                      files["q6"].strip() == "after-nano", files["q6"].strip())
+        ok &= h.check("exit -> notice -> Enter restarted the session",
+                      files["q7"].strip() == "after-restart", files["q7"].strip())
+        cycles = [line for line in files["r"].splitlines() if line.startswith("C")]
+        ok &= h.check(f"{TERMUX_CLOSE_CYCLES} close/reopen cycles each ran a command",
+                      len(cycles) == TERMUX_CLOSE_CYCLES,
+                      f"{len(cycles)} of {TERMUX_CLOSE_CYCLES}: {cycles[:3]}…{cycles[-2:]}")
+        ok &= h.check("two windows are two independent sessions",
+                      files["q9one"].strip() == "one" and files["q9two"].strip() == "two",
+                      f"one={files['q9one'].strip()!r} two={files['q9two'].strip()!r}")
+        log_text = files["term.log"]
+        ok &= h.check("first window attached to slot 1", "in slot 1" in log_text,
+                      _first_line(log_text, "in slot"))
+        ok &= h.check("second window attached to slot 2", "in slot 2" in log_text,
+                      _first_line(log_text, "in slot 2"))
+        ok &= h.check("session restart visible in the client log",
+                      "kernel session reopened" in log_text, _first_line(log_text, "reopened"))
+        ok &= h.check("windows were closed by the server (no self-kill)",
+                      "server closed the window" in log_text,
+                      _first_line(log_text, "server closed"))
+
+        # Isolation from the boot VT: the typed text must never appear on serial.
+        leaks = [needle for needle in
+                 ("history-1", "q2Z", "SEL >>", "XYZ", "after-restart", "q9one", "q9two",
+                  "C20>>/mnt/r")
+                 if needle in serial]
+        ok &= h.check("window input never leaked into the boot VT (serial)",
+                      not leaks, f"leaked: {leaks}" if leaks else "serial is clean")
+
+        crashes = [line for line in serial.splitlines()
+                   if re.search(r"EXC #|PAGE FAULT|PANIC|panic|kernel bug", line)]
+        ok &= h.check("no #PF / panic across 20 close/reopen cycles and restarts",
+                      not crashes, crashes[0] if crashes else "none")
+        return ("PASS" if ok else "FAIL"), (EXIT_PASS if ok else EXIT_FAIL)
+    finally:
+        kb.close()
+
 # ── phase 1 groups: real getgroups/setgroups/VFS decisions from ring 3 ───────
 
 
@@ -4185,6 +4592,7 @@ MODES = {
     "rndis": mode_rndis,
     "scroll": mode_scroll,
     "desktop": mode_desktop,
+    "termux": mode_termux,
     "groups": mode_groups,
     "netperms": mode_netperms,
     "smoke": mode_smoke,
@@ -4376,6 +4784,17 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--selfcheck-ms", type=int, default=3_000,
                     help="delay of the in-guest fbdev selfcheck (default 3000)")
 
+    tx = sub.add_parser(
+        "termux", parents=[common],
+        help="Stage-4 terminal window acceptance: history/editing/scrollback/"
+             "selection/nano + exit/restart + 20 close/reopen cycles + two-window "
+             "input isolation, driven over QEMU PS/2 and verified by marker files "
+             "written to the ext2 data disk")
+    tx.add_argument("--skip-build", action="store_true",
+                    help="use existing static pagh-desktop/pagh-terminal binaries")
+    tx.add_argument("--reuse-desktop-disk", action="store_true",
+                    help="reuse .cache/e2e_termux_disk.img (already formatted/injected)")
+
     sub.add_parser("usb", parents=[common],
                    help="USB-input acceptance: boot the staged image with an "
                         "emulated xHCI controller + USB keyboard + USB mouse, drive "
@@ -4437,6 +4856,13 @@ def main(argv: list[str] | None = None) -> int:
               "--reuse-desktop-disk to iterate on an already prepared image.",
               file=sys.stderr, flush=True)
         print("\nE2E RESULT: REFUSED (desktop mode owns its disk) (exit 2)", flush=True)
+        return EXIT_SETUP
+    if mode == "termux" and args.disk:
+        print("[e2e] termux: --disk is not supported: the mode prepares its own "
+              "pagh-owned ext2 disk (.cache/e2e_termux_disk.img) because the marker "
+              "files are read back from it; pass --reuse-desktop-disk to iterate.",
+              file=sys.stderr, flush=True)
+        print("\nE2E RESULT: REFUSED (termux mode owns its disk) (exit 2)", flush=True)
         return EXIT_SETUP
     if mode == "usb" and (args.disk or getattr(args, "nvme", False)):
         print("[e2e] usb: --disk/--nvme are not supported by this mode: it writes its "
