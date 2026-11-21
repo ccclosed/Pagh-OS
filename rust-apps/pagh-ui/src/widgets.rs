@@ -511,22 +511,34 @@ impl List {
     pub fn draw(&self, canvas: &mut Canvas, theme: &Theme, area: Rect) -> ListLayout {
         let palette = &theme.palette;
         let layout = self.layout(area, theme);
+        // Отсечение — это и есть виджетный damage: если прямоугольник списка
+        // не пересекается с текущим клипом (повреждённой областью), пункт не
+        // рисуется вовсе. Так проход по списку стоит O(попавших в damage
+        // пунктов), а не O(всех): полный кадр (клип = вся поверхность)
+        // рисуется как раньше.
+        let clip = canvas.clip();
         let mut y = area.y;
         let mut item_index = 0;
         for section in &self.sections {
             if !section.title.is_empty() {
-                font::draw(
-                    canvas,
-                    area.x + 12,
-                    y + SECTION_HEIGHT / 2 + font::ascent() / 2,
-                    &section.title,
-                    palette.section_text,
-                );
+                let title_rect = Rect::new(area.x, y, area.w, SECTION_HEIGHT);
+                if clip.intersects(title_rect) {
+                    font::draw(
+                        canvas,
+                        area.x + 12,
+                        y + SECTION_HEIGHT / 2 + font::ascent() / 2,
+                        &section.title,
+                        palette.section_text,
+                    );
+                }
                 y += SECTION_HEIGHT;
             }
             for item in &section.items {
                 let rect = layout.items[item_index].1;
                 item_index += 1;
+                if !clip.intersects(rect) {
+                    continue;
+                }
                 let selected = self.selected == Some(item.id);
                 let hovered = self.hovered == Some(item.id);
                 if selected {
@@ -643,11 +655,16 @@ impl Grid {
     pub fn draw(&self, canvas: &mut Canvas, theme: &Theme, area: Rect) -> Vec<Rect> {
         let palette = &theme.palette;
         let cells = self.layout(area);
+        // См. `List::draw`: ячейка вне повреждённой области не рисуется.
+        let clip = canvas.clip();
         for (index, cell) in cells.iter().enumerate() {
             let Some(item) = self.items.get(index) else {
                 continue;
             };
             if cell.bottom() > area.bottom() || cell.y > area.bottom() {
+                continue;
+            }
+            if !clip.intersects(*cell) {
                 continue;
             }
             if self.selected == Some(index) {
