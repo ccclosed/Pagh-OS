@@ -114,6 +114,41 @@ default **in the same PR that lands the patch**: add `default=True` to
 for one-off debugging. Until then the compatibility path is intentional: the
 driver must not paint existing runs red before the kernel half exists.
 
+## Status: the kernel half is applied (branch `fix/bootid-marker` → `dev`)
+
+`tools/e2e_bootid_kernel.patch` no longer applies as a diff — the tree moved under it
+(`src/boot.rs` prose was translated and `init_serial()` now lives further down) — so t27
+applied it by hand with the same semantics:
+
+```rust
+pub const BOOT_ID: &str = "PAGH-BOOTID-0000000000000000";   // 28 bytes, fixed length
+// in init_serial(), right after `info!("serial")`:
+info!("[BOOTID] {}", BOOT_ID);
+```
+
+Only the doc comment was adapted (Russian, matching the tree's style after the translation
+wave); the constant, the placeholder bytes and the log line are exactly what the driver
+expects — `BOOT_TAG_PLACEHOLDER` is `PAGH-BOOTID-` plus 16 zeros, and each profile carries
+**exactly one** occurrence, inside a `PT_LOAD` segment. Boot phase order is untouched: the
+marker is serial output inside step 1, printed while later phases can still fail.
+
+Live proof (`python3 tools/e2e.py selftest`, release profile):
+
+* serial: `[INFO] [BOOTID] PAGH-BOOTID-ad1c57eca3060288` — the first kernel line, right after
+  the firmware banner and before `[INFO] fb0: …`;
+* patch audit: staged ELF offset 1546541, 14 bytes changed, size unchanged (25150896), one
+  occurrence of 1 inside `PT_LOAD`;
+* verdict: `boot identity: verified`, `SELFTEST SUMMARY: 115 routines, 0 failed checks,
+  1 skipped`, `E2E RESULT: PASS (exit 0)`, and no `unverifiable`/`predates` warning;
+* artifacts: `/home/oleg/.cache/pagh-agent-notes/qbootid-selftest-serial.log`,
+  `qbootid-selftest-summary.json`, `qbootid-selftest-stdout.log`.
+
+Still open (and out of scope for the kernel PR): the Follow-up above — making
+`--require-boot-proof` the default is a change to `tools/e2e.py`, so it belongs to the driver's
+own PR. Nothing is silently weakened until then: with the placeholder present, a tag that does
+not come back is `fail` ⇒ `REFUSED (boot identity)` with exit 2 *without* the flag; the flag
+only upgrades the "no placeholder at all" case from a warning to a refusal.
+
 ## Note for reviewers
 
 `tools/e2e.py` appears as a **new file** in this branch: the Linux E2E driver

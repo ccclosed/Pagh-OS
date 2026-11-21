@@ -103,18 +103,20 @@ pub fn take_scancode() -> Option<u8> {
 /// Inject a scancode from another keyboard source (USB HID), exactly as if the
 /// 8042 had delivered it.
 ///
-/// The whole point of feeding THIS ring rather than a second queue: every
-/// consumer — the shell's decoder, the `^C`/`^Z` latches, a compat process's
-/// stdin — already reads here, so a USB keyboard needs no changes downstream.
-/// The modifier tracking the driver does for `^C` is deliberately NOT duplicated
-/// here: it runs in `irq_handler`, and duplicating it would double-count a
-/// Ctrl press that arrived on both paths (firmware PS/2 translation plus a real
-/// USB device) and latch `^C` without a keypress.
+/// The byte enters the *producer* side of the input path — the `inputd` queue —
+/// and `inputd` routes it exactly like an IRQ1 byte. Every consumer (the shell's
+/// decoder, the `^C`/`^Z` latches, a compat process's stdin) still reads the same
+/// PS/2 ring, so a USB keyboard needs no changes downstream. The modifier
+/// tracking the driver does for `^C` is deliberately NOT duplicated here: it runs
+/// in `irq_handler`, and duplicating it would double-count a Ctrl press that
+/// arrived on both paths (firmware PS/2 translation plus a real USB device) and
+/// latch `^C` without a keypress.
 pub fn inject_scancode(byte: u8) {
-    // Та же маршрутизация, что у IRQ1: evdev получает байт всегда, shell-кольцо —
-    // только пока клавиатурой не владеет VT-клиент. USB HID-путь зовёт именно
-    // эту функцию, поэтому одна точка покрывает оба источника.
-    deliver_physical(byte);
+    // Производитель ничего не доставляет сам: байт встаёт в очередь `inputd`,
+    // и маршрутизацию `deliver_physical` выполняет ОДИН поток для обоих
+    // источников — IRQ1 и USB HID. Дедупликация `vtinput` поэтому существует в
+    // одном месте, а не повторяется в USB-трансляторе.
+    crate::drivers::inputd::push_scancode(byte);
 }
 
 /// Доставить физический скан-код (IRQ1 или USB HID) обоим потребителям.
@@ -127,7 +129,10 @@ pub fn inject_scancode(byte: u8) {
 /// (двойное эхо, два элемента истории, повтор команды). Владельца, который уже
 /// завершился, снимает shell-цикл (`vtinput::reap_dead_client`), поэтому
 /// shell-only загрузка и закрытый терминал ввод не теряют.
-fn deliver_physical(byte: u8) {
+///
+/// Единственный вызывающий — диспетчер `inputd::drain`: производитель (IRQ1,
+/// USB HID) только кладёт байт в очередь.
+pub(crate) fn deliver_physical(byte: u8) {
     crate::drivers::evdev::feed_scancode(byte);
     if !crate::drivers::vtinput::client_active() {
         push_to_ring(byte);
@@ -237,10 +242,10 @@ pub fn irq_handler() {
         }
     }
 
-    // Маршрутизация: evdev получает байт всегда (композитор), shell-кольцо —
-    // только если клавиатурой не владеет VT-клиент; иначе этот же байт придёт
-    // в shell один раз через `/dev/vtinput`.
-    deliver_physical(scancode);
+    // IRQ только КЛАДЁТ байт в очередь. Доставку (evdev + shell-кольцо с
+    // дедупликацией `vtinput`) выполняет поток `inputd`: одно правило на IRQ1 и
+    // USB HID, и никакой работы с потребителями в IRQ-контексте.
+    crate::drivers::inputd::push_scancode(scancode);
 }
 
 /// True when the ring buffer holds an unread scancode. Lets
