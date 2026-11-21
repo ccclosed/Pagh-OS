@@ -5,7 +5,7 @@ use pagh_terminal::demo;
 use pagh_terminal::png;
 use pagh_terminal::render::{
     render_screen, render_screen_into, render_screen_into_cleared, render_window, Canvas,
-    RenderOptions, Theme, BORDER, TITLE_H, VIEWPORT_PADDING,
+    RenderOptions, Theme, BORDER, SELECTION_BG_MIX, TITLE_H, VIEWPORT_PADDING,
 };
 use pagh_terminal::screen::{Screen, SelectionMode};
 use pagh_terminal::Terminal;
@@ -55,10 +55,11 @@ fn text_cursor_and_selection_paint_expected_pixels() {
     let theme = theme();
     let canvas = render_screen(&terminal.screen, &theme, &RenderOptions::default());
 
-    // Selected cell background.
+    // Selected cell background: a wash over the cell background, not an
+    // opaque fill (see render::SELECTION_BG_MIX).
     assert_eq!(
         &canvas.pixel(VIEWPORT_PADDING + 8 + 2, VIEWPORT_PADDING + 2)[..3],
-        &theme.selection.to_array()
+        &theme.bg.lerp(theme.selection, SELECTION_BG_MIX).to_array()
     );
     // Cursor block at cell 5.
     assert_eq!(
@@ -400,5 +401,141 @@ fn bulk_fills_match_the_per_pixel_reference() {
         reference.pixels,
         mapped.clone().pixels,
         "mapped fill diverges (wire order or stride)"
+    );
+}
+
+/// Репро бага на настоящем выводе `fastfetch`, снятом с гостя (serial-лог
+/// сессии qbug3): цветной `#`-логотип слева, ANSI-текст справа и полоса
+/// цветовых фонов внизу.
+///
+/// Оракул: кадр с выделением обязан быть пиксель-в-пиксель равен кадру без
+/// выделения, отрисованному с `theme.bg == подсветка`, во всех клетках с
+/// дефолтным фоном. Это ровно утверждение «выделение меняет только фон»:
+/// foreground, сглаживание и ANSI-цвета совпадают по построению, а не по
+/// переписанной в тесте формуле.
+///
+/// Прежний `resolve_style` подменял foreground на один тёмный `selection_fg`,
+/// поэтому логотип и цветные пары ключ/значение становились серыми, а
+/// ANSI-фоны — сплошной синей полосой.
+#[test]
+fn selection_over_real_fastfetch_output_keeps_logo_text_and_colours() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let raw = std::fs::read(dir.join("tests/fixtures/fastfetch-guest.script"))
+        .expect("fastfetch guest fixture");
+    let theme = theme();
+    let opts = RenderOptions::default();
+    let mut plain = Terminal::new(100, 30);
+    plain.feed(&raw);
+    let before = render_screen(&plain.screen, &theme, &opts);
+
+    // Весь блок fastfetch: 12 строк логотипа/информации + две строки
+    // цветовых фонов (ANSI 40..47 и 100..107).
+    let mut selected = Terminal::new(100, 30);
+    selected.feed(&raw);
+    selected
+        .screen
+        .begin_selection_abs(0, 0, SelectionMode::Char);
+    selected.screen.extend_selection_abs(13, 99);
+    let after = render_screen(&selected.screen, &theme, &opts);
+
+    let highlight = theme.bg.lerp(theme.selection, SELECTION_BG_MIX);
+    let mut washed = theme.clone();
+    washed.bg = highlight;
+    let oracle = render_screen(&plain.screen, &washed, &opts);
+    assert_ne!(
+        highlight.to_array(),
+        theme.selection.to_array(),
+        "selection wash must not be the opaque accent"
+    );
+
+    let rgb = |px: [u8; 4]| [px[0], px[1], px[2]];
+    let mut background = 0usize;
+    let mut glyph = 0usize;
+    let mut swatches = 0usize;
+    for row in 0..14 {
+        let line = plain.screen.view_line(row);
+        for col in 0..100 {
+            let cell = line.get(col).copied().unwrap_or_default();
+            for y in 0..18 {
+                for x in 0..8 {
+                    let px = (
+                        VIEWPORT_PADDING + col * 8 + x,
+                        VIEWPORT_PADDING + row * 18 + y,
+                    );
+                    let b = rgb(before.pixel(px.0, px.1));
+                    let a = after.pixel(px.0, px.1);
+                    if !cell.bg.is_default() {
+                        // ANSI-фон (полоса цветов внизу): подсветка — смесь, а
+                        // не сплошная заливка, поэтому арт остаётся различимым.
+                        let bg = cell.bg.resolve(&theme.palette, theme.bg);
+                        assert_eq!(
+                            rgb(a),
+                            bg.lerp(theme.selection, SELECTION_BG_MIX).to_array(),
+                            "ANSI background art was erased at ({row},{col})"
+                        );
+                        assert_ne!(rgb(a), theme.selection.to_array());
+                        swatches += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        a,
+                        oracle.pixel(px.0, px.1),
+                        "selected cell ({row},{col}) differs from `theme.bg = highlight`"
+                    );
+                    if b == theme.bg.to_array() {
+                        assert_eq!(rgb(a), highlight.to_array());
+                        background += 1;
+                    } else {
+                        glyph += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        background > 10_000,
+        "selection painted too little: {background}"
+    );
+    assert!(
+        swatches > 100,
+        "no ANSI colour swatches covered: {swatches}"
+    );
+
+    // Регрессия «foreground посерел»: ядра глифов (полное покрытие) — это
+    // пиксели, которые в оракуле остались прежними; старый код перекрашивал
+    // их все, поэтому счётчик обнулялся бы. Края сглаживания законно
+    // смешиваются с новым фоном, поэтому их сюда не относим.
+    let mut preserved = 0usize;
+    for row in 0..14 {
+        let line = plain.screen.view_line(row);
+        for col in 0..100 {
+            let cell = line.get(col).copied().unwrap_or_default();
+            if !cell.bg.is_default() {
+                continue;
+            }
+            for y in 0..18 {
+                for x in 0..8 {
+                    let px = (
+                        VIEWPORT_PADDING + col * 8 + x,
+                        VIEWPORT_PADDING + row * 18 + y,
+                    );
+                    let b = before.pixel(px.0, px.1);
+                    let a = after.pixel(px.0, px.1);
+                    if b[..3] != theme.bg.to_array()[..] && b == a {
+                        preserved += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        preserved > 1_000,
+        "foreground colours were not preserved: {preserved}"
+    );
+    // И сам кадр не должен быть «залит» подсветкой: глифовые пиксели заведомо
+    // есть внутри выделения.
+    assert!(
+        glyph > 1_000,
+        "no glyph pixels inside the selection: {glyph}"
     );
 }

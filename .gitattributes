@@ -10,3 +10,8 @@
 # checks them out as CRLF on Windows and cargo then fails with
 # "the listed checksum of vendor/... has changed". Disable all conversion.
 vendor/** -text
+
+# Терминальные фикстуры — сырые байтовые потоки вывода (ESC-последовательности,
+# CRLF от консоли/PTY). Нормализация EOL изменила бы смысл фикстуры, поэтому
+# байты хранятся как есть (как vendor/**).
+rust-apps/pagh-terminal/tests/fixtures/** -text
