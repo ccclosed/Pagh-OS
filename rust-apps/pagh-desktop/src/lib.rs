@@ -32,6 +32,7 @@ pub mod demo;
 pub mod evdev;
 pub mod fbdev;
 pub mod font;
+pub mod framestats;
 pub mod scenario;
 pub mod server;
 pub mod shadow;

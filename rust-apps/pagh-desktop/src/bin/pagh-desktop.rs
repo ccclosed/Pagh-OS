@@ -152,6 +152,9 @@ fn run() -> io::Result<()> {
                 options.frame_log_every =
                     parse_u64(value(&mut args, "--frame-log-every")?, "--frame-log-every")?
             }
+            "--frame-stats" => {
+                options.frame_stats = Some(PathBuf::from(value(&mut args, "--frame-stats")?))
+            }
             "--bench" => bench_mode = true,
             "--bench-frames" => {
                 bench_frames = parse_u64(value(&mut args, "--bench-frames")?, "--bench-frames")?
@@ -177,6 +180,9 @@ fn run() -> io::Result<()> {
         return run_bench(&options, bench_frames, bench_json, &bench_label);
     }
 
+    // `--clock now` means *live* wall clock, not a snapshot of it: the server
+    // re-reads the clock each half-second and damages only the panel clock rect.
+    options.live_clock = clock_now;
     let mut server = Server::bind(options)?;
     if clock_now {
         let (time, date) = demo::clock_now();
@@ -305,6 +311,7 @@ fn print_help() {
                [--spawn-demo] [--demo-binary PATH]
                [--launch-target APP=PROGRAM[|ARG…]] [--autostart APP]
                [--clock now|fixed] [--quiet] [--frame-log-every N]
+               [--frame-stats PATH]
                [--bench] [--bench-frames N] [--bench-json PATH]
                [--bench-label NAME]
 
@@ -321,6 +328,11 @@ input-trace + full-render (для QEMU-приёмки tools/e2e.py desktop).
 печатает frame time + breakdown render/blend/copy/present в serial (JSON —
 между маркерами FRAMETIME_JSON_BEGIN/END, файл — по --bench-json).
 --frame-log-every N печатает frame-stats каждые N presented-кадров.
+--frame-stats PATH пишет строку на секунду (включая секунды без кадров) и
+итоговую summary: frames, avg/p95/max длительности кадра и gap_max_ms —
+самый долгий разрыв между presents, то есть прямое свидетельство голодания.
+Часы панели при --clock now идут: раз в минуту перерисовывается только
+clock_rect, независимо от клиентских кадров.
 
 --launch-target задаёт приложение для PDP/1 launch (type 13):
   --launch-target 'terminal=/usr/bin/pagh-terminal|--socket|{{socket}}'
