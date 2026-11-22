@@ -5,8 +5,10 @@ The Linux layer implements threads (`CLONE_VM|CLONE_THREAD`, including musl's
 `CLONE_DETACHED`), a real address-space `fork` (`fork_linux_process`), `posix_spawn`
 (`clone(CLONE_VM|CLONE_VFORK)` as a COW fork plus parent wait), `futex`, and POSIX signal
 delivery — so a Rust program that spawns threads, child processes or handles signals
-should work; the samples here stay single-threaded on purpose. GUI libraries are not supported: there is no X11/Wayland
-server, only the kernel's own framebuffer.
+should work; the samples here stay single-threaded on purpose. There is still no X11/Wayland
+server: the GUI is the userspace desktop below (variant B) plus the kernel's own framebuffer,
+and a program draws into its `memfd` through the PDP/1 toolkit rather than through a system
+GUI library.
 
 Build the sample:
 
@@ -32,8 +34,12 @@ top of it (sidebar, grid/list views, context menu with the Dolphin-style
 "Создать" submenu, properties dialog, VFS trait plus a fake and a host backend).
 Files draws only the client area — the compositor owns the title bar, panel and
 window management — and asks the compositor to launch the terminal through the
-PDP/1 `launch` (type 13) extension. Both are dependency-free crates with their
-own `[workspace]` and `.cargo/config.toml` (the root config targets bare metal),
+PDP/1 `launch` (type 13) extension. `rust-apps/pagh-terminal` is that second client: a
+VT100/ANSI emulator with its own renderer, a PDP/1 client and an `ShmSurface` path
+(memfd handed over with `SCM_RIGHTS`, damage rectangles on the socket), and it is also the
+consumer of the kernel terminal session (`/dev/vtfb1` + `/dev/vtinput1`, see
+`docs/terminal-session.md`). All three are dependency-free crates with their own
+`[workspace]` and `.cargo/config.toml` (the root config targets bare metal),
 so they build for the host or for static musl:
 
 ```bash
@@ -52,13 +58,20 @@ the real Files binary over an `AF_UNIX` socket. See `pagh-ui/README.md`,
 `rust-apps/tinygl` vendors upstream **TinyGL 0.4.1** (MIT, Fabrice Bellard) and
 wraps it in a thin Rust FFI layer. It renders **on the CPU only** into a dense
 `0x00RRGGBB` (`XRGB8888`) buffer — the compositor's pixel format — so a client
-can draw straight into its memfd and commit damage. This is PR1 (build-probe):
-upstream C 0.4.1 + `build.rs` for this crate only, no system build changes.
+can draw straight into its memfd and commit damage. Status: **PR1 build-probe +
+PR2 FFI core + PR3 textures/display lists** are merged; PR5 adds fixed-function
+lighting (`glLightfv`/`glMaterialfv`) and the `pagh-gl-demo` client below. PR1
+proved upstream C 0.4.1 builds for musl, links static-pie and produces the
+reference pixels (a strict digest); PR2 added the safe layer (context,
+viewport/clear, matrix stack, immediate-mode primitives, depth/cull,
+`ZB_resize`). No GPU/DRM, and the system build (`build-rust-app.sh`) is still
+unchanged.
 
 Honest limits: fixed-function GL 1.1 subset, no shaders/GLSL/GL 2.0+, no
 FBO/VBO/`glDrawArrays`, 16-bit Z, `stride == width*4`, `width % 4 == 0`,
 one context per process (`gl_ctx` is global), and upstream `gl_fatal_error` is
-`exit(1)`. See `tinygl/README.md` for the full list and
+`exit(1)` — every invariant is validated by our `Surface`/`Context` before C is entered.
+See `tinygl/README.md` for the full list and
 `tinygl/UPSTREAM.md` for the pinned pixel digest.
 
 ```bash
@@ -72,3 +85,26 @@ The musl build needs a C compiler for `x86_64-unknown-linux-musl`
 it and prints the install instructions if missing. The ELF is static-pie
 (`INTERP` gate: `tinygl-probe --check-interp` plus the existing
 `tools/build-rust-app.sh` check).
+
+
+## CPU TinyGL demo: `pagh-gl-demo`
+
+`rust-apps/pagh-gl-demo` is the PDP/1 client that renders the three CPU scenes
+(`triangle`, `cube`, `gears`) **straight into the window's
+`mmap(MAP_SHARED)` memfd** through `tinygl`; only `COMMIT` + `DAMAGE` travel
+over the socket (PDP/1 `ShmSurface`, no frame copy). Frames are indexed, not
+timed: frame `n` has a fixed angle, so FNV-1a pixel digests are reproducible on
+the host, in QEMU and on musl. Without `--connect` it runs headless into
+`Vec<u32>` and prints `TINYGL <scene> frame=<n> digest=0x…`; with `--connect
+/tmp/pagh-desktop.sock` it opens a live window.
+
+```bash
+cd rust-apps/pagh-gl-demo && cargo test
+cargo run --bin pagh-gl-demo -- gears --hash
+tools/build-rust-app.sh rust-apps/pagh-gl-demo   # static-pie musl
+```
+
+Honest limits (also in its README): CPU only, fixed-function GL 1.1 subset,
+16-bit Z, `stride == width*4`, `width % 4 == 0`, one GL context per process,
+and no full-frame fallback — a compositor without `ShmSurface` makes the demo
+fail with an explicit error.

@@ -702,9 +702,12 @@ Linux-поведение снято одноразовым пробником н
 * **Аппаратный курсор, KMS modeset, vt-switch, hotplug**: нет.
 * **EV_ABS/touch, EV_LED, автоповтор**: нет.
 * **fbdev modeset** (`FBIOPUT_VSCREENINFO`) и панорамирование: нет.
-* **PTY/терминал в окне**: окно запускает userspace shell за двумя pipe'ами
-  (без termios/job-control/размера окна), а kernel-shell остаётся особым случаем;
-  полноценный userspace PTY появится отдельно.
+* **PTY/терминал в окне**: `/dev/vtfb1` + `/dev/vtinput1` (§11) дают окну **kernel-shell
+  сессию**, то есть настоящий shell, но не userspace PTY: управляющий терминал по-прежнему
+  один (§11, ограничения), per-window job control нет, а окно, подключённое к VT-поверхности
+  сессии 0 (`/dev/vtconsole0` + `/dev/vtinput`), — read-only зеркало boot-VT. Привязка окна к
+  kernel-сессии по умолчанию — PR #147, в `dev` её ещё нет: обычный путь сегодня запускает
+  собственный shell-потомок за pipe'ами.
 
 ---
 
@@ -756,7 +759,9 @@ In-QEMU (`python3 tools/e2e.py selftest`) гоняет routines:
   обычные `write`/`read` на том же socketpair не изменились.
 
 Все проверки выполняются в свежем пользовательском PML4 и возвращают кадры в
-PMM (`SELFTEST SUMMARY: 106 routines, 0 failed checks`).
+PMM. Итог печатает сам прогон — `SELFTEST SUMMARY: N routines, 0 failed checks`; `N`
+растёт с каждым PR (routine добавляются вместе с фичами), поэтому здесь нет константы:
+сверяйтесь с выводом своей сборки, а не с числом из документа.
 
 ---
 
