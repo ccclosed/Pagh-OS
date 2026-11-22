@@ -20,9 +20,9 @@ use std::time::Duration;
 use pagh_terminal::kernelsession::{
     buttons_to_mask, encode_key_bytes, encode_mouse_event, encode_snapshot, fit_placement,
     is_missing_device, is_session_end, render_notice, solid_pixels, wheel_from_axis,
-    window_to_surface, Draw, FileInput, FitPlacement, FrameSource, InputSink, KernelFrame,
-    KeyForwarder, MouseEvent, MouseForwarder, ReadFrameSource, VtFbError, VtFbInfo, MOUSE_BTN_LEFT,
-    MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_EVENT_LEN,
+    window_to_surface, winsize_cells, Draw, FileInput, FitPlacement, FrameSource, InputSink,
+    KernelFrame, KeyForwarder, MouseEvent, MouseForwarder, ReadFrameSource, VtFbError, VtFbInfo,
+    MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_EVENT_LEN,
 };
 use pagh_terminal::protocol::{self, configure_flags, welcome_flags, Message};
 use pagh_terminal::render::{Canvas, Theme};
@@ -1048,4 +1048,18 @@ fn kernel_mode_uses_a_pid_derived_window_id() {
         "the client must exit cleanly on Close: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Размер терминала в клетках ядра (8×18 px) — то, что клиент шлёт в
+/// `TIOCSWINSZ` после resize окна: целочисленное деление, минимум одна клетка,
+/// кламп в `u16` (структура UAPI — четыре `u16`).
+#[test]
+fn winsize_cells_match_the_kernel_cell_grid() {
+    assert_eq!(winsize_cells(720, 420), (90, 23));
+    assert_eq!(winsize_cells(1280, 800), (160, 44));
+    // Окно меньше клетки — не 0 (TUI делил бы на ноль), а одна клетка.
+    assert_eq!(winsize_cells(1, 1), (1, 1));
+    assert_eq!(winsize_cells(0, 0), (1, 1));
+    // struct winsize — четыре u16: гигантский запрос клампится, не переполняется.
+    assert_eq!(winsize_cells(u32::MAX, u32::MAX), (u16::MAX, u16::MAX));
 }

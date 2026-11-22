@@ -252,9 +252,11 @@ pub fn init(screen_w: usize, screen_h: usize) -> bool {
 /// `evdev::feed_mouse`, то есть у него есть потребители, которых в IRQ-контексте
 /// быть не должно. Здесь остаётся ровно чтение порта и запись байта в очередь.
 pub fn irq_handler() {
-    // SAFETY: standard PS/2 data-port read in IRQ context.
-    let byte: u8 = unsafe { Port::<u8>::new(DATA_PORT).read() };
-    crate::drivers::inputd::push_aux(byte);
+    // Общий выходной буфер 8042 выгребает `i8042`: все готовые байты за один
+    // заход, маршрутизация по AUXDATA. Читать здесь один байт — и терять
+    // остальные, пока распаковка держит прерывания, — и было причиной
+    // «замерзшего» курсора под `ppkg install`.
+    crate::drivers::i8042::irq_drain();
 }
 
 /// Inject a complete PS/2-format packet from another pointing device (USB HID).

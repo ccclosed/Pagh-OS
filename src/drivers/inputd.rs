@@ -152,6 +152,9 @@ pub fn drain() -> usize {
 pub fn inputd_thread() {
     crate::info!("inputd: dispatch thread started");
     loop {
+        // Страховка от долгих окон с замаскированным IF: 8042 выгребается и
+        // без IRQ12, раз в тик, поэтому поток пакетов не рвётся под распаковкой.
+        super::i8042::poll();
         drain();
         crate::task::scheduler::sleep_ticks(1);
     }

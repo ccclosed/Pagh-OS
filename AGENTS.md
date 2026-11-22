@@ -483,14 +483,19 @@ slice 4; 2.10.0 — procfs slice 3; 2.9.x — правда о памяти и `/
   таймера задаче без сисколлов реализованы. SIGCHLD ставится родителю в очередь на
   exit/stop/continue ребёнка (2.15.0). Настоящие process groups теперь есть в `CompatState`
   (`pgid`, `setpgid`/`getpgid`/`getpgrp`/`setsid`, `kill(0)`/`kill(-pgid)` адресуют группу)
-  с 2.16.0. Terminal job control пришёл вместе с ними: консоль — управляющий терминал с
-  одной foreground process group (`drivers::tty`, чистые правила в
+  с 2.16.0. Terminal job control пришёл вместе с ними: каждая консольная сессия
+  (boot-консоль и каждое терминальное окно) — свой управляющий терминал с собственной
+  foreground process group (`drivers::tty`, чистые правила и `struct winsize` в
   `arch/x86_64/linux/tty.rs`, host-свойство `tty_job`), `TIOCGPGRP`/`TIOCSPGRP` отвечают
   как `tcgetpgrp`/`tcsetpgrp`, фоновое чтение получает `SIGTTIN`, а (при `TOSTOP`) фоновая
-  запись — `SIGTTOU`, и `^Z` останавливает foreground GROUP. Остающиеся отклонения названы
-  в модуле, а не подразумеваются: нет сессий (правило сессии `tcsetpgrp`
-  аппроксимируется), фоновый доступ возвращает `EINTR` вместо перезапуска после `SIGCONT`,
-  а `TOSTOP` по умолчанию включён там, где Linux выключает.
+  запись — `SIGTTOU`, `TIOCGWINSZ`/`TIOCSWINSZ` + `SIGWINCH` двигают размер окна, и `^Z`
+  останавливает foreground GROUP. `TOSTOP` по умолчанию ВЫКЛЮЧЕН, как в Linux (иначе
+  фоновый композитор desktop'а парковался на фоновой записи); порядок `^C`/`^Z`/`fg`/`bg`
+  и таблица jobs — на сессию. Остающиеся отклонения названы в модуле, а не
+  подразумеваются: нет `setsid`/`TIOCSCTTY` и PTY (правило сессии `tcsetpgrp`
+  аппроксимируется консольной сессией), фоновый доступ возвращает `EINTR` вместо
+  перезапуска после `SIGCONT`, а полного `termios` нет — действуют `ICANON`/`ECHO`/`ISIG`/
+  `TOSTOP`.
 - Устройства ввода: PS/2-клавиатура/мышь (IRQ1/IRQ12) и USB HID через xHCI-контроллер,
   которым ядро управляет само (`drivers::xhci`, `drivers::usb_hid`, опрос из потока `usb` и
   напрямую из boot-меню). Весь путь проверен в QEMU с эмулированными контроллером и

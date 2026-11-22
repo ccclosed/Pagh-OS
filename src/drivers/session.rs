@@ -150,6 +150,20 @@ pub fn bound_session(pid: u64) -> usize {
         .unwrap_or(session_route::BOOT_SESSION)
 }
 
+/// Унаследовать привязку родителя fork-ребёнком (`lxrun`-программа сделала
+/// `fork`).
+///
+/// Без этого ребёнок задания не принадлежал бы ни окну, ни boot-консоли: его
+/// вывод ушёл бы в boot-консоль, а stdin — в boot-терминал. Привязка — часть
+/// управляющего терминала, поэтому наследуется как `pgid`/`tty_job`. Boot-сессия
+/// привязок не имеет, и родитель из неё не создаёт запись.
+pub fn inherit_bind(child: u64) {
+    let session = current();
+    if session != session_route::BOOT_SESSION {
+        bind(child, session);
+    }
+}
+
 /// Снять привязку задачи (вызывается на её выходе, чтобы таблица не росла).
 pub fn unbind(pid: u64) {
     let mut binds = BINDS.lock();
@@ -193,6 +207,15 @@ static OPEN_LOCK: Spinlock<()> = Spinlock::new(());
 /// сессии передаётся через слот. Спавн сериализован (одна сессия, один CPU):
 /// слот пишется непосредственно перед спавном и читается в его начале.
 static PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// PID клиента, открывшего устройства слота (для focus-latch); `0` — нет.
+pub fn open_client(session: usize) -> u64 {
+    if session < MAX_SESSIONS {
+        OPEN_CLIENT[session].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
 
 /// Сколько fd устройств конкретной сессии открыто (для диагностики/тестов).
 pub fn open_fds(session: usize) -> u32 {
@@ -381,6 +404,9 @@ pub fn exit(session: usize) -> ! {
     // сосчитаться как закрытие будущей сессии (см. [`note_close`]).
     OPEN_FDS[session].store(0, Ordering::Relaxed);
     OPEN_CLIENT[session].store(0, Ordering::Relaxed);
+    // #172: задания, размер окна и foreground-группа — тоже по сессии.
+    crate::shell::jobs::clear_session(session);
+    crate::drivers::tty::reset_session(session);
     reset(session);
     crate::drivers::framebuffer::reset_session(session);
     crate::task::scheduler::exit_current()

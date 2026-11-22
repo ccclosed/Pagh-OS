@@ -1195,7 +1195,8 @@ fn read_secret(prompt: &str) -> Option<String> {
                 // Защёлку ^C, которую ставит декодер, гасим: она предназначена
                 // для ожидания foreground-ребёнка `lxrun`, и оставлять её
                 // взведённой значило бы мгновенно завершить следующую программу.
-                super::keys::CTRL_C_LATCH.store(false, core::sync::atomic::Ordering::Relaxed);
+                // Защёлка — ЭТОЙ консольной сессии (per-session tty).
+                let _ = super::keys::take_ctrl_c_latch();
                 crate::kprintln!();
                 crate::fb_println!();
                 return None;
@@ -2195,61 +2196,68 @@ pub(super) fn cmd_warn(_ctx: &mut ShellCtx, args: &[&str]) {
 fn foreground_wait(pid: u64, pgid: u64, command: &str) {
     use crate::arch::x86_64::linux::signal::send_signal_to_pgid_all;
     use crate::arch::x86_64::linux::signal_frame::{SIGINT, SIGTSTP};
-    use core::sync::atomic::Ordering;
 
-    crate::shell::keys::CTRL_C_LATCH.store(false, Ordering::Relaxed);
-    crate::shell::keys::CTRL_Z_LATCH.store(false, Ordering::Relaxed);
-    crate::drivers::ps2_kbd::CTRL_C.store(false, Ordering::Relaxed);
-    crate::drivers::ps2_kbd::CTRL_Z.store(false, Ordering::Relaxed);
-    crate::drivers::ps2_kbd::FG_PID.store(pid, Ordering::Relaxed);
+    // Всё состояние — ЭТОЙ консольной сессии: её foreground-группа, её защёлки,
+    // её таблица заданий. Окно и boot-shell больше не отбирают терминал друг у
+    // друга (per-session tty).
+    let session = crate::drivers::session::current();
+    crate::shell::keys::clear_ctrl_latches();
+    crate::drivers::ps2_kbd::set_ctrl_c(session, false);
+    crate::drivers::ps2_kbd::set_ctrl_z(session, false);
+    crate::drivers::ps2_kbd::set_fg_pid(session, pid);
     // Задание владеет терминалом, пока выполняется (также ставится `lxrun`
     // внутри критической секции spawn; `fg` ставит его здесь перед возобновлением).
-    crate::drivers::tty::set_foreground_pgid(pgid);
+    crate::drivers::tty::set_foreground_pgid_for(session, pgid);
     let mut parked = false;
     while crate::task::compat::compat_exists(pid) && !parked {
         // Клавиатура, которую держит клиент окна, адресована ОКНУ, а не этой
-        // boot-сессии: её ^C/^Z не должны останавливать задание boot-shell'а.
-        // Живой симптом: `^C`, набранный в окне (в т.ч. из-за потерянного break
-        // модификатора под TCG), приходил сюда как защёлка декодера и убивал
-        // compositor вместе с окном. Защёлки дренируются, а не копятся.
+        // boot-сессии: её ^C/^Z не должны останавливать/убивать задание
+        // boot-shell'а (compositor/клиент). Защёлки именно дренируются, а не
+        // копятся, чтобы не сработать позже на чужом задании.
         let foreign_keys = crate::drivers::vtinput::client_active()
-            && crate::drivers::session::current() == crate::drivers::session_route::BOOT_SESSION;
+            && session == crate::drivers::session_route::BOOT_SESSION;
         if foreign_keys {
-            let _ = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed);
-            let _ = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed);
-            let _ = crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
-            let _ = crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
+            let _ = crate::shell::keys::take_ctrl_c_latch();
+            let _ = crate::shell::keys::take_ctrl_z_latch();
+            let _ = crate::drivers::ps2_kbd::take_ctrl_c(session);
+            let _ = crate::drivers::ps2_kbd::take_ctrl_z(session);
             crate::task::scheduler::yield_current();
             continue;
         }
-        let stopped = crate::shell::keys::CTRL_Z_LATCH.swap(false, Ordering::Relaxed)
-            | crate::drivers::ps2_kbd::CTRL_Z.swap(false, Ordering::Relaxed);
+        let stopped =
+            crate::shell::keys::take_ctrl_z_latch() | crate::drivers::ps2_kbd::take_ctrl_z(session);
         if stopped {
             // Остановить foreground-группу ТЕРМИНАЛА. Записанный pid — лишь
             // собственный waiter shell: задание, сделавшее fork, имеет несколько
             // thread groups, и все они должны встать, а не только лидер.
-            let target = crate::drivers::tty::foreground_pgid();
+            let target = crate::drivers::tty::foreground_pgid_for(session);
             match send_signal_to_pgid_all(target, SIGTSTP) {
                 Ok(()) => {
                     shell_println("^Z");
+                    // `^Z` мог быть набран уже после того, как сигнал от
+                    // `/dev/vtinput1` остановил группу сам: повторная доставка
+                    // SIGTSTP идемпотентна (группа уже stopped), поэтому запись
+                    // задания и выход из ожидания корректны в обоих случаях.
                     crate::shell::jobs::record(pid, pgid, String::from(command), true);
                     parked = true;
                 }
                 Err(_) => shell_println("^Z: no live foreground job"),
             }
         }
-        let pressed = crate::shell::keys::CTRL_C_LATCH.swap(false, Ordering::Relaxed)
-            | crate::drivers::ps2_kbd::CTRL_C.swap(false, Ordering::Relaxed);
+        let pressed =
+            crate::shell::keys::take_ctrl_c_latch() | crate::drivers::ps2_kbd::take_ctrl_c(session);
         if pressed {
             // ^C — тоже сигнал терминала: SIGINT идёт foreground-группе.
             shell_println("^C");
-            if send_signal_to_pgid_all(crate::drivers::tty::foreground_pgid(), SIGINT).is_err() {
+            if send_signal_to_pgid_all(crate::drivers::tty::foreground_pgid_for(session), SIGINT)
+                .is_err()
+            {
                 let _ = crate::arch::x86_64::linux::signal::send_signal(pid, SIGINT);
             }
         }
         crate::task::scheduler::yield_current();
     }
-    crate::drivers::ps2_kbd::FG_PID.store(0, Ordering::Relaxed);
+    crate::drivers::ps2_kbd::set_fg_pid(session, 0);
     // Задание закончило с экраном: продолжить shell ниже его последней строки,
     // а не затирать её (VT знает, где кончился его курсор, консоль — нет).
     crate::drivers::vt::cursor_to_console();
@@ -2260,7 +2268,7 @@ fn foreground_wait(pid: u64, pgid: u64, command: &str) {
     }
     // Вернуть терминал shell. Остановленное задание возобновляет `fg`,
     // который заново вооружает его группу перед SIGCONT.
-    crate::drivers::tty::restore_shell_foreground();
+    crate::drivers::tty::restore_shell_foreground_for(session);
 }
 
 /// `jobs`: перечислить запомненные задания.
@@ -2284,6 +2292,7 @@ pub(super) fn cmd_jobs(_ctx: &mut ShellCtx, _args: &[&str]) {
 
 /// `bg`: возобновить самое свежее остановленное задание в фоне.
 pub(super) fn cmd_bg(_ctx: &mut ShellCtx, _args: &[&str]) {
+    // Таблица заданий и терминал — текущей консольной сессии.
     let Some((pid, pgid, command)) = crate::shell::jobs::last() else {
         shell_println("bg: no jobs");
         return;
@@ -2308,7 +2317,8 @@ pub(super) fn cmd_fg(_ctx: &mut ShellCtx, _args: &[&str]) {
     // Отдать терминал заданию ДО его возобновления: задание, пишущее сразу после
     // SIGCONT, не должно быть остановлено как «фоновое» (оно снова foreground) —
     // порядок и делает `fg` надёжным.
-    crate::drivers::tty::set_foreground_pgid(pgid);
+    let session = crate::drivers::session::current();
+    crate::drivers::tty::set_foreground_pgid_for(session, pgid);
     let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
         pgid,
         crate::arch::x86_64::linux::signal_frame::SIGCONT,
@@ -2504,6 +2514,7 @@ pub(super) fn run_lxrun(path: &str, args: &[&str]) {
     // исполниться. Вывод консоли здесь безопасен при замаскированных
     // прерываниях: он берёт локи framebuffer/serial, ни один не берётся дважды и
     // ни один не блокирует.
+    let session = crate::drivers::session::current();
     let result = crate::arch::cpu::without_interrupts(|| {
         let r = crate::task::process::run_linux_binary_as(
             crate::shell::identity::current(),
@@ -2517,10 +2528,14 @@ pub(super) fn run_lxrun(path: &str, args: &[&str]) {
             // ушли бы в boot-консоль (маршрут «задача → сессия» не знает, что он
             // принадлежит окну). `bind(pid, 0)` убирает запись, поэтому
             // boot-сессия не платит ничем.
-            crate::drivers::session::bind(pid, crate::drivers::session::current());
+            crate::drivers::session::bind(pid, session);
             let child_pgid = crate::task::compat::pgid_of(pid).unwrap_or(pid);
             crate::task::compat::mark_tty_job(pid);
-            crate::drivers::tty::set_foreground_pgid(child_pgid);
+            // Терминал и вход этого задания — терминал СВОЕЙ сессии; ставим оба
+            // до снятия маски, чтобы первый же read/write ребёнка не увидел
+            // «фоновое» состояние.
+            crate::drivers::tty::set_foreground_pgid_for(session, child_pgid);
+            crate::drivers::ps2_kbd::set_fg_pid(session, pid);
             // Вывод задания идёт через VT, shell — через текстовую консоль: оба
             // рисуют в один framebuffer, поэтому передать VT клетку, до которой
             // дошла консоль. Без этого первая строка программы легла бы поверх
@@ -2550,7 +2565,7 @@ pub(super) fn run_lxrun(path: &str, args: &[&str]) {
             foreground_wait(pid, child_pgid, args.first().copied().unwrap_or("?"));
         }
         Err(e) => {
-            crate::drivers::ps2_kbd::FG_PID.store(0, core::sync::atomic::Ordering::Relaxed);
+            crate::drivers::ps2_kbd::set_fg_pid(session, 0);
             let detail = match e {
                 crate::task::process::RunError::ArgsTooLarge => "argument list too large",
                 crate::task::process::RunError::NotFound => "file not found or unreadable",
