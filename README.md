@@ -477,6 +477,36 @@ install python3` (прогресс на serial; зеркало лога во fra
 Prompt показывает текущий рабочий каталог и рендерится в цвете на framebuffer (serial
 остаётся простым текстом).
 
+### Идентификация ОС: `Pagh-OS`, а не Linux-дистрибутив
+
+Pagh — самостоятельная ОС с Linux-совместимым syscall ABI. Каноническое имя ОС —
+`Pagh-OS` (`ID=pagh`); версия — `CARGO_PKG_VERSION`. `provision.rs` создаёт
+стандартный `/etc/os-release` на первом boot'е, досоздаёт его на уже
+провижиненном диске и обновляет `VERSION`, если ядро обновилось (файл с чужой
+идентичностью не трогается):
+
+```text
+NAME="Pagh-OS"
+ID=pagh
+VERSION="2.24.0"
+VERSION_ID="2.24.0"
+PRETTY_NAME="Pagh-OS 2.24.0"
+ARCH=x86_64
+```
+
+Поэтому os-release-совместимые инструменты видят правильное имя; например,
+`lxrun /mnt/usr/bin/fastfetch` печатает строку `OS: Pagh-OS 2.24.0 x86_64`.
+`/proc/sys/kernel/ostype` отвечает `Pagh`, `/proc/sys/kernel/osrelease` и
+`/proc/version` несут настоящую версию.
+
+`uname(2).sysname` при этом остаётся `Linux` — это **UTS-идентификатор
+Linux-совместимости**, а не имя ОС: его опрашивают Linux-бинарники, `configure` и
+`config.guess`, и смена на `Pagh` сломала бы совместимость, ради которой слой
+`arch/x86_64/linux/` существует. Поэтому `uname -s` — не способ узнать имя ОС;
+используйте `cat /etc/os-release` или `cat /proc/sys/kernel/ostype`. Полная
+модель, диагноз старого `linux-pagh` (это была строка `Kernel: Linux 6.1.0-pagh`,
+а не имя ОС) и ограничения — [`docs/os-identity.md`](docs/os-identity.md).
+
 ### Прокрутка консоли
 
 Консоль держит строки, ушедшие вверх, и показывает их снова при прокрутке:
