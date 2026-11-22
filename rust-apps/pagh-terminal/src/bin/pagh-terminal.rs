@@ -1367,7 +1367,12 @@ fn forward_winsize(
     if *reported == Some((cols, rows)) {
         return None;
     }
-    match devfs::set_winsize(sink.file(), cols, rows) {
+    // Между `ENODEV` и respawn (#174) устройства закрыты: размер будет отослан
+    // заново после успешного respawn (там `reported` сбрасывается).
+    let Some(file) = sink.file() else {
+        return None;
+    };
+    match devfs::set_winsize(file, cols, rows) {
         Ok(()) => {
             *reported = Some((cols, rows));
             Some(format!(
@@ -1519,6 +1524,19 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     }
                     match respawn_kernel_session(&mut frame, &mut forwarder, &mut diag) {
                         Ok(()) => {
+                            // Новая kernel-сессия стартует с размером по
+                            // умолчанию: сообщить ей текущий window-winsize,
+                            // иначе TUI внутри respawn'нутого окна останется с
+                            // чужой геометрией.
+                            reported_winsize = None;
+                            if let Some(line) = forward_winsize(
+                                forwarder.sink(),
+                                width,
+                                height,
+                                &mut reported_winsize,
+                            ) {
+                                note!("{line}");
+                            }
                             // `draw_notice_frame` отпустил ShmSurface: дальше
                             // полный кадр в локальный холст (как legacy-путь).
                             fallback = Some(Canvas::new(width as usize, height as usize, theme.bg));

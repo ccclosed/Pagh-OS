@@ -379,10 +379,12 @@ impl FileInput {
         })
     }
 
-    /// Дескриптор `/dev/vtinput1`: resize-путь шлёт по нему `TIOCSWINSZ`
-    /// (сам `ioctl` — unsafe, поэтому он в `devfs` рядом с `mmap`).
-    pub fn file(&self) -> &File {
-        &self.file
+    /// Дескриптор `/dev/vtinput1`, если устройство открыто: resize-путь шлёт по
+    /// нему `TIOCSWINSZ` (сам `ioctl` — unsafe, поэтому он в `devfs` рядом с
+    /// `mmap`). `None` — устройство закрыто между `ENODEV` и respawn (#174),
+    /// поэтому resize в этот момент пропускается, а не паникует.
+    pub fn file(&self) -> Option<&File> {
+        self.file.as_ref()
     }
 }
 
