@@ -46,8 +46,9 @@
 //!   (`KeyModes::default()`), как kernel-shell и ожидает;
 //! * scrollback и selection остаются в ядре: колесо и протяжка мышью в окно не
 //!   транслируются;
-//! * при downscale текст режется (nearest neighbour, без фильтра) — выбор
-//!   политики см. [`fit_placement`].
+//! * downscale — только целочисленный (nearest neighbour, без фильтра и без
+//!   дробного шага): дробный шаг ставит штрихи шрифта между пикселями окна и
+//!   делает текст нечитаемым.  Выбор политики см. [`fit_placement`].
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -424,20 +425,40 @@ impl InputSink for FileInput {
     }
 }
 
+/// Наибольший целый делитель кадра, который ещё помещается в окно.
+///
+/// `1` — поверхность помещается целиком, блит пиксель в пиксель.  Иначе —
+/// минимальный `n >= 2`, при котором `src / n` влезает в окно, то есть
+/// `max(ceil(src_w/dst_w), ceil(src_h/dst_h))`.  Дробного шага здесь нет
+/// намеренно: именно он ставил штрихи шрифта ядра между пикселями окна.
+fn integer_downscale(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> usize {
+    if dst_w >= src_w && dst_h >= src_h {
+        return 1;
+    }
+    let by_w = src_w.div_ceil(dst_w);
+    let by_h = src_h.div_ceil(dst_h);
+    by_w.max(by_h).max(1)
+}
+
 /// Раскладка кадра сессии внутри окна: `dst`-прямоугольник и его смещение.
 ///
 /// Политика (одна, документированная, без «умных» эвристик):
 ///
 /// * окно **не меньше** поверхности — блит 1:1 по центру, без ресемплинга
 ///   (пиксель в пиксель: текст ядра не мылится);
-/// * окно **меньше** — downscale с сохранением пропорций (nearest neighbour,
-///   целочисленная арифметика) и центрирование; края заливаются фоном темы;
-/// * **обрезки нет** никогда: вся поверхность сессии видна целиком.  Обрезка
-///   спрятала бы часть вывода shell'а (ячейки 8×18 px, окно на 900×600 почти
-///   всегда меньше типичного kernel-fb), а потерянный вывод хуже, чем
-///   потерянная строка пикселей;
+/// * окно **меньше** — downscale ровно в целое число раз (2×, 3×, …;
+///   nearest neighbour), по центру, поля заливаются фоном темы.  Дробный
+///   масштаб запрещён: на 1280×800 в окне 900×600 он давал 0.70 и штрихи
+///   шрифта 8×18 попадали между пикселями окна;
+/// * **обрезки нет** никогда: целый делитель выбран так, что весь кадр
+///   помещается в окно, а `blit_xrgb` читает всю поверхность (последний
+///   пиксель каждой строки/столбца — на своём месте);
 /// * **апскейла нет**: увеличение окна не растягивает кадр до мыла, а
 ///   показывает его 1:1 по центру.
+///
+/// Вырожденный случай — окно меньше одного пикселя поверхности после деления
+/// (например 800×1280 в 100×1): результат клампится к 1 px, блит показывает
+/// одну строку/столбец выборки.  Паники и деления на ноль нет.
 pub fn fit_placement(
     src_w: usize,
     src_h: usize,
@@ -447,16 +468,12 @@ pub fn fit_placement(
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return None;
     }
-    let (width, height) = if src_w <= dst_w && src_h <= dst_h {
-        (src_w, src_h)
-    } else if (src_w as u64) * (dst_h as u64) >= (src_h as u64) * (dst_w as u64) {
-        // Поверхность «шире» окна: упираемся в ширину.
-        let height = ((src_h as u64 * dst_w as u64) / src_w as u64) as usize;
-        (dst_w, height.clamp(1, dst_h))
-    } else {
-        let width = ((src_w as u64 * dst_h as u64) / src_h as u64) as usize;
-        (width.clamp(1, dst_w), dst_h)
-    };
+    let scale = integer_downscale(src_w, src_h, dst_w, dst_h);
+    // `src / scale <= dst` по построению `scale`; `min(dst)` — страховка от
+    // целочисленного округления на вырожденных размерах, а `max(1)` не даёт
+    // получить пустой прямоугольник.
+    let width = (src_w / scale).max(1).min(dst_w);
+    let height = (src_h / scale).max(1).min(dst_h);
     Some(FitPlacement {
         x: (dst_w - width) / 2,
         y: (dst_h - height) / 2,
@@ -474,9 +491,20 @@ pub struct FitPlacement {
     pub height: usize,
 }
 
+/// Индекс пикселя-источника для индекса `d` в окне.
+///
+/// Только целочисленное деление (floor): каждый пиксель окна копирует ровно
+/// один пиксель поверхности, смешения нет.  При точном целом делителе `n`
+/// (`dst_len == src_len / n`) это ровно `d * n`.
+fn sample_index(d: usize, src_len: usize, dst_len: usize) -> usize {
+    (d * src_len / dst_len).min(src_len.saturating_sub(1))
+}
+
 /// Блит XRGB-пикселей ядра в RGBA-канву окна.
 ///
 /// Байты в памяти — `B, G, R, X` (XRGB8888 little-endian, как формат 1 PDP/1).
+/// Масштаб — только целый (`fit_placement`): выборка nearest neighbour по
+/// целочисленному индексу, без фильтра и без дробной интерполяции.
 /// Источник короче объявленного `stride * height` — честная ошибка
 /// [`VtFbError::ShortRead`], а не «нарисуем что-нибудь».
 pub fn blit_xrgb(
@@ -492,10 +520,10 @@ pub fn blit_xrgb(
         return Ok(());
     }
     for dy in 0..place.height {
-        let sy = dy * src_h / place.height;
+        let sy = sample_index(dy, src_h, place.height);
         let row = sy.saturating_mul(stride);
         for dx in 0..place.width {
-            let sx = dx * src_w / place.width;
+            let sx = sample_index(dx, src_w, place.width);
             let index = row + sx * 4;
             let Some(pixel) = src.get(index..index + 4) else {
                 return Err(VtFbError::ShortRead {
@@ -1002,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn fit_placement_never_crops_and_never_upscales() {
+    fn fit_placement_is_one_to_one_when_the_window_fits() {
         // 1:1 (окно больше поверхности) — по центру, без растяжения.
         let place = fit_placement(640, 400, 900, 600).unwrap();
         assert_eq!(
@@ -1014,7 +1042,7 @@ mod tests {
                 height: 400
             }
         );
-        // Точно в размер — без смещений.
+        // Ровно в размер — без смещений и без масштаба.
         let place = fit_placement(640, 400, 640, 400).unwrap();
         assert_eq!(
             place,
@@ -1025,19 +1053,109 @@ mod tests {
                 height: 400
             }
         );
-        // Окно меньше: пропорциональный downscale, обе оси в пределах окна.
+        // 1280×800 в окне 1400×900: 1:1, поля по 60/50 px.
+        let place = fit_placement(1280, 800, 1400, 900).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (60, 50, 1280, 800)
+        );
+        // Широкое окно с запасом по высоте тоже 1:1, а не апскейл.
+        let place = fit_placement(640, 400, 1024, 768).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (192, 184, 640, 400)
+        );
+    }
+
+    #[test]
+    fn fit_placement_downscales_by_an_integer_factor_only() {
+        // 1280×800 в 900×600: дробный шаг был 0.70; целый — ровно 2×.
+        let place = fit_placement(1280, 800, 900, 600).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (130, 100, 640, 400)
+        );
+        // 1180×700 (штатное окно e2e) — тот же целый 2×, а не 0.92.
+        let place = fit_placement(1280, 800, 1180, 700).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (270, 150, 640, 400)
+        );
+        // 1024×768 в 900×600: 512×384 по центру.
         let place = fit_placement(1024, 768, 900, 600).unwrap();
-        assert!(place.width <= 900 && place.height <= 600);
-        assert_eq!(place.width, 800);
-        assert_eq!(place.height, 600);
-        assert_eq!(place.x, 50);
-        // Очень широкое окно: упираемся в высоту.
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (194, 108, 512, 384)
+        );
+        // Очень широкое окно: упираемся в высоту, делитель 3.
         let place = fit_placement(1000, 100, 400, 400).unwrap();
-        assert_eq!(place.height, 40);
-        assert_eq!(place.width, 400);
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (33, 183, 333, 33)
+        );
+        // Ровно вдвое меньшее окно — ровно 2×.
+        let place = fit_placement(1280, 800, 640, 400).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (0, 0, 640, 400)
+        );
+        // Вчетверо меньшее окно — ровно 4×.
+        let place = fit_placement(1280, 800, 320, 200).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (0, 0, 320, 200)
+        );
+    }
+
+    #[test]
+    fn fit_placement_never_upscales_never_crops_and_never_panics() {
         // Ноль с любой стороны — рисовать нечего, но не паника.
         assert!(fit_placement(0, 10, 10, 10).is_none());
         assert!(fit_placement(10, 10, 0, 10).is_none());
+        assert!(fit_placement(10, 0, 10, 10).is_none());
+        assert!(fit_placement(10, 10, 10, 0).is_none());
+
+        for &(sw, sh) in &[(1, 1), (16, 8), (640, 400), (1280, 800), (1024, 768)] {
+            for &(dw, dh) in &[
+                (1, 1),
+                (3, 2),
+                (100, 1),
+                (200, 150),
+                (640, 400),
+                (900, 600),
+                (1180, 700),
+                (1280, 800),
+                (1400, 900),
+                (4096, 4096),
+            ] {
+                let place = fit_placement(sw, sh, dw, dh).expect("non-zero sizes fit");
+                // Никогда не апскейл: кадр не больше поверхности.
+                assert!(place.width <= sw, "{sw}x{sh} in {dw}x{dh}: {place:?}");
+                assert!(place.height <= sh, "{sw}x{sh} in {dw}x{dh}: {place:?}");
+                // Никогда не кроп: кадр целиком внутри окна.
+                assert!(place.x + place.width <= dw, "{sw}x{sh} in {dw}x{dh}");
+                assert!(place.y + place.height <= dh, "{sw}x{sh} in {dw}x{dh}");
+                // Масштаб — либо 1:1, либо целый делитель, и он покрывает всю
+                // поверхность с точностью до округления вниз (< делителя).
+                if dw >= sw && dh >= sh {
+                    assert_eq!((place.width, place.height), (sw, sh));
+                } else {
+                    let scale = integer_downscale(sw, sh, dw, dh);
+                    assert!(scale >= 2, "{sw}x{sh} in {dw}x{dh}: scale {scale}");
+                    assert_eq!(place.width, (sw / scale).max(1).min(dw));
+                    assert_eq!(place.height, (sh / scale).max(1).min(dh));
+                    // Ни один пиксель поверхности не потерян незамеченным:
+                    // остаток меньше одного шага делителя.  Клампированный к
+                    // 1 px вырожденный случай сюда не входит по построению.
+                    if place.width > 1 {
+                        assert!(sw - place.width * scale < scale);
+                    }
+                    if place.height > 1 {
+                        assert!(sh - place.height * scale < scale);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1052,6 +1170,50 @@ mod tests {
         assert_eq!(canvas.pixel(2, 1), [0xFF, 0x00, 0x00, 255]);
         // Поля вокруг кадра остались фоном темы.
         assert_eq!(canvas.pixel(0, 0), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn blit_integer_downscale_is_nearest_neighbour_not_a_blend() {
+        // Поверхность 6×4, окно 3×2: ровно 2× по обеим осям.
+        let info = info(6, 4, 0);
+        // Каждый пиксель уникален: (r, g, b) = (x, y, 0), память B,G,R,X.
+        let mut src = vec![0u8; info.pixels_len()];
+        for y in 0..4usize {
+            for x in 0..6usize {
+                let i = (y * 6 + x) * 4;
+                src[i] = 0;
+                src[i + 1] = y as u8;
+                src[i + 2] = x as u8;
+            }
+        }
+        let mut canvas = Canvas::new(3, 2, crate::cell::Rgb(9, 9, 9));
+        let place = fit_placement(6, 4, 3, 2).unwrap();
+        assert_eq!((place.x, place.y, place.width, place.height), (0, 0, 3, 2));
+        blit_xrgb(&src, &info, &mut canvas, &place).unwrap();
+        // Выборка d * 2 по обеим осям, цвет источника без смешения.
+        for dy in 0..2 {
+            for dx in 0..3 {
+                assert_eq!(
+                    canvas.pixel(dx, dy),
+                    [(dx * 2) as u8, (dy * 2) as u8, 0, 255],
+                    "dest ({dx},{dy}) must copy source ({}, {}) verbatim",
+                    dx * 2,
+                    dy * 2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sample_index_maps_every_destination_pixel_into_the_source() {
+        assert_eq!(sample_index(0, 800, 400), 0);
+        assert_eq!(sample_index(399, 800, 400), 798);
+        // Нецелый делитель: floor-шаг, но всегда внутри источника.
+        for d in 0..1000usize {
+            assert!(sample_index(d, 1280, 426) < 1280);
+            assert!(sample_index(d, 800, 100) < 800);
+        }
+        assert_eq!(sample_index(999, 800, 100), 799);
     }
 
     #[test]

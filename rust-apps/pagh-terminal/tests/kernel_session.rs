@@ -262,6 +262,54 @@ fn a_small_window_shows_the_whole_frame_scaled_down() {
 }
 
 #[test]
+fn a_1280x800_surface_in_a_small_window_uses_an_integer_two_times_fit() {
+    // Регрессия FIX #1: раньше 1280×800 в окне 900×600 сжимались дробно
+    // (0.70), и штрихи 8×18-шрифта попадали между пикселями окна.  Теперь —
+    // ровно 2× (640×400) по центру, поля — фон темы, кадр не обрезан.
+    let surface = (0x33, 0x44, 0x55);
+    let fb = MockFb::new(info(1280, 800, 1), surface);
+    let mut frame = KernelFrame::open(fb).expect("open");
+    let theme = Theme::default();
+    let mut canvas = Canvas::new(900, 600, theme.bg);
+    assert_eq!(
+        frame.draw_if_changed(&mut canvas, &theme).unwrap(),
+        Draw::Drawn { generation: 1 }
+    );
+    let place = fit_placement(1280, 800, 900, 600).unwrap();
+    assert_eq!(
+        place,
+        FitPlacement {
+            x: 130,
+            y: 100,
+            width: 640,
+            height: 400
+        },
+        "small window must use the integer 2x fit, not a fractional scale"
+    );
+    let bg = [theme.bg.0, theme.bg.1, theme.bg.2, 255];
+    let fg = [surface.0, surface.1, surface.2, 255];
+    // Углы кадра — пиксели поверхности.
+    for (x, y) in [
+        (place.x, place.y),
+        (place.x + place.width - 1, place.y),
+        (place.x, place.y + place.height - 1),
+        (place.x + place.width - 1, place.y + place.height - 1),
+    ] {
+        assert_eq!(canvas.pixel(x, y), fg, "surface pixel at ({x},{y})");
+    }
+    // Letterbox слева/справа/сверху/снизу — фон темы, ни одного пикселя
+    // поверхности за пределами 640×400.
+    for (x, y) in [
+        (place.x - 1, place.y + place.height / 2),
+        (place.x + place.width, place.y + place.height / 2),
+        (place.x + place.width / 2, place.y - 1),
+        (place.x + place.width / 2, place.y + place.height),
+    ] {
+        assert_eq!(canvas.pixel(x, y), bg, "letterbox at ({x},{y})");
+    }
+}
+
+#[test]
 fn session_end_is_reported_honestly_and_not_masked() {
     let mut fb = MockFb::new(info(2, 2, 1), (0, 0, 0));
     fb.failure = Some("ended");
