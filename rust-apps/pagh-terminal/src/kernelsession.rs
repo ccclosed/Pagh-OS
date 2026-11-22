@@ -44,11 +44,15 @@
 //! * клиент не наблюдает DEC-режимы (пиксели не говорят, хочет ли сессия
 //!   application-cursor keys), поэтому стрелки кодируются в normal-режиме
 //!   (`KeyModes::default()`), как kernel-shell и ожидает;
-//! * scrollback и selection остаются в ядре: колесо и протяжка мышью в окно не
-//!   транслируются;
-//! * downscale — только целочисленный (nearest neighbour, без фильтра и без
-//!   дробного шага): дробный шаг ставит штрихи шрифта между пикселями окна и
-//!   делает текст нечитаемым.  Выбор политики см. [`fit_placement`].
+//! * scrollback и selection остаются в ядре: протяжка мышью в окно не
+//!   транслируется, а колесо при 1:1-вьюпорте прокручивает сам вьюпорт (см.
+//!   [`View`]); kernel-scrollback остаётся на PageUp/PageDown в shell'е;
+//! * по умолчанию показ **1:1**: окно меньше поверхности — не дробный
+//!   downscale, а полноразмерный вьюпорт с прокруткой (колесо,
+//!   `Ctrl+Shift`+стрелки/PageUp/PageDown/Home/End).  Целочисленный
+//!   зум-обзор (2×, 3×, …) — необязательный режим (`--scale 2`,
+//!   `Ctrl+Shift+Z`); дробного масштаба нет нигде — он ставил штрихи шрифта
+//!   между пикселями окна и делал текст нечитаемым.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -57,6 +61,7 @@ use std::path::{Path, PathBuf};
 
 use crate::font::{CELL_H, CELL_W};
 use crate::keys::{self, KeyModes};
+use crate::protocol::mods;
 use crate::render::{render_screen_into, Canvas, RenderOptions, Theme, VIEWPORT_PADDING};
 use crate::Terminal;
 
@@ -440,25 +445,44 @@ fn integer_downscale(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> 
     by_w.max(by_h).max(1)
 }
 
-/// Раскладка кадра сессии внутри окна: `dst`-прямоугольник и его смещение.
+/// Раскладка кадра сессии внутри окна: `dst`-прямоугольник и его источник.
 ///
-/// Политика (одна, документированная, без «умных» эвристик):
+/// `src_*` — вырез поверхности, который попал в `(x, y, width, height)`.
+/// Для 1:1-вьюпорта это окно-размерный вырез с `src_width == width`
+/// (сдвиг `src_x/src_y` — прокрутка), для целочисленного зума — вся
+/// поверхность (`src_width/src_height == info.width/height`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FitPlacement {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    /// Левый верхний пиксель поверхности, показанный в `(x, y)`.
+    pub src_x: usize,
+    pub src_y: usize,
+    /// Размер выреза поверхности, отображённого в `width × height`.
+    pub src_width: usize,
+    pub src_height: usize,
+}
+
+/// Как окно показывает поверхность сессии.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScaleMode {
+    /// **По умолчанию:** 1:1 пиксель в пиксель.  Если окно меньше поверхности,
+    /// виден вьюпорт размером с окно, который прокручивается (`View::pan_by`),
+    /// а не сжимается дробно: текст остаётся полноразмерным и читаемым.
+    #[default]
+    OneToOne,
+    /// Необязательный обзор: вся поверхность целиком, но только в целое
+    /// число раз меньше (2×, 3×, …).  Дробного шага нет и здесь.
+    Integer,
+}
+
+/// Раскладка всего кадра при целочисленном зуме ([`ScaleMode::Integer`]).
 ///
-/// * окно **не меньше** поверхности — блит 1:1 по центру, без ресемплинга
-///   (пиксель в пиксель: текст ядра не мылится);
-/// * окно **меньше** — downscale ровно в целое число раз (2×, 3×, …;
-///   nearest neighbour), по центру, поля заливаются фоном темы.  Дробный
-///   масштаб запрещён: на 1280×800 в окне 900×600 он давал 0.70 и штрихи
-///   шрифта 8×18 попадали между пикселями окна;
-/// * **обрезки нет** никогда: целый делитель выбран так, что весь кадр
-///   помещается в окно, а `blit_xrgb` читает всю поверхность (последний
-///   пиксель каждой строки/столбца — на своём месте);
-/// * **апскейла нет**: увеличение окна не растягивает кадр до мыла, а
-///   показывает его 1:1 по центру.
-///
-/// Вырожденный случай — окно меньше одного пикселя поверхности после деления
-/// (например 800×1280 в 100×1): результат клампится к 1 px, блит показывает
-/// одну строку/столбец выборки.  Паники и деления на ноль нет.
+/// Поверхность влезает целиком: `src = (0, 0, src_w, src_h)`, окно получает
+/// уменьшенный в целое число раз кадр по центру.  Дробного масштаба нет:
+/// именно он ставил штрихи шрифта 8×18 между пикселями окна.
 pub fn fit_placement(
     src_w: usize,
     src_h: usize,
@@ -479,16 +503,209 @@ pub fn fit_placement(
         y: (dst_h - height) / 2,
         width,
         height,
+        src_x: 0,
+        src_y: 0,
+        src_width: src_w,
+        src_height: src_h,
     })
 }
 
-/// Прямоугольник вывода кадра в окне (см. [`fit_placement`]).
+/// Максимальная прокрутка 1:1-вьюпорта по каждой оси (0 — ось помещается).
+fn max_scroll(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> (usize, usize) {
+    (src_w.saturating_sub(dst_w), src_h.saturating_sub(dst_h))
+}
+
+/// Прокрутка, прижатая к допустимому диапазону для текущей геометрии.
+fn clamp_scroll(
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    scroll_x: usize,
+    scroll_y: usize,
+) -> (usize, usize) {
+    let (max_x, max_y) = max_scroll(src_w, src_h, dst_w, dst_h);
+    (scroll_x.min(max_x), scroll_y.min(max_y))
+}
+
+/// Состояние показа поверхности клиентом: режим плюс прокрутка 1:1-вьюпорта.
+///
+/// Живёт целиком в клиенте: ядро по-прежнему владеет поверхностью размером с
+/// экран и ничего не знает про окно/прокрутку (ABI `/dev/vtfb1` не меняется).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct View {
+    mode: ScaleMode,
+    scroll_x: usize,
+    scroll_y: usize,
+}
+
+impl View {
+    pub fn mode(&self) -> ScaleMode {
+        self.mode
+    }
+
+    /// Текущая прокрутка в пикселях поверхности.
+    pub fn scroll(&self) -> (usize, usize) {
+        (self.scroll_x, self.scroll_y)
+    }
+
+    /// Сменить режим; прокрутка сбрасывается (целочисленный зум показывает
+    /// весь кадр, а после возврата к 1:1 начинать с левого верхнего угла —
+    /// предсказуемо).
+    pub fn set_mode(&mut self, mode: ScaleMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.scroll_x = 0;
+            self.scroll_y = 0;
+        }
+    }
+
+    /// Прижать прокрутку к новой геометрии (resize окна или поверхности).
+    ///
+    /// Это и есть «re-clamp после resize»: окно выросло — лишняя прокрутка
+    /// снимается; окно стало не меньше поверхности — смещение обнуляется.
+    pub fn reclamp(&mut self, src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) {
+        if self.mode == ScaleMode::Integer {
+            self.scroll_x = 0;
+            self.scroll_y = 0;
+            return;
+        }
+        let (x, y) = clamp_scroll(src_w, src_h, dst_w, dst_h, self.scroll_x, self.scroll_y);
+        self.scroll_x = x;
+        self.scroll_y = y;
+    }
+
+    /// Раскладка кадра для текущего режима и геометрии.
+    ///
+    /// 1:1: вырез `min(surface, window)` по каждой оси, центрированный по той
+    /// оси, где поверхность меньше окна; прокрутка прижата к диапазону.
+    /// Integer: вся поверхность через [`fit_placement`] (целый делитель).
+    pub fn placement(
+        &self,
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> Option<FitPlacement> {
+        if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+            return None;
+        }
+        if self.mode == ScaleMode::Integer {
+            return fit_placement(src_w, src_h, dst_w, dst_h);
+        }
+        let view_w = src_w.min(dst_w);
+        let view_h = src_h.min(dst_h);
+        let (src_x, src_y) = clamp_scroll(src_w, src_h, dst_w, dst_h, self.scroll_x, self.scroll_y);
+        Some(FitPlacement {
+            x: (dst_w - view_w) / 2,
+            y: (dst_h - view_h) / 2,
+            width: view_w,
+            height: view_h,
+            src_x,
+            src_y,
+            src_width: view_w,
+            src_height: view_h,
+        })
+    }
+
+    /// Прокрутить 1:1-вьюпорт на `dx`/`dy` пикселей поверхности.
+    ///
+    /// Возвращает `true`, если смещение действительно изменилось.  В режиме
+    /// [`ScaleMode::Integer`] прокрутки нет (весь кадр виден целиком) —
+    /// всегда `false`, чтобы вызывающий не перерисовывал кадр зря.
+    pub fn pan_by(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> bool {
+        if self.mode == ScaleMode::Integer || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+            return false;
+        }
+        let (max_x, max_y) = max_scroll(src_w, src_h, dst_w, dst_h);
+        let x = (self.scroll_x as i64 + dx as i64).clamp(0, max_x as i64) as usize;
+        let y = (self.scroll_y as i64 + dy as i64).clamp(0, max_y as i64) as usize;
+        let changed = (x, y) != (self.scroll_x, self.scroll_y);
+        self.scroll_x = x;
+        self.scroll_y = y;
+        changed
+    }
+
+    /// Прокрутить вьюпорт в абсолютную позицию (Home/End), прижатую к краям.
+    pub fn pan_to(
+        &mut self,
+        x: usize,
+        y: usize,
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> bool {
+        if self.mode == ScaleMode::Integer || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+            return false;
+        }
+        let (x, y) = clamp_scroll(src_w, src_h, dst_w, dst_h, x, y);
+        let changed = (x, y) != (self.scroll_x, self.scroll_y);
+        self.scroll_x = x;
+        self.scroll_y = y;
+        changed
+    }
+}
+
+/// Сколько пикселей поверхности прокручивает один щелчок колеса.
+///
+/// Колесо в этом окне прокручивает **вьюпорт** (поверхность ядра больше
+/// окна), а не kernel-scrollback: без этого увидеть правую/нижнюю часть
+/// кадра было бы нечем.  Шаг — три клетки, как в обычном терминале.
+pub const WHEEL_PAN_X: i32 = 3 * CELL_W as i32;
+/// Вертикальный шаг колеса в пикселях поверхности.
+pub const WHEEL_PAN_Y: i32 = 3 * CELL_H as i32;
+
+/// Шаг прокрутки 1:1-вьюпорта, запрошенный клавиатурой.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FitPlacement {
-    pub x: usize,
-    pub y: usize,
-    pub width: usize,
-    pub height: usize,
+pub enum PanStep {
+    Left,
+    Right,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+/// `Ctrl+Shift+…` → прокрутка вьюпорта; `None` — клавиша уходит shell'у.
+///
+/// Простые стрелки/PageUp/PageDown остаются у shell'а (редактирование строки,
+/// history, kernel-scrollback): перехват без модификатора сломал бы ввод.
+/// Поэтому панорама окна — только с `Ctrl+Shift`, а `Ctrl+Shift+Z` — переключение
+/// 1:1 ↔ целочисленный обзор ([`zoom_toggle_key`]).
+pub fn pan_step_for_key(code: u32, pressed: bool, modifiers: u32) -> Option<PanStep> {
+    if !pressed || modifiers & (mods::CTRL | mods::SHIFT) != (mods::CTRL | mods::SHIFT) {
+        return None;
+    }
+    use keys::evdev as key;
+    match code {
+        key::KEY_LEFT => Some(PanStep::Left),
+        key::KEY_RIGHT => Some(PanStep::Right),
+        key::KEY_UP => Some(PanStep::Up),
+        key::KEY_DOWN => Some(PanStep::Down),
+        key::KEY_PAGEUP => Some(PanStep::PageUp),
+        key::KEY_PAGEDOWN => Some(PanStep::PageDown),
+        key::KEY_HOME => Some(PanStep::Home),
+        key::KEY_END => Some(PanStep::End),
+        _ => None,
+    }
+}
+
+/// `Ctrl+Shift+Z` — переключить 1:1 ↔ целочисленный зум-обзор.
+pub fn zoom_toggle_key(code: u32, pressed: bool, modifiers: u32) -> bool {
+    pressed
+        && code == keys::evdev::KEY_Z
+        && modifiers & (mods::CTRL | mods::SHIFT) == (mods::CTRL | mods::SHIFT)
 }
 
 /// Индекс пикселя-источника для индекса `d` в окне.
@@ -503,8 +720,10 @@ fn sample_index(d: usize, src_len: usize, dst_len: usize) -> usize {
 /// Блит XRGB-пикселей ядра в RGBA-канву окна.
 ///
 /// Байты в памяти — `B, G, R, X` (XRGB8888 little-endian, как формат 1 PDP/1).
-/// Масштаб — только целый (`fit_placement`): выборка nearest neighbour по
-/// целочисленному индексу, без фильтра и без дробной интерполяции.
+/// Масштаб — только целый (`fit_placement`/1:1-вьюпорт): выборка nearest
+/// neighbour по целочисленному индексу, без фильтра и без дробной
+/// интерполяции.  `place.src_*` задаёт вырез поверхности: для 1:1 это
+/// прокрученное окно-размерное окно, для Integer — вся поверхность.
 /// Источник короче объявленного `stride * height` — честная ошибка
 /// [`VtFbError::ShortRead`], а не «нарисуем что-нибудь».
 pub fn blit_xrgb(
@@ -513,17 +732,15 @@ pub fn blit_xrgb(
     canvas: &mut Canvas,
     place: &FitPlacement,
 ) -> Result<(), VtFbError> {
-    let src_w = info.width as usize;
-    let src_h = info.height as usize;
     let stride = info.stride as usize;
     if place.width == 0 || place.height == 0 {
         return Ok(());
     }
     for dy in 0..place.height {
-        let sy = sample_index(dy, src_h, place.height);
+        let sy = place.src_y + sample_index(dy, place.src_height, place.height);
         let row = sy.saturating_mul(stride);
         for dx in 0..place.width {
-            let sx = sample_index(dx, src_w, place.width);
+            let sx = place.src_x + sample_index(dx, place.src_width, place.width);
             let index = row + sx * 4;
             let Some(pixel) = src.get(index..index + 4) else {
                 return Err(VtFbError::ShortRead {
@@ -563,6 +780,10 @@ pub struct KernelFrame<S: FrameSource> {
     info: VtFbInfo,
     last_generation: Option<u64>,
     full: bool,
+    /// Размер клиентской области окна (content rect) для 1:1-вьюпорта.
+    window: (usize, usize),
+    /// Режим показа + прокрутка; целиком клиентское состояние.
+    view: View,
 }
 
 impl<S: FrameSource> KernelFrame<S> {
@@ -574,11 +795,124 @@ impl<S: FrameSource> KernelFrame<S> {
             info,
             last_generation: None,
             full: true,
+            window: (0, 0),
+            view: View::default(),
         })
     }
 
     pub fn info(&self) -> VtFbInfo {
         self.info
+    }
+
+    /// Текущий режим показа (1:1 или целочисленный зум).
+    pub fn view(&self) -> View {
+        self.view
+    }
+
+    /// Размер окна, под который сейчас считается раскладка.
+    pub fn window_size(&self) -> (usize, usize) {
+        self.window
+    }
+
+    /// Переключить режим показа; следующий кадр перерисовывается полностью.
+    pub fn set_view_mode(&mut self, mode: ScaleMode) {
+        self.view.set_mode(mode);
+        self.invalidate();
+    }
+
+    /// Переключить 1:1 ↔ целочисленный зум; возвращает новый режим.
+    pub fn toggle_view_mode(&mut self) -> ScaleMode {
+        let next = match self.view.mode() {
+            ScaleMode::OneToOne => ScaleMode::Integer,
+            ScaleMode::Integer => ScaleMode::OneToOne,
+        };
+        self.set_view_mode(next);
+        next
+    }
+
+    /// Сообщить новый размер окна (`configure`/resize).
+    ///
+    /// Прокрутка прижимается к новой геометрии: выросшее окно отдаёт лишнее
+    /// смещение, окно не меньше поверхности сбрасывает его в ноль.  Следующий
+    /// `draw_if_changed` блитит полный кадр.
+    pub fn set_window(&mut self, width: usize, height: usize) {
+        self.window = (width, height);
+        self.view.reclamp(
+            self.info.width as usize,
+            self.info.height as usize,
+            width,
+            height,
+        );
+        self.invalidate();
+    }
+
+    /// Раскладка для текущего размера окна (для указателя/тестов).
+    pub fn placement(&self) -> Option<FitPlacement> {
+        self.view.placement(
+            self.info.width as usize,
+            self.info.height as usize,
+            self.window.0,
+            self.window.1,
+        )
+    }
+
+    /// Есть ли что прокручивать: поверхность больше окна хотя бы по одной оси
+    /// и режим — 1:1.
+    pub fn pannable(&self) -> bool {
+        self.view.mode() == ScaleMode::OneToOne
+            && (self.info.width as usize > self.window.0
+                || self.info.height as usize > self.window.1)
+    }
+
+    /// Прокрутить 1:1-вьюпорт; `true` — перерисовать кадр.
+    pub fn pan_by(&mut self, dx: i32, dy: i32) -> bool {
+        let changed = self.view.pan_by(
+            dx,
+            dy,
+            self.info.width as usize,
+            self.info.height as usize,
+            self.window.0,
+            self.window.1,
+        );
+        if changed {
+            self.invalidate();
+        }
+        changed
+    }
+
+    /// Прокрутить 1:1-вьюпорт в абсолютную позицию (Home/End).
+    pub fn pan_to(&mut self, x: usize, y: usize) -> bool {
+        let changed = self.view.pan_to(
+            x,
+            y,
+            self.info.width as usize,
+            self.info.height as usize,
+            self.window.0,
+            self.window.1,
+        );
+        if changed {
+            self.invalidate();
+        }
+        changed
+    }
+
+    /// Применить клавиатурный шаг прокрутки 1:1-вьюпорта.
+    ///
+    /// Стрелки — одна клетка, PageUp/PageDown — почти весь видимый рост,
+    /// Home/End — край поверхности.  `true` — кадр изменился и его надо
+    /// перерисовать.
+    pub fn pan_step(&mut self, step: PanStep) -> bool {
+        let page_y = self.window.1.saturating_sub(CELL_H).max(CELL_H) as i32;
+        match step {
+            PanStep::Left => self.pan_by(-(CELL_W as i32), 0),
+            PanStep::Right => self.pan_by(CELL_W as i32, 0),
+            PanStep::Up => self.pan_by(0, -(CELL_H as i32)),
+            PanStep::Down => self.pan_by(0, CELL_H as i32),
+            PanStep::PageUp => self.pan_by(0, -page_y),
+            PanStep::PageDown => self.pan_by(0, page_y),
+            PanStep::Home => self.pan_to(0, 0),
+            PanStep::End => self.pan_to(usize::MAX, usize::MAX),
+        }
     }
 
     /// Забыть generation: следующий кадр блитится полностью (ресайз окна,
@@ -601,6 +935,14 @@ impl<S: FrameSource> KernelFrame<S> {
         self.last_generation = None;
         self.full = true;
         self.info = self.source.poll()?;
+        // Новая сессия может сообщить другую геометрию: прокрутка не должна
+        // выйти за её границы.
+        self.view.reclamp(
+            self.info.width as usize,
+            self.info.height as usize,
+            self.window.0,
+            self.window.1,
+        );
         Ok(self.info)
     }
 
@@ -611,10 +953,24 @@ impl<S: FrameSource> KernelFrame<S> {
         theme: &Theme,
     ) -> Result<Draw, VtFbError> {
         let info = self.source.poll()?;
+        // Окно могло измениться без `set_window` (первый кадр, прямой вызов):
+        // раскладка обязана считаться от фактического холста, а прокрутка —
+        // прижиматься к нему.
+        let window = (canvas.width, canvas.height);
+        if window != self.window {
+            self.window = window;
+            self.view.reclamp(
+                info.width as usize,
+                info.height as usize,
+                window.0,
+                window.1,
+            );
+            self.full = true;
+        }
         if !self.full && Some(info.generation) == self.last_generation && info == self.info {
             return Ok(Draw::Unchanged);
         }
-        let Some(place) = fit_placement(
+        let Some(place) = self.view.placement(
             info.width as usize,
             info.height as usize,
             canvas.width,
@@ -770,10 +1126,14 @@ pub fn wheel_from_axis(vertical: i32) -> i32 {
 
 /// Координаты окна (content rect) → пиксели поверхности сессии.
 ///
-/// Обратное к [`blit_xrgb`]: окно показывает `place`-прямоугольник поверхности,
-/// поэтому `sx = (x - place.x) * src_w / place.width`. Точки в letterbox'е
-/// (полях) прижимаются к краю: колесо/клик в поле не должны уводить указатель
-/// сессии за поверхность. Нулевые размеры (сессия без кадра) дают `(0, 0)`.
+/// Обратное к [`blit_xrgb`]: окно показывает `place`-вырез поверхности
+/// (`src_x/src_y`, `src_width/src_height`), поэтому
+/// `sx = src_x + (x - place.x) * src_width / place.width`.  Для 1:1-вьюпорта
+/// `src_width == width`, то есть `sx = src_x + (x - place.x)` — клик попадает
+/// ровно в тот пиксель, который виден.  Точки в letterbox'е (полях)
+/// прижимаются к краю видимого выреза, а результат — к границам поверхности:
+/// колесо/клик в поле не должны уводить указатель сессии за поверхность.
+/// Нулевые размеры (сессия без кадра) дают `(0, 0)`.
 pub fn window_to_surface(x: i32, y: i32, info: &VtFbInfo, place: &FitPlacement) -> (i32, i32) {
     let src_w = info.width as i64;
     let src_h = info.height as i64;
@@ -782,8 +1142,8 @@ pub fn window_to_surface(x: i32, y: i32, info: &VtFbInfo, place: &FitPlacement) 
     }
     let rel_x = (x - place.x as i32).clamp(0, place.width.saturating_sub(1) as i32) as i64;
     let rel_y = (y - place.y as i32).clamp(0, place.height.saturating_sub(1) as i32) as i64;
-    let sx = rel_x * src_w / place.width as i64;
-    let sy = rel_y * src_h / place.height as i64;
+    let sx = place.src_x as i64 + rel_x * place.src_width as i64 / place.width as i64;
+    let sy = place.src_y as i64 + rel_y * place.src_height as i64 / place.height as i64;
     (sx.clamp(0, src_w - 1) as i32, sy.clamp(0, src_h - 1) as i32)
 }
 
@@ -1034,24 +1394,23 @@ mod tests {
         // 1:1 (окно больше поверхности) — по центру, без растяжения.
         let place = fit_placement(640, 400, 900, 600).unwrap();
         assert_eq!(
-            place,
-            FitPlacement {
-                x: 130,
-                y: 100,
-                width: 640,
-                height: 400
-            }
+            (
+                place.x,
+                place.y,
+                place.width,
+                place.height,
+                place.src_x,
+                place.src_y,
+                place.src_width,
+                place.src_height
+            ),
+            (130, 100, 640, 400, 0, 0, 640, 400)
         );
         // Ровно в размер — без смещений и без масштаба.
         let place = fit_placement(640, 400, 640, 400).unwrap();
         assert_eq!(
-            place,
-            FitPlacement {
-                x: 0,
-                y: 0,
-                width: 640,
-                height: 400
-            }
+            (place.x, place.y, place.width, place.height),
+            (0, 0, 640, 400)
         );
         // 1280×800 в окне 1400×900: 1:1, поля по 60/50 px.
         let place = fit_placement(1280, 800, 1400, 900).unwrap();
@@ -1156,6 +1515,224 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn view_defaults_to_full_size_one_to_one_viewport() {
+        let view = View::default();
+        assert_eq!(view.mode(), ScaleMode::OneToOne);
+        let place = view.placement(1280, 800, 900, 600).unwrap();
+        // Окно целиком занято 1:1-вырезом: пиксель в пиксель, без масштаба.
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (0, 0, 900, 600)
+        );
+        assert_eq!(
+            (place.src_x, place.src_y, place.src_width, place.src_height),
+            (0, 0, 900, 600)
+        );
+        // 1:1: вырез не растягивается/сжимается.
+        assert_eq!(place.src_width, place.width);
+        assert_eq!(place.src_height, place.height);
+    }
+
+    #[test]
+    fn view_one_to_one_pans_and_clamps_to_surface_bounds() {
+        let mut view = View::default();
+        assert!(view.pan_by(100, 100, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (100, 100));
+        // Нулевая дельта не меняет кадр (нечего перерисовывать).
+        assert!(!view.pan_by(0, 0, 1280, 800, 900, 600));
+        // Дальше края поверхности прокрутка не уходит.
+        assert!(view.pan_by(10_000, 10_000, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (380, 200));
+        let place = view.placement(1280, 800, 900, 600).unwrap();
+        assert_eq!((place.src_x, place.src_y), (380, 200));
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (0, 0, 900, 600)
+        );
+        // Назад к левому верхнему углу.
+        assert!(view.pan_by(-10_000, -10_000, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (0, 0));
+    }
+
+    #[test]
+    fn view_centers_axes_that_fit_inside_the_window() {
+        // Окно шире поверхности, но ниже: по X кадр целиком и по центру,
+        // по Y — прокручиваемый 1:1-вырез.
+        let mut view = View::default();
+        assert!(view.pan_by(0, 100, 1280, 800, 1400, 700));
+        let place = view.placement(1280, 800, 1400, 700).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (60, 0, 1280, 700)
+        );
+        assert_eq!(
+            (place.src_x, place.src_y, place.src_width, place.src_height),
+            (0, 100, 1280, 700)
+        );
+        // По X прокрутки нет — дельта игнорируется, кадр не трогается.
+        assert!(!view.pan_by(100, 0, 1280, 800, 1400, 700));
+
+        // Окно выше поверхности, но уже: по Y целиком и по центру, по X — вырез.
+        let mut view = View::default();
+        assert!(view.pan_by(100, 0, 1280, 800, 900, 900));
+        let place = view.placement(1280, 800, 900, 900).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (0, 50, 900, 800)
+        );
+        assert_eq!((place.src_x, place.src_y), (100, 0));
+    }
+
+    #[test]
+    fn view_resize_reclamps_scroll_and_recenters_when_the_surface_fits() {
+        let mut view = View::default();
+        assert!(view.pan_by(10_000, 10_000, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (380, 200));
+        // Окно выросло: лишняя прокрутка снимается.
+        view.reclamp(1280, 800, 1180, 700);
+        assert_eq!(view.scroll(), (100, 100));
+        // Окно не меньше поверхности: смещение обнуляется, кадр по центру.
+        view.reclamp(1280, 800, 1400, 900);
+        assert_eq!(view.scroll(), (0, 0));
+        let place = view.placement(1280, 800, 1400, 900).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (60, 50, 1280, 800)
+        );
+        assert_eq!(
+            (place.src_x, place.src_y, place.src_width, place.src_height),
+            (0, 0, 1280, 800)
+        );
+    }
+
+    #[test]
+    fn view_integer_mode_is_optional_and_has_no_scroll() {
+        let mut view = View::default();
+        view.set_mode(ScaleMode::Integer);
+        assert_eq!(view.mode(), ScaleMode::Integer);
+        let place = view.placement(1280, 800, 900, 600).unwrap();
+        assert_eq!(
+            (place.x, place.y, place.width, place.height),
+            (130, 100, 640, 400)
+        );
+        assert_eq!(
+            (place.src_x, place.src_y, place.src_width, place.src_height),
+            (0, 0, 1280, 800)
+        );
+        // В зум-обзоре весь кадр виден целиком: прокрутки нет.
+        assert!(!view.pan_by(100, 100, 1280, 800, 900, 600));
+        assert!(!view.pan_to(100, 100, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (0, 0));
+        // Возврат к 1:1 начинается с левого верхнего угла.
+        view.set_mode(ScaleMode::OneToOne);
+        assert_eq!(view.placement(1280, 800, 900, 600).unwrap().src_x, 0);
+        assert_eq!(view.scroll(), (0, 0));
+    }
+
+    #[test]
+    fn blit_one_to_one_viewport_copies_pixels_at_the_scroll_offset() {
+        // Поверхность 8×6 с уникальным цветом на пиксель; окно 4×3,
+        // прокрученное в (2, 1).  Пиксель окна обязан быть ровно пикселем
+        // поверхности, без масштаба и смешения.
+        let info = info(8, 6, 0);
+        let mut src = vec![0u8; info.pixels_len()];
+        for y in 0..6usize {
+            for x in 0..8usize {
+                let i = (y * 8 + x) * 4;
+                src[i] = 0;
+                src[i + 1] = y as u8;
+                src[i + 2] = x as u8;
+            }
+        }
+        let mut view = View::default();
+        assert!(view.pan_by(2, 1, 8, 6, 4, 3));
+        let place = view.placement(8, 6, 4, 3).unwrap();
+        assert_eq!((place.x, place.y, place.width, place.height), (0, 0, 4, 3));
+        assert_eq!(
+            (place.src_x, place.src_y, place.src_width, place.src_height),
+            (2, 1, 4, 3)
+        );
+        let mut canvas = Canvas::new(4, 3, crate::cell::Rgb(9, 9, 9));
+        blit_xrgb(&src, &info, &mut canvas, &place).unwrap();
+        for dy in 0..3 {
+            for dx in 0..4 {
+                assert_eq!(
+                    canvas.pixel(dx, dy),
+                    [(2 + dx) as u8, (1 + dy) as u8, 0, 255],
+                    "dest ({dx},{dy}) must copy source ({}, {})",
+                    2 + dx,
+                    1 + dy
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn window_to_surface_follows_the_viewport_offset() {
+        let info = info(1280, 800, 0);
+        let mut view = View::default();
+        assert!(view.pan_by(200, 100, 1280, 800, 900, 600));
+        let place = view.placement(1280, 800, 900, 600).unwrap();
+        assert_eq!(window_to_surface(0, 0, &info, &place), (200, 100));
+        assert_eq!(window_to_surface(899, 599, &info, &place), (1099, 699));
+        // Поле по центрированной оси прижимается к краю выреза.
+        let place = View::default().placement(1280, 800, 1400, 700).unwrap();
+        assert_eq!(window_to_surface(60, 0, &info, &place), (0, 0));
+        assert_eq!(window_to_surface(0, 0, &info, &place), (0, 0));
+    }
+
+    #[test]
+    fn pan_keys_require_ctrl_shift_and_cover_the_viewport() {
+        use crate::keys::evdev as key;
+        let both = mods::CTRL | mods::SHIFT;
+        assert_eq!(
+            pan_step_for_key(key::KEY_LEFT, true, both),
+            Some(PanStep::Left)
+        );
+        assert_eq!(
+            pan_step_for_key(key::KEY_RIGHT, true, both),
+            Some(PanStep::Right)
+        );
+        assert_eq!(pan_step_for_key(key::KEY_UP, true, both), Some(PanStep::Up));
+        assert_eq!(
+            pan_step_for_key(key::KEY_DOWN, true, both),
+            Some(PanStep::Down)
+        );
+        assert_eq!(
+            pan_step_for_key(key::KEY_PAGEUP, true, both),
+            Some(PanStep::PageUp)
+        );
+        assert_eq!(
+            pan_step_for_key(key::KEY_PAGEDOWN, true, both),
+            Some(PanStep::PageDown)
+        );
+        assert_eq!(
+            pan_step_for_key(key::KEY_HOME, true, both),
+            Some(PanStep::Home)
+        );
+        assert_eq!(
+            pan_step_for_key(key::KEY_END, true, both),
+            Some(PanStep::End)
+        );
+        // Без Ctrl+Shift клавиши принадлежат shell'у — не перехватываем.
+        assert_eq!(pan_step_for_key(key::KEY_LEFT, true, mods::CTRL), None);
+        assert_eq!(pan_step_for_key(key::KEY_LEFT, true, mods::SHIFT), None);
+        assert_eq!(pan_step_for_key(key::KEY_LEFT, false, both), None);
+        // Не-панорамная клавиша с теми же модификаторами не перехватывается.
+        assert_eq!(pan_step_for_key(key::KEY_A, true, both), None);
+    }
+
+    #[test]
+    fn zoom_toggle_is_ctrl_shift_z() {
+        let both = mods::CTRL | mods::SHIFT;
+        assert!(zoom_toggle_key(keys::evdev::KEY_Z, true, both));
+        assert!(!zoom_toggle_key(keys::evdev::KEY_Z, false, both));
+        assert!(!zoom_toggle_key(keys::evdev::KEY_Z, true, mods::CTRL));
+        assert!(!zoom_toggle_key(keys::evdev::KEY_Z, true, mods::SHIFT));
+        assert!(!zoom_toggle_key(keys::evdev::KEY_A, true, both));
     }
 
     #[test]
