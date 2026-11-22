@@ -296,3 +296,196 @@ fn live_pointer_selection_keeps_fastfetch_glyphs_and_colours() {
 
     let _ = std::fs::remove_dir_all(&shots);
 }
+
+/// Whole-area selection через живой указатель: протяжка от верхней клетки
+/// контента до нижней — это жест «выделить весь терминал», и он обязан
+/// превратиться в `SelectionMode::Area`, а не обрезаться по колонкам
+/// нажатия/отпускания.
+///
+/// Проверяем на настоящем кадре композитора: подсветка есть в *каждой* клетке
+/// сетки, включая пустые строки под fastfetch, логотип сохранил свой цвет
+/// байт-в-байт, а множество цветов глифов не выродилось в один серый.
+#[test]
+fn live_whole_area_drag_selects_every_cell_without_greying() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fastfetch-guest.script");
+    let (cols, rows) = layout(CONTENT.0, CONTENT.1);
+    assert!(rows > 14, "окно слишком низкое для fastfetch-вывода");
+
+    let shots = temp_dir("shots-area");
+    let socket = unique_socket_path("terminal-selection-area");
+    let server = Server::spawn(ServerOptions {
+        socket: socket.clone(),
+        width: SCREEN.0,
+        height: SCREEN.1,
+        quiet: std::env::var("PAGH_E2E_VERBOSE").is_err(),
+        screenshot_dir: Some(shots.clone()),
+        ..ServerOptions::default()
+    })
+    .expect("композитор стартует");
+
+    let empty = capture(&server.control, &shots, "10-empty.png");
+    let mut child: Child = Command::new(env!("CARGO_BIN_EXE_pagh-terminal"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--size",
+            &format!("{}x{}", CONTENT.0, CONTENT.1),
+            "--feed",
+            fixture.to_str().unwrap(),
+            "--title",
+            "fastfetch — whole-area selection",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("pagh-terminal стартует");
+
+    let mut drawn = None;
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let frame = capture(&server.control, &shots, "11-terminal.png");
+            if frame != empty {
+                drawn = Some(frame);
+                true
+            } else {
+                false
+            }
+        }),
+        "окно терминала не появилось на экране композитора"
+    );
+    let before_bytes = drawn.unwrap();
+    let before = decode(&before_bytes);
+    let theme = Theme::default();
+
+    // Жест «весь терминал»: нажатие в первой клетке контента, затем протяжка
+    // до последней клетки (включая пустые строки под fastfetch).
+    let (sx, sy) = cell_point(0, 0);
+    let (ex, ey) = cell_point(cols - 1, rows - 1);
+    server.control.mouse_move(sx, sy);
+    std::thread::sleep(Duration::from_millis(120));
+    server.control.mouse_button(1, true);
+    std::thread::sleep(Duration::from_millis(80));
+    let steps = 8;
+    for step in 1..=steps {
+        let x = sx + (ex - sx) * step / steps;
+        let y = sy + (ey - sy) * step / steps;
+        server.control.mouse_move(x, y);
+        std::thread::sleep(Duration::from_millis(90));
+    }
+    server.control.mouse_button(1, false);
+    server.control.mouse_move(30, 770);
+    std::thread::sleep(Duration::from_millis(700));
+
+    let highlight = theme.bg.lerp(theme.selection, SELECTION_BG_MIX);
+    // Ровно сетка, без padding-рамки клиента: padding никогда не входит в
+    // выделение (это не клетки), поэтому сравнивать его с подсветкой нельзя.
+    let x0 = (cell_point(0, 0).0 as usize) - CELL_W / 2;
+    let y0 = (cell_point(0, 0).1 as usize) - CELL_H / 2;
+    let x1 = x0 + cols * CELL_W;
+    let y1 = y0 + rows * CELL_H;
+    let region = |bytes: &[u8]| -> Vec<u8> {
+        let img = decode(bytes);
+        let mut out = Vec::with_capacity((x1 - x0) * (y1 - y0) * 4);
+        for y in y0..y1.min(img.height as usize) {
+            for x in x0..x1.min(img.width as usize) {
+                out.extend_from_slice(&pixel(&img, x, y));
+            }
+        }
+        out
+    };
+    let mut after_bytes = capture(&server.control, &shots, "12-area-selected-a.png");
+    let mut after_region = region(&after_bytes);
+    let mut stable = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        let next = capture(&server.control, &shots, "12-area-selected.png");
+        let next_region = region(&next);
+        if next_region == after_region {
+            stable = true;
+            after_bytes = next;
+            break;
+        }
+        after_bytes = next;
+        after_region = next_region;
+    }
+    assert!(stable, "кадр терминала не стабилизировался после выделения");
+    assert_ne!(
+        after_region,
+        region(&before_bytes),
+        "whole-area drag did not change the frame"
+    );
+    let after = decode(&after_bytes);
+
+    let mut washed = 0usize;
+    let mut glyph = 0usize;
+    let mut glyph_colours = std::collections::BTreeSet::new();
+    // Пустые строки под выводом fastfetch (сюда не попадает ни один глиф)
+    // обязаны быть подсвечены: иначе выделение обрезалось по строке текста.
+    let bottom_row_y = (cell_point(0, rows - 2).1 as usize) + CELL_H / 2;
+    let mut bottom_washed = 0usize;
+    for y in y0..y1.min(before.height as usize) {
+        for x in x0..x1.min(before.width as usize) {
+            let b = pixel(&before, x, y);
+            let a = pixel(&after, x, y);
+            if b[..3] == theme.bg.to_array()[..] {
+                assert_eq!(
+                    a[..3],
+                    highlight.to_array()[..],
+                    "клетка ({x},{y}) не попала в выделение"
+                );
+                washed += 1;
+                if y == bottom_row_y {
+                    bottom_washed += 1;
+                }
+            } else if a == b {
+                // Ядро глифа (полное покрытие) — цвет обязан остаться прежним.
+                glyph += 1;
+                glyph_colours.insert([a[0], a[1], a[2]]);
+            }
+        }
+    }
+    assert!(
+        washed > 100_000,
+        "выделение не покрыло всю площадь: фоновых пикселей {washed}"
+    );
+    assert!(
+        bottom_washed > 500,
+        "пустые строки под выводом не подсвечены: {bottom_washed}"
+    );
+    assert!(glyph > 1_000, "в выделении не осталось глифов: {glyph}");
+    assert!(
+        glyph_colours.len() >= 3,
+        "цвета глифов выродились в {} цвет(а) — регрессия «посерения»",
+        glyph_colours.len()
+    );
+
+    server.control.close_window(101);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    server.control.shutdown();
+    server.join().expect("композитор завершился");
+
+    if let Some(dir) = evidence_dir() {
+        std::fs::copy(
+            shots.join("11-terminal.png"),
+            dir.join("live-area-before.png"),
+        )
+        .unwrap();
+        std::fs::copy(
+            shots.join("12-area-selected.png"),
+            dir.join("live-area-after.png"),
+        )
+        .unwrap();
+    }
+
+    let _ = std::fs::remove_dir_all(&shots);
+}

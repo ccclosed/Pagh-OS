@@ -539,3 +539,100 @@ fn selection_over_real_fastfetch_output_keeps_logo_text_and_colours() {
         "no glyph pixels inside the selection: {glyph}"
     );
 }
+
+/// Whole-area selection (`SelectionMode::Area` через `select_all_view`):
+/// выделяется весь видимый вывод целиком, а не прямоугольник, у которого
+/// первая/последняя строка обрезаны по колонке нажатия/отпускания.
+///
+/// Оракул тот же, что у теста выше — кадр обязан совпасть с рендером, где
+/// `theme.bg` уже равен подсветке, — но теперь он применяется к *каждой*
+/// клетке сетки: ни одна колонка логотипа и ни один свотч палитры не остаётся
+/// вне выделения и не сереет.
+#[test]
+fn whole_area_selection_covers_whole_output_and_keeps_colours() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let raw = std::fs::read(dir.join("tests/fixtures/fastfetch-guest.script"))
+        .expect("fastfetch guest fixture");
+    let theme = theme();
+    let opts = RenderOptions {
+        show_cursor: false,
+        ..RenderOptions::default()
+    };
+
+    let mut plain = Terminal::new(100, 30);
+    plain.feed(&raw);
+    let before = render_screen(&plain.screen, &theme, &opts);
+
+    let mut selected = Terminal::new(100, 30);
+    selected.feed(&raw);
+    selected.screen.select_all_view();
+    assert_eq!(
+        selected.screen.selection().unwrap().mode,
+        SelectionMode::Area,
+        "select_all_view must use whole-area mode"
+    );
+    let after = render_screen(&selected.screen, &theme, &opts);
+
+    let highlight = theme.bg.lerp(theme.selection, SELECTION_BG_MIX);
+    let mut washed_theme = theme.clone();
+    washed_theme.bg = highlight;
+    let oracle = render_screen(&plain.screen, &washed_theme, &opts);
+
+    let rgb = |px: [u8; 4]| [px[0], px[1], px[2]];
+    let mut washed = 0usize;
+    let mut glyph_core = 0usize;
+    let mut glyph_colours = std::collections::BTreeSet::new();
+    let mut swatches = 0usize;
+    for row in 0..30 {
+        let line = plain.screen.view_line(row);
+        for col in 0..100 {
+            let cell = line.get(col).copied().unwrap_or_default();
+            for y in 0..18 {
+                for x in 0..8 {
+                    let px = (
+                        VIEWPORT_PADDING + col * 8 + x,
+                        VIEWPORT_PADDING + row * 18 + y,
+                    );
+                    let b = before.pixel(px.0, px.1);
+                    let a = after.pixel(px.0, px.1);
+                    if !cell.bg.is_default() {
+                        let bg = cell.bg.resolve(&theme.palette, theme.bg);
+                        assert_eq!(
+                            rgb(a),
+                            bg.lerp(theme.selection, SELECTION_BG_MIX).to_array(),
+                            "ANSI background art erased at ({row},{col})"
+                        );
+                        swatches += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        a,
+                        oracle.pixel(px.0, px.1),
+                        "whole-area cell ({row},{col}) differs from the wash oracle"
+                    );
+                    if b[..3] == theme.bg.to_array()[..] {
+                        assert_eq!(
+                            rgb(a),
+                            highlight.to_array(),
+                            "cell ({row},{col}) was not selected"
+                        );
+                        washed += 1;
+                    } else if b == a {
+                        glyph_core += 1;
+                        glyph_colours.insert(rgb(b));
+                    }
+                }
+            }
+        }
+    }
+    // Вся сетка 100x30, от верхней строки до нижней и от первой колонки до
+    // последней: подсветка есть в каждой клетке, включая пустые.
+    assert!(washed > 26_000, "whole area not washed: {washed}");
+    assert!(swatches > 100, "ANSI palette strip missing: {swatches}");
+    assert!(glyph_core > 2_000, "logo/text pixels lost: {glyph_core}");
+    assert!(
+        glyph_colours.len() >= 3,
+        "foreground collapsed into {} colour(s)",
+        glyph_colours.len()
+    );
+}
