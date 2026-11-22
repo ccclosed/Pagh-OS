@@ -3797,6 +3797,15 @@ def mode_termwindow(h: "Harness") -> tuple[str, int]:
             ok &= run_in_window("16-ppkg-install", "ppkg install nano fastfetch ncurses-base", "ppkg",
                                 timeout=a.ppkg_timeout)
 
+            # Cosmetic for the evidence frame: clear first so the compat VT's
+            # cursor is at the top of the screen and fastfetch prints top-left
+            # like neofetch. Without this, fastfetch starts at the current
+            # prompt (normal terminal output lands at the bottom), and the VT's
+            # first full repaint hides the console history above it. The
+            # positioning itself is not a bug; the cleared screen is simply the
+            # honest showcase for the screenshot.
+            ok &= run_in_window("18c-clear", "clear", "clear")
+
             # Bare `fastfetch` first: no `lxrun` prefix, the shell resolves it in
             # PATH. It is independent of the interactive editor below, so a slow
             # TUI cannot starve the evidence for it.

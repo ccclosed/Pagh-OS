@@ -134,7 +134,11 @@
   `ps -ef`, `id`, `id -un`, `groups`, `ls -la /mnt`, `disk list`, `clear`, `help`,
   `nano` (открыть → текст → `Ctrl+S` → `Ctrl+Q`), затем (если нет `--no-distro`)
   `ppkg update`, `ppkg install nano fastfetch ncurses-base`, `lxrun nano -I`
-  (`Ctrl+O`/Enter/`Ctrl+X`) и голое `fastfetch` (PATH-fallback, без `lxrun`). Утверждения: пара
+  (`Ctrl+O`/Enter/`Ctrl+X`) и голое `fastfetch` (PATH-fallback, без `lxrun`); перед
+  `fastfetch` отправляется `clear`, чтобы compat-VT начинал с верхней строки и кадр
+  evidence показывал логотип `PAGH` в левом верхнем углу (как neofetch) — сам
+  `fastfetch` печатает от текущего курсора, то есть без `clear` от приглашения внизу.
+  Утверждения: пара
   `[DIAG] window session=1 command=…/done=…` на каждую команду (ядро печатает её мимо
   фильтра сессии) + PNG кадра (`.cache/termwindow-*.png`), идентичность `fastfetch`
   (строки `OS:`/`Kernel:` называют `Pagh-OS`, а не `Linux`; `Disk (/)` — ёмкость ext2,
