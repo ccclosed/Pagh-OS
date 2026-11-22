@@ -1054,6 +1054,11 @@ fn fork_linux_process_inner(
         if !compat::fork_current_compat(child, clear_child_tid) {
             return Err(Errno::EINVAL);
         }
+        // Ребёнок наследует управляющий терминал родителя: консольная сессия —
+        // такое же свойство задания, как pgid/tty_job. Без привязки вывод
+        // fork-ребёнка `lxrun`-программы окна ушёл бы в boot-консоль (см.
+        // `docs/terminal-session.md`, граница «дети lxrun»).
+        crate::drivers::session::inherit_bind(child);
         if vfork {
             // Зарегистрировать ожидание ДО постановки ребёнка в очередь: иначе
             // он мог бы exec'нуть/выйти раньше, чем родитель начнёт ждать, и

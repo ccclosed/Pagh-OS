@@ -200,9 +200,12 @@ scanout) и терминальное окно desktop'а (сессия 1, offscr
   курсора разрешают **экземпляр текущей задачи** через `drivers::session`
   (чистая `session_route::route` над атомиками: владелец сессии сильнее
   привязки compat-ребёнка);
-* окно не зовёт `tty::init_shell` (управляющий терминал один — boot-shell),
-  не печатает баннер в serial и не исполняет `autorun`; вывод команд окна в
-  serial тоже подавлен (`serial::_kprint`), потому что serial — общий лог ядра;
+* окно заявляет СВОЙ управляющий терминал
+  (`tty::init_shell_for(session, pid)`): foreground-группа, `TOSTOP`, `winsize`
+  и таблица заданий — на сессию, поэтому `^C`/`^Z`/`jobs`/`fg`/`bg` в окне не
+  трогают boot-shell; окно не печатает баннер в serial и не исполняет
+  `autorun`; вывод команд окна в serial тоже подавлен (`serial::_kprint`),
+  потому что serial — общий лог ядра;
 * `nano`/`paint` работают без изменений логики: они рисуют через общий
   framebuffer-API, а `nano` уже читал клавишу общим helper'ом; единственная
   механическая правка — та же строка чтения клавиши в `paint.rs`, переведённая
@@ -211,17 +214,21 @@ scanout) и терминальное окно desktop'а (сессия 1, offscr
   запрос выхода, и задача выходит сама на границе цикла.
 
 Дизайн, ABI (`VTFBIOGET_INFO`, mmap/read, `vtinput1`), тесты и честные границы
-(нет PTY/termios и per-window job control, два окна делят одну сессию,
+(job-control теперь per-session; нет PTY/`setsid`, два окна делят одну сессию,
 глобальная идентичность `su`/`login`) — `docs/terminal-session.md`.
 
 ## Job control
 
-Терминал консоли — управляющий, и у него ровно одна foreground-группа
-(`drivers::tty`, чистые правила — `linux::tty`, хост-свойство `tty_job`).
+Терминал КАЖДОЙ консольной сессии — управляющий, и у него своя foreground-группа
+(`drivers::tty`, массивы по сессии; чистые правила — `linux::tty`, хост-свойство
+`tty_job`). Таблица заданий (`shell::jobs`) тоже на сессию: `jobs`/`fg`/`bg` в
+окне не видят задание boot-shell'а и наоборот.
 
 1. `lxrun` (и команды, которые его переиспользуют) спавнит процесс и **в той же
    `without_interrupts`-секции** помечает его JOB'ом (`compat::mark_tty_job`),
-   отдаёт ему терминал (`tty::set_foreground_pgid(child_pgid)`), печатает строку
+   отдаёт ему терминал своей сессии (`tty::set_foreground_pgid_for(session, child_pgid)`),
+   привязывает pid к сессии (`session::bind`; `fork`-дети наследуют) и ставит
+   foreground-pid сессии, печатает строку
    `lxrun: started …` и выравнивает курсор VT по курсору консоли
    (`vt::cursor_from_console`). Один критический участок на всё: дочерний процесс
    становится runnable сразу по возврате interrupts, поэтому и «фоновое окно»
@@ -234,7 +241,7 @@ scanout) и терминальное окно desktop'а (сессия 1, offscr
      (групповая остановка в планировщике per-thread-group, лидеру её мало), запись
      попадает в `jobs` как `Stopped`;
    - на любом выходе (exit или stop) shell возвращает себе терминал
-     (`tty::restore_shell_foreground()`).
+     (`tty::restore_shell_foreground_for(session)`).
 3. `jobs` печатает таблицу, `bg` шлёт `SIGCONT` всей группе и оставляет её в фоне
    (следующее чтение терминала снова её остановит — `SIGTTIN`), `fg` **сначала**
    отдаёт терминал заданию, потом шлёт `SIGCONT`, и ждёт его тем же
