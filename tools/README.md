@@ -11,7 +11,7 @@
 | `host_tests.py` | Обёртка: определяет host triple через `rustc -vV`, запускает `cargo test --locked --target <host>` в `host-tests/` |
 | `toolchain.sh` | Guard для `build.sh`/`run.sh`: отказывается собирать ненайтовым (stable/дистрибутивным) `cargo` — тот падает с `-Zjson-target-spec` и не называет настоящую причину. `tools/build.py` его не требует |
 | `check_agents_md.py` | Гейт утверждений `AGENTS.md` против дерева (шесть гейтов, канонические entry points, версия/теги, release-notes) в обе стороны; `--probe` ломает каждый класс утверждений в scratch-копии и требует находку на каждую поломку; `--quiet` — только вердикт |
-| `e2e.py` | Кроссплатформенный (Linux/CI, без pwsh) in-guest E2E-драйвер: режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`, `tcp-shot`, `smoke`, `usb`, `rndis`, `scroll`, `desktop`, `groups`, `netperms`; общие флаги `--features`/`--debug`/`--cpu`/`--disk`/`--nvme`/`--timeout`/`--settle`/`--expect`/`--keep-artifacts` |
+| `e2e.py` | Кроссплатформенный (Linux/CI, без pwsh) in-guest E2E-драйвер: режимы `selftest`, `local-mirror`, `live-update`, `bigindex`, `shell`, `tcp-shot`, `smoke`, `usb`, `rndis`, `scroll`, `desktop`, `termux`, `termwindow`, `groups`, `netperms`; общие флаги `--features`/`--debug`/`--cpu`/`--disk`/`--nvme`/`--timeout`/`--settle`/`--expect`/`--keep-artifacts` |
 | `check_safety.py` | CI-гейт unsafe-политики: сканирует `src/security/`, `src/arch/x86_64/linux/mod.rs`, `src/memory/vmm.rs`, `src/net/tls.rs`, `src/pkg/apt.rs` — каждый `unsafe {` обязан иметь `SAFETY:`-коммент в предыдущих 6 строках, иначе exit 1 |
 | `worktrees.py` | Гигиена worktree по правилу AGENTS.md «после мержа PR ветку удаляют»: таблица всех worktree (state `merged`/`unique`/`dirty`/`detached`, ahead/unique по `git cherry`, число грязных путей), `--prune` (dry-run без `--yes`; не трогает грязные/уникальные/detached и «активные» — тронутые меньше `--min-idle-minutes`, по умолчанию 30), `--self-test` собирает временный репозиторий и проверяет классификатор и правила prune на нём) |
 | `gen_ca_bundle.py` | Генератор trust-anchor бандла TLS-верификатора: скачивает curl/Mozilla CA extract, выбирает корни по subject CN (ISRG Root X1/X2, GTS R1/R4), пишет детерминированный `src/net/ca_bundle.rs` (DER-массивы + метки); сгенерированный файл коммитится, перегенерация — только осознанно |
@@ -125,6 +125,25 @@
   `--legacy-demo` оставляет **прежний** сценарий с демо-клиентом (`pagh-desktop-demo` +
   `--spawn-demo`) как регрессию тестового фолбэка: обычный путь демо-клиент не инжектит и
   `--spawn-demo` не передаёт.
+- `python3 tools/e2e.py termwindow` — приёмка **stage 2**: терминальное окно desktop'а
+  есть ПОЛНАЯ kernel-shell сессия (`/dev/vtfb1` + `/dev/vtinput1`), а не зеркало и не
+  userspace-shell. Композитор (`/mnt/pd`) и его `--launch-target` поднимаются через
+  `/mnt/etc/autorun` (шиповая рецептура `desktop-autorun`): команда содержит `{socket}`,
+  а набранные через QMP скобки под TCG оставляли залипший Ctrl — и первый же `c` в гостя
+  превращался в настоящий `^C`. Harness кликает окно и печатает в него `df`, `ps`,
+  `ps -ef`, `id`, `id -un`, `groups`, `ls -la /mnt`, `disk list`, `clear`, `help`,
+  `nano` (открыть → текст → `Ctrl+S` → `Ctrl+Q`), затем (если нет `--no-distro`)
+  `ppkg update`, `ppkg install nano fastfetch ncurses-base`, `lxrun nano -I`
+  (`Ctrl+O`/Enter/`Ctrl+X`) и голое `fastfetch` (PATH-fallback, без `lxrun`). Утверждения: пара
+  `[DIAG] window session=1 command=…/done=…` на каждую команду (ядро печатает её мимо
+  фильтра сессии) + PNG кадра (`.cache/termwindow-*.png`), отсутствие вывода команд окна
+  в serial (`1K-blocks`/`STAT COMMAND`/`uid=0(root)` — иначе команда исполнилась в
+  boot-shell), сохранённые `nano` файлы, прочитанные обратно из ext2 через `debugfs`, и
+  отсутствие `PANIC`/`[EXC`. Диск по умолчанию 256 МиБ (`--disk-mb`; 64 МиБ хватает
+  только на инъекцию бинарей, но не на `ppkg install`). Интерактивность ncurses-программ
+  через `lxrun` не доказывается (§6.10: у `drivers::vt` нет alternate screen/DEC-режимов) —
+  режим помечает её `unverified`, а не зелёным. Требует `qemu-img`, `debugfs`, OVMF;
+  сеть — только для distro-шага. Снимки — `.cache/termwindow-*.png`.
 - Env-оверрады: `LIMINE_DIR`/`LIMINE_EFI` (иначе автопоиск/автоскачивание), `OVMF`/`--ovmf`
   (если заданы и файл существует — берутся они; иначе `OVMF.fd` из корня репо; иначе системный
   `OVMF_CODE.fd`, напр. `/usr/share/edk2/ovmf/`), `PAGH_DISK` (дефолт `disk.img`),

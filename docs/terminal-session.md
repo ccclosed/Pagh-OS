@@ -405,3 +405,30 @@ IntelliMouse-соглашению (`lines = -delta`). Без инверсии «
     `Ctrl+Y`/`Ctrl+V` в kernel-shell; системного (межоконного) буфера desktop
     нет, поэтому «вставить из другого приложения» не поддерживается и не
     имитируется.
+
+## 7. Live-приёмка команд окна
+
+In-QEMU рутины §5 проверяют маршрутизацию, но не «человек видит это в окне».
+Это проверяет режим `python3 tools/e2e.py termwindow`: шиповые `pagh-desktop` +
+`pagh-terminal` (fbdev/evdev/PDP), окно = session 1, каждая команда печатается в
+окно и подтверждается парой `[DIAG] window session=1 command=…/done=…` в serial
+плюс PNG кадра (`.cache/termwindow-*.png`):
+
+* команды реестра: `df`, `ps`, `ps -ef`, `id`, `id -un`, `groups`, `ls -la /mnt`,
+  `disk list`, `clear`, `help`;
+* kernel-редактор `nano` (открыть → текст → `Ctrl+S` → `Ctrl+Q`), сохранённый
+  буфер читается обратно из ext2 через `debugfs`;
+* distro-путь: `ppkg update`, `ppkg install nano fastfetch ncurses-base`, голое
+  `fastfetch` (PATH-fallback #158, без `lxrun`), `lxrun nano` (с `-I`: rc-файлы
+  Debian ссылаются на абсолютные `/usr/...`, а дерево лежит под `/mnt`).
+
+Композитор стартует через `/mnt/etc/autorun` (рецепт `desktop-autorun`): команда
+`--launch-target` содержит `{socket}`, а набранные через QMP скобки под TCG
+оставляли залипший модификатор — следующий `c` становился настоящим `^C`.
+Вывод kernel-shell-команд не появляется в serial (иначе команда исполнилась бы в
+boot-shell) — это отдельная проверка режима.
+
+Чего режим не доказывает и не притворяется: интерактивность ncurses-программ
+через `lxrun` — по §6.10 у `drivers::vt` нет alternate screen/DEC-режимов, поэтому
+такой редактор остаётся построчным; режим фиксирует это как `unverified`
+(«дошёл до `read(2)` — и всё»), а не как зелёный пункт.
