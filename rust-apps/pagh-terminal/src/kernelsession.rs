@@ -49,10 +49,13 @@
 //!   [`View`]); kernel-scrollback остаётся на PageUp/PageDown в shell'е;
 //! * по умолчанию показ **1:1**: окно меньше поверхности — не дробный
 //!   downscale, а полноразмерный вьюпорт с прокруткой (колесо,
-//!   `Ctrl+Shift`+стрелки/PageUp/PageDown/Home/End).  Целочисленный
-//!   зум-обзор (2×, 3×, …) — необязательный режим (`--scale 2`,
-//!   `Ctrl+Shift+Z`); дробного масштаба нет нигде — он ставил штрихи шрифта
-//!   между пикселями окна и делал текст нечитаемым.
+//!   `Ctrl+Shift`+стрелки/PageUp/PageDown/Home/End).  Вьюпорт **следует за
+//!   живым низом** ([`View`]): новый вывод и приглашение видны без прокрутки;
+//!   прокрутка вверх останавливает следование, `Ctrl+Shift+End` или возврат
+//!   колесом к низу — возобновляет.  Целочисленный зум-обзор (2×, 3×, …) —
+//!   необязательный режим (`--scale 2`, `Ctrl+Shift+Z`); дробного масштаба нет
+//!   нигде — он ставил штрихи шрифта между пикселями окна и делал текст
+//!   нечитаемым.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -515,28 +518,36 @@ fn max_scroll(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> (usize,
     (src_w.saturating_sub(dst_w), src_h.saturating_sub(dst_h))
 }
 
-/// Прокрутка, прижатая к допустимому диапазону для текущей геометрии.
-fn clamp_scroll(
-    src_w: usize,
-    src_h: usize,
-    dst_w: usize,
-    dst_h: usize,
-    scroll_x: usize,
-    scroll_y: usize,
-) -> (usize, usize) {
-    let (max_x, max_y) = max_scroll(src_w, src_h, dst_w, dst_h);
-    (scroll_x.min(max_x), scroll_y.min(max_y))
-}
-
-/// Состояние показа поверхности клиентом: режим плюс прокрутка 1:1-вьюпорта.
+/// Состояние показа поверхности клиентом: режим, прокрутка 1:1-вьюпорта и
+/// автоследование за нижним краем.
 ///
 /// Живёт целиком в клиенте: ядро по-прежнему владеет поверхностью размером с
 /// экран и ничего не знает про окно/прокрутку (ABI `/dev/vtfb1` не меняется).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// **Автоследование (стандартная семантика терминала).**  Пока `follow` включён,
+/// 1:1-вьюпорт стоит на нижнем крае поверхности: новые строки shell'а и
+/// приглашение (`prompt`) всегда видны без ручной прокрутки.  Прокрутка вверх
+/// (`wheel` вверх, `Ctrl+Shift+Up/PageUp/Home`) снимает `follow`, чтобы чтение
+/// истории не «дёргало» обратно; возврат к нижнему краю (`wheel` вниз до упора,
+/// `Ctrl+Shift+End`) снова включает следование.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct View {
     mode: ScaleMode,
     scroll_x: usize,
     scroll_y: usize,
+    /// Следовать за нижним краем поверхности (сбрасывается прокруткой вверх).
+    follow: bool,
+}
+
+impl Default for View {
+    fn default() -> View {
+        View {
+            mode: ScaleMode::OneToOne,
+            scroll_x: 0,
+            scroll_y: 0,
+            follow: true,
+        }
+    }
 }
 
 impl View {
@@ -544,41 +555,78 @@ impl View {
         self.mode
     }
 
-    /// Текущая прокрутка в пикселях поверхности.
+    /// Включено ли автоследование за нижним краем.
+    pub fn follows(&self) -> bool {
+        self.follow
+    }
+
+    /// Последняя заданная прокрутка в пикселях поверхности.
+    ///
+    /// Пока `follow` включён, фактическая позиция — нижний край; для неё есть
+    /// [`View::effective_scroll`] (и [`KernelFrame::scroll`]).
     pub fn scroll(&self) -> (usize, usize) {
         (self.scroll_x, self.scroll_y)
     }
 
-    /// Сменить режим; прокрутка сбрасывается (целочисленный зум показывает
-    /// весь кадр, а после возврата к 1:1 начинать с левого верхнего угла —
-    /// предсказуемо).
+    /// Фактическая прокрутка для данной геометрии: нижний край при `follow`.
+    pub fn effective_scroll(
+        &self,
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> (usize, usize) {
+        if self.mode == ScaleMode::Integer {
+            return (0, 0);
+        }
+        let (max_x, max_y) = max_scroll(src_w, src_h, dst_w, dst_h);
+        let x = self.scroll_x.min(max_x);
+        let y = if self.follow {
+            max_y
+        } else {
+            self.scroll_y.min(max_y)
+        };
+        (x, y)
+    }
+
+    /// Сменить режим; прокрутка сбрасывается, автоследование включается.
+    ///
+    /// Целочисленный зум показывает весь кадр; после возврата к 1:1 начинать
+    /// с живого низа (приглашение видно) — предсказуемо.
     pub fn set_mode(&mut self, mode: ScaleMode) {
         if self.mode != mode {
             self.mode = mode;
             self.scroll_x = 0;
             self.scroll_y = 0;
+            self.follow = true;
         }
     }
 
     /// Прижать прокрутку к новой геометрии (resize окна или поверхности).
     ///
-    /// Это и есть «re-clamp после resize»: окно выросло — лишняя прокрутка
-    /// снимается; окно стало не меньше поверхности — смещение обнуляется.
+    /// Resize: автоследование остаётся на нижнем крае; ручная прокрутка
+    /// сохраняется, но клампится к новым границам.  Окно не меньше
+    /// поверхности — смещение 0 (следовать не за чем).
     pub fn reclamp(&mut self, src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) {
         if self.mode == ScaleMode::Integer {
             self.scroll_x = 0;
             self.scroll_y = 0;
             return;
         }
-        let (x, y) = clamp_scroll(src_w, src_h, dst_w, dst_h, self.scroll_x, self.scroll_y);
-        self.scroll_x = x;
-        self.scroll_y = y;
+        let (max_x, max_y) = max_scroll(src_w, src_h, dst_w, dst_h);
+        self.scroll_x = self.scroll_x.min(max_x);
+        self.scroll_y = if self.follow {
+            max_y
+        } else {
+            self.scroll_y.min(max_y)
+        };
     }
 
     /// Раскладка кадра для текущего режима и геометрии.
     ///
     /// 1:1: вырез `min(surface, window)` по каждой оси, центрированный по той
-    /// оси, где поверхность меньше окна; прокрутка прижата к диапазону.
+    /// оси, где поверхность меньше окна; по умолчанию — нижний край
+    /// ([`View`]).
     /// Integer: вся поверхность через [`fit_placement`] (целый делитель).
     pub fn placement(
         &self,
@@ -595,7 +643,7 @@ impl View {
         }
         let view_w = src_w.min(dst_w);
         let view_h = src_h.min(dst_h);
-        let (src_x, src_y) = clamp_scroll(src_w, src_h, dst_w, dst_h, self.scroll_x, self.scroll_y);
+        let (src_x, src_y) = self.effective_scroll(src_w, src_h, dst_w, dst_h);
         Some(FitPlacement {
             x: (dst_w - view_w) / 2,
             y: (dst_h - view_h) / 2,
@@ -610,9 +658,11 @@ impl View {
 
     /// Прокрутить 1:1-вьюпорт на `dx`/`dy` пикселей поверхности.
     ///
-    /// Возвращает `true`, если смещение действительно изменилось.  В режиме
-    /// [`ScaleMode::Integer`] прокрутки нет (весь кадр виден целиком) —
-    /// всегда `false`, чтобы вызывающий не перерисовывал кадр зря.
+    /// Стартует с фактической позиции (при автоследовании — с нижнего края).
+    /// Возвращает `true`, если видимая позиция действительно изменилась.
+    /// Прокрутка вверх выключает автоследование; возврат к нижнему краю —
+    /// включает.  В режиме [`ScaleMode::Integer`] прокрутки нет (весь кадр
+    /// виден целиком) — всегда `false`.
     pub fn pan_by(
         &mut self,
         dx: i32,
@@ -626,15 +676,19 @@ impl View {
             return false;
         }
         let (max_x, max_y) = max_scroll(src_w, src_h, dst_w, dst_h);
-        let x = (self.scroll_x as i64 + dx as i64).clamp(0, max_x as i64) as usize;
-        let y = (self.scroll_y as i64 + dy as i64).clamp(0, max_y as i64) as usize;
-        let changed = (x, y) != (self.scroll_x, self.scroll_y);
+        let (from_x, from_y) = self.effective_scroll(src_w, src_h, dst_w, dst_h);
+        let x = (from_x as i64 + dx as i64).clamp(0, max_x as i64) as usize;
+        let y = (from_y as i64 + dy as i64).clamp(0, max_y as i64) as usize;
         self.scroll_x = x;
         self.scroll_y = y;
-        changed
+        // Автоследование возвращается только на самом нижнем крае.
+        self.follow = y == max_y;
+        (x, y) != (from_x, from_y)
     }
 
     /// Прокрутить вьюпорт в абсолютную позицию (Home/End), прижатую к краям.
+    ///
+    /// `End` (нижний край) снова включает автоследование, `Home` — выключает.
     pub fn pan_to(
         &mut self,
         x: usize,
@@ -647,11 +701,14 @@ impl View {
         if self.mode == ScaleMode::Integer || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
             return false;
         }
-        let (x, y) = clamp_scroll(src_w, src_h, dst_w, dst_h, x, y);
-        let changed = (x, y) != (self.scroll_x, self.scroll_y);
+        let (max_x, max_y) = max_scroll(src_w, src_h, dst_w, dst_h);
+        let (from_x, from_y) = self.effective_scroll(src_w, src_h, dst_w, dst_h);
+        let x = x.min(max_x);
+        let y = y.min(max_y);
         self.scroll_x = x;
         self.scroll_y = y;
-        changed
+        self.follow = y == max_y;
+        (x, y) != (from_x, from_y)
     }
 }
 
@@ -814,6 +871,21 @@ impl<S: FrameSource> KernelFrame<S> {
         self.window
     }
 
+    /// Фактическая прокрутка с учётом автоследования за нижним краем.
+    pub fn scroll(&self) -> (usize, usize) {
+        self.view.effective_scroll(
+            self.info.width as usize,
+            self.info.height as usize,
+            self.window.0,
+            self.window.1,
+        )
+    }
+
+    /// Включено ли автоследование (новый вывод держит вьюпорт на нижнем крае).
+    pub fn following(&self) -> bool {
+        self.view.follows()
+    }
+
     /// Переключить режим показа; следующий кадр перерисовывается полностью.
     pub fn set_view_mode(&mut self, mode: ScaleMode) {
         self.view.set_mode(mode);
@@ -911,7 +983,11 @@ impl<S: FrameSource> KernelFrame<S> {
             PanStep::PageUp => self.pan_by(0, -page_y),
             PanStep::PageDown => self.pan_by(0, page_y),
             PanStep::Home => self.pan_to(0, 0),
-            PanStep::End => self.pan_to(usize::MAX, usize::MAX),
+            // End — на живой низ, горизонталь не трогаем (в 1:1 это X=0).
+            PanStep::End => {
+                let (x, _) = self.scroll();
+                self.pan_to(x, usize::MAX)
+            }
         }
     }
 
@@ -1518,9 +1594,12 @@ mod tests {
     }
 
     #[test]
-    fn view_defaults_to_full_size_one_to_one_viewport() {
+    fn view_defaults_to_full_size_one_to_one_following_the_bottom() {
         let view = View::default();
         assert_eq!(view.mode(), ScaleMode::OneToOne);
+        assert!(view.follows());
+        // Нижний край: приглашение/новый вывод видны без ручной прокрутки.
+        assert_eq!(view.effective_scroll(1280, 800, 900, 600), (0, 200));
         let place = view.placement(1280, 800, 900, 600).unwrap();
         // Окно целиком занято 1:1-вырезом: пиксель в пиксель, без масштаба.
         assert_eq!(
@@ -1529,40 +1608,73 @@ mod tests {
         );
         assert_eq!(
             (place.src_x, place.src_y, place.src_width, place.src_height),
-            (0, 0, 900, 600)
+            (0, 200, 900, 600)
         );
         // 1:1: вырез не растягивается/сжимается.
         assert_eq!(place.src_width, place.width);
         assert_eq!(place.src_height, place.height);
+        // Хранимая позиция до первого resize/pan ещё 0, но фактическая — низ.
+        assert_eq!(view.scroll(), (0, 0));
     }
 
     #[test]
-    fn view_one_to_one_pans_and_clamps_to_surface_bounds() {
+    fn view_pan_up_stops_following_and_bottom_resumes_it() {
         let mut view = View::default();
-        assert!(view.pan_by(100, 100, 1280, 800, 900, 600));
-        assert_eq!(view.scroll(), (100, 100));
-        // Нулевая дельта не меняет кадр (нечего перерисовывать).
-        assert!(!view.pan_by(0, 0, 1280, 800, 900, 600));
-        // Дальше края поверхности прокрутка не уходит.
-        assert!(view.pan_by(10_000, 10_000, 1280, 800, 900, 600));
-        assert_eq!(view.scroll(), (380, 200));
-        let place = view.placement(1280, 800, 900, 600).unwrap();
-        assert_eq!((place.src_x, place.src_y), (380, 200));
-        assert_eq!(
-            (place.x, place.y, place.width, place.height),
-            (0, 0, 900, 600)
-        );
-        // Назад к левому верхнему углу.
-        assert!(view.pan_by(-10_000, -10_000, 1280, 800, 900, 600));
+        // Wheel-up: уходим от живого низа, автоследование выключается.
+        assert!(view.pan_by(0, -100, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (0, 100));
+        assert!(!view.follows());
+        // Дальше вверх — Home.
+        assert!(view.pan_by(0, -10_000, 1280, 800, 900, 600));
         assert_eq!(view.scroll(), (0, 0));
+        assert!(!view.follows());
+        // Нулевая дельта кадр не меняет.
+        assert!(!view.pan_by(0, 0, 1280, 800, 900, 600));
+        // Вниз до упора — снова автоследование.
+        assert!(view.pan_by(0, 10_000, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (0, 200));
+        assert!(view.follows());
+        // Горизонтальная прокрутка на нижнем крае не отключает следование.
+        assert!(view.pan_by(10_000, 0, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (380, 200));
+        assert!(view.follows());
+        // Ctrl+Shift+End — абсолютный нижний край, следование включено.
+        assert!(view.pan_to(0, 0, 1280, 800, 900, 600));
+        assert!(!view.follows());
+        assert!(view.pan_to(0, usize::MAX, 1280, 800, 900, 600));
+        assert_eq!(view.scroll(), (0, 200));
+        assert!(view.follows());
+    }
+
+    #[test]
+    fn view_new_output_keeps_following_until_the_user_pans_up() {
+        // Пока follow включён, фактическая позиция — всегда нижний край, в том
+        // числе после появления нового вывода (новая generation).
+        let mut view = View::default();
+        assert_eq!(view.effective_scroll(1280, 800, 900, 600), (0, 200));
+        view.reclamp(1280, 800, 900, 600);
+        assert_eq!(view.effective_scroll(1280, 800, 900, 600), (0, 200));
+        // Пользователь ушёл в историю: новый вывод не дёргает обратно.
+        assert!(view.pan_by(0, -80, 1280, 800, 900, 600));
+        assert_eq!(view.effective_scroll(1280, 800, 900, 600), (0, 120));
+        assert!(!view.follows());
+        view.reclamp(1280, 800, 900, 600);
+        assert_eq!(
+            view.effective_scroll(1280, 800, 900, 600),
+            (0, 120),
+            "a generation change must not yank a user reading history"
+        );
+        // End возвращает к живому низу и возобновляет следование.
+        assert!(view.pan_to(0, usize::MAX, 1280, 800, 900, 600));
+        assert_eq!(view.effective_scroll(1280, 800, 900, 600), (0, 200));
+        assert!(view.follows());
     }
 
     #[test]
     fn view_centers_axes_that_fit_inside_the_window() {
         // Окно шире поверхности, но ниже: по X кадр целиком и по центру,
-        // по Y — прокручиваемый 1:1-вырез.
+        // по Y — прокручиваемый 1:1-вырез, по умолчанию на нижнем крае.
         let mut view = View::default();
-        assert!(view.pan_by(0, 100, 1280, 800, 1400, 700));
         let place = view.placement(1280, 800, 1400, 700).unwrap();
         assert_eq!(
             (place.x, place.y, place.width, place.height),
@@ -1574,8 +1686,13 @@ mod tests {
         );
         // По X прокрутки нет — дельта игнорируется, кадр не трогается.
         assert!(!view.pan_by(100, 0, 1280, 800, 1400, 700));
+        // Вверх по Y — история, следование выключается.
+        assert!(view.pan_by(0, -40, 1280, 800, 1400, 700));
+        assert_eq!(view.scroll(), (0, 60));
+        assert!(!view.follows());
 
-        // Окно выше поверхности, но уже: по Y целиком и по центру, по X — вырез.
+        // Окно выше поверхности, но уже: по Y целиком и по центру (follow —
+        // no-op), по X — вырез.
         let mut view = View::default();
         assert!(view.pan_by(100, 0, 1280, 800, 900, 900));
         let place = view.placement(1280, 800, 900, 900).unwrap();
@@ -1584,28 +1701,56 @@ mod tests {
             (0, 50, 900, 800)
         );
         assert_eq!((place.src_x, place.src_y), (100, 0));
+        // Y помещается целиком, поэтому follow остаётся (no-op).
+        assert!(view.follows());
     }
 
     #[test]
-    fn view_resize_reclamps_scroll_and_recenters_when_the_surface_fits() {
+    fn view_resize_keeps_follow_at_bottom_and_preserves_user_offset() {
+        // Автоследование: после resize остаёмся на нижнем крае.
         let mut view = View::default();
-        assert!(view.pan_by(10_000, 10_000, 1280, 800, 900, 600));
-        assert_eq!(view.scroll(), (380, 200));
-        // Окно выросло: лишняя прокрутка снимается.
         view.reclamp(1280, 800, 1180, 700);
-        assert_eq!(view.scroll(), (100, 100));
+        assert_eq!(view.scroll(), (0, 100));
+        assert!(view.follows());
+        // Пользователь ушёл в историю: resize сохраняет его смещение (кламп).
+        assert!(view.pan_to(20, 40, 1280, 800, 1180, 700));
+        assert!(!view.follows());
+        view.reclamp(1280, 800, 900, 500);
+        assert_eq!(view.scroll(), (20, 40));
         // Окно не меньше поверхности: смещение обнуляется, кадр по центру.
         view.reclamp(1280, 800, 1400, 900);
         assert_eq!(view.scroll(), (0, 0));
+        assert!(
+            !view.follows(),
+            "user choice is preserved, not silently reset"
+        );
         let place = view.placement(1280, 800, 1400, 900).unwrap();
         assert_eq!(
             (place.x, place.y, place.width, place.height),
             (60, 50, 1280, 800)
         );
+        // End возвращает следование; уменьшение окна снова держит низ.
+        view.pan_to(0, usize::MAX, 1280, 800, 1400, 900);
+        assert!(view.follows());
+        view.reclamp(1280, 800, 900, 600);
+        assert_eq!(view.scroll(), (0, 200));
+    }
+
+    #[test]
+    fn view_whole_frame_makes_follow_a_no_op() {
+        let mut view = View::default();
+        assert!(view.follows());
+        assert_eq!(view.effective_scroll(1280, 800, 1400, 900), (0, 0));
+        let place = view.placement(1280, 800, 1400, 900).unwrap();
         assert_eq!(
             (place.src_x, place.src_y, place.src_width, place.src_height),
             (0, 0, 1280, 800)
         );
+        assert!(!view.pan_by(0, 100, 1280, 800, 1400, 900));
+        assert_eq!(view.effective_scroll(1280, 800, 1400, 900), (0, 0));
+        view.reclamp(1280, 800, 1400, 900);
+        assert_eq!(view.scroll(), (0, 0));
+        assert!(view.follows());
     }
 
     #[test]
@@ -1622,14 +1767,14 @@ mod tests {
             (place.src_x, place.src_y, place.src_width, place.src_height),
             (0, 0, 1280, 800)
         );
-        // В зум-обзоре весь кадр виден целиком: прокрутки нет.
+        // В зум-обзоре весь кадр виден целиком: прокрутки и follow нет.
         assert!(!view.pan_by(100, 100, 1280, 800, 900, 600));
         assert!(!view.pan_to(100, 100, 1280, 800, 900, 600));
         assert_eq!(view.scroll(), (0, 0));
-        // Возврат к 1:1 начинается с левого верхнего угла.
+        // Возврат к 1:1 начинается с живого низа (приглашение видно).
         view.set_mode(ScaleMode::OneToOne);
-        assert_eq!(view.placement(1280, 800, 900, 600).unwrap().src_x, 0);
-        assert_eq!(view.scroll(), (0, 0));
+        assert_eq!(view.placement(1280, 800, 900, 600).unwrap().src_y, 200);
+        assert!(view.follows());
     }
 
     #[test]
@@ -1648,7 +1793,7 @@ mod tests {
             }
         }
         let mut view = View::default();
-        assert!(view.pan_by(2, 1, 8, 6, 4, 3));
+        assert!(view.pan_to(2, 1, 8, 6, 4, 3));
         let place = view.placement(8, 6, 4, 3).unwrap();
         assert_eq!((place.x, place.y, place.width, place.height), (0, 0, 4, 3));
         assert_eq!(
@@ -1674,12 +1819,14 @@ mod tests {
     fn window_to_surface_follows_the_viewport_offset() {
         let info = info(1280, 800, 0);
         let mut view = View::default();
-        assert!(view.pan_by(200, 100, 1280, 800, 900, 600));
+        assert!(view.pan_to(200, 100, 1280, 800, 900, 600));
         let place = view.placement(1280, 800, 900, 600).unwrap();
         assert_eq!(window_to_surface(0, 0, &info, &place), (200, 100));
         assert_eq!(window_to_surface(899, 599, &info, &place), (1099, 699));
         // Поле по центрированной оси прижимается к краю выреза.
-        let place = View::default().placement(1280, 800, 1400, 700).unwrap();
+        let mut view = View::default();
+        assert!(view.pan_to(0, 0, 1280, 800, 1400, 700));
+        let place = view.placement(1280, 800, 1400, 700).unwrap();
         assert_eq!(window_to_surface(60, 0, &info, &place), (0, 0));
         assert_eq!(window_to_surface(0, 0, &info, &place), (0, 0));
     }

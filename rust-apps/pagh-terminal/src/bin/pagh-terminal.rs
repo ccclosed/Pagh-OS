@@ -1598,9 +1598,9 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         );
     } else if info.width > width || info.height > height {
         note!(
-            "presentation: 1:1 viewport (window {width}x{height} < surface {}x{}); \
-             wheel / Ctrl+Shift+arrows/PageUp/PageDown pan, Ctrl+Shift+Home/End jump, \
-             Ctrl+Shift+Z zooms out",
+            "presentation: 1:1 viewport (window {width}x{height} < surface {}x{}), \
+             following the live bottom; wheel / Ctrl+Shift+arrows/PageUp/PageDown \
+             pan (up pauses following), Ctrl+Shift+End resumes, Ctrl+Shift+Z zooms out",
             info.width,
             info.height
         );
@@ -2469,10 +2469,11 @@ LIVE:
   --size WxH       initial window content size (default 900x600; kernel-session
                    mode enforces a 320x200 minimum)
   --scale N        kernel-session presentation: 1 = full-size 1:1 viewport
-                   with panning (default), 2 = integer zoom-out (2x/3x/...,
-                   whole surface, no fractional scale).  At runtime
-                   Ctrl+Shift+Z toggles it; Ctrl+Shift+arrows/PageUp/PageDown
-                   pan the 1:1 viewport, the wheel pans too.
+                   following the live bottom, with panning (default),
+                   2 = integer zoom-out (2x/3x/..., whole surface, no
+                   fractional scale).  At runtime Ctrl+Shift+Z toggles it;
+                   the wheel or Ctrl+Shift+arrows/PageUp/PageDown pan the 1:1
+                   viewport, Ctrl+Shift+End returns to the live bottom.
   --window-id N    client-chosen window id (default: derived from pid in
                    kernel-session mode, 101 elsewhere)
   --feed FILE      preload terminal output into the demo shell
