@@ -3853,8 +3853,11 @@ def mode_termux(h: "Harness") -> tuple[str, int]:
                       _first_line(log_text, "in slot"))
         ok &= quick or h.check("second window attached to slot 2", "in slot 2" in log_text,
                                _first_line(log_text, "in slot 2"))
-        ok &= h.check("session restart visible in the client log",
-                      "kernel session reopened" in log_text, _first_line(log_text, "reopened"))
+        restarted = ("kernel session restarted in the same window" in log_text
+                     or "kernel session reopened" in log_text)
+        ok &= h.check("session restart visible in the client log", restarted,
+                      _first_line(log_text, "restarted in the same window")
+                      or _first_line(log_text, "reopened"))
         closed_count = log_text.count("server closed the window")
         ok &= quick or h.check(f"all {TERMUX_CLOSE_CYCLES} window closes came from the server",
                       closed_count >= TERMUX_CLOSE_CYCLES,
