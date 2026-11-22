@@ -24,6 +24,7 @@ mod log;
 mod logfile;
 mod memory;
 mod net;
+mod os_identity;
 mod pkg;
 mod provision;
 mod security;

@@ -545,6 +545,13 @@ pub mod release_file;
 #[path = "../../src/vfs/procfs_format.rs"]
 pub mod procfs_format;
 
+// `os_identity` — канонические строки идентичности (`Pagh-OS` / `pagh`) и
+// форматтеры `/etc/os-release`, `/etc/pagh-release`, `/etc/motd`. `core`+`alloc`
+// only, поэтому host-свойство `os_identity` исполняет ровно тот исходник,
+// который компилирует ядро; `uname(2)` берёт UTS-константы отсюда же.
+#[path = "../../src/os_identity.rs"]
+pub mod os_identity;
+
 // `task_stat` is the tick/event accounting behind `/proc/stat` (issue #11,
 // slice 2): the pure user/system/idle classification plus the monotonic
 // `AtomicU64` counters and the seqlock snapshot. `core`-only and self-contained,
@@ -650,6 +657,11 @@ mod properties {
     mod procfs_stat;
     mod procfs_status;
     mod procfs_task;
+
+    // Идентичность ОС (`docs/os-identity.md`): `/etc/os-release` называет
+    // систему `Pagh-OS`/`pagh` и несёт реальную версию; `uname(2)` остаётся
+    // Linux-совместимым UTS-идентификатором, и свойство это фиксирует.
+    mod os_identity;
 
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.

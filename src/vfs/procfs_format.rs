@@ -919,7 +919,8 @@ pub fn format_stat(s: &StatInputs) -> Vec<u8> {
 /// Linux отвечает здесь `Linux\n`, потому что читает `init_uts_ns.name.sysname`.
 /// `uname(2)` в pagh ради совместимости сообщает `Linux`, но контракт procfs
 /// требует идентичность этого ядра, поэтому значение — `Pagh`, то же имя, что
-/// использует проект (`docs/procfs.md` §4.12).
+/// использует проект (`docs/procfs.md` §4.12). Имя **ОС** (`Pagh-OS`) живёт в
+/// `/etc/os-release`; полная модель — `docs/os-identity.md`.
 pub const KERNEL_OSTYPE: &str = "Pagh";
 
 /// `/proc/sys/kernel/hostname`: nodename, который сообщает `uname(2)`.
