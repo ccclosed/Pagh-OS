@@ -233,37 +233,62 @@ impl VfsNode for VtInputDevice {
     }
 }
 
-/// `/dev/vtfb1` — read-only пиксельная поверхность терминальной сессии 1.
+/// Имя узла сессии: `vtfb1`, `vtfb2`, …
+///
+/// `VfsNode::name` отдаёт `&str`, а VFS-таблица сравнивает имена при `lookup`,
+/// поэтому имена — статическая таблица по номеру слота, а не `format!` (у узла
+/// нет состояния аллокации, и `readdir` не должен аллоцировать имена).
+fn session_name(prefix: &str, session: usize) -> &str {
+    // Статический набор имён 0..MAX_SESSIONS: строка нужна только для VFS, а
+    // не для ABI, поэтому расширение MAX_SESSIONS добавляет строку здесь.
+    let names: &[&'static str] = match prefix {
+        "vtfb" => &["vtfb0", "vtfb1", "vtfb2", "vtfb3"],
+        "vtinput" => &["vtinput0", "vtinput1", "vtinput2", "vtinput3"],
+        "vtmouse" => &["vtmouse0", "vtmouse1", "vtmouse2", "vtmouse3"],
+        _ => &[""],
+    };
+    names.get(session).copied().unwrap_or("")
+}
+
+/// `/dev/vtfb{N}` — read-only пиксельная поверхность терминальной сессии `N`.
 ///
 /// Композитор терминального окна читает её через `ioctl(VTFBIOGET_INFO)` +
 /// `mmap(PROT_READ, MAP_SHARED)` (или `read(2)`-fallback с 24-байтным
 /// заголовком). Содержимое живёт в [`crate::drivers::offscreen`]; узел только
 /// сообщает геометрию/поколение/кадры. Запись запрещена: пиксели публикует
 /// kernel-shell сессии.
-pub struct TerminalFramebufferDevice;
+pub struct TerminalFramebufferDevice {
+    session: usize,
+}
+
+impl TerminalFramebufferDevice {
+    pub fn new(session: usize) -> TerminalFramebufferDevice {
+        TerminalFramebufferDevice { session }
+    }
+}
 
 impl VfsNode for TerminalFramebufferDevice {
     fn name(&self) -> &str {
-        "vtfb1"
+        session_name("vtfb", self.session)
     }
     fn is_directory(&self) -> bool {
         false
     }
-    fn is_vtfb1(&self) -> bool {
-        true
+    fn vtfb_session(&self) -> Option<usize> {
+        Some(self.session)
     }
     fn vtfb_info(&self) -> Option<crate::drivers::vtfb_abi::VtfbInfo> {
         // После выхода сессии — `ENODEV`: поверхность в PMM остаётся (кадры
         // нельзя забрать, пока их держит отображение клиента), но окна больше
         // нет, и ioctl/`mmap` по старому fd обязаны это сказать, а не отдать
         // геометрию мёртвой сессии. Повторный `open` поднимает её заново.
-        if !crate::drivers::session::live(1) {
+        if !crate::drivers::session::live(self.session) {
             return None;
         }
-        crate::drivers::offscreen::info(1)
+        crate::drivers::offscreen::info(self.session)
     }
     fn vtfb_page(&self, index: u64) -> Option<u64> {
-        crate::drivers::offscreen::page(1, index)
+        crate::drivers::offscreen::page(self.session, index)
     }
     fn size(&self) -> u64 {
         // Логический размер `read(2)`-файла: заголовок плюс пиксели.
@@ -275,7 +300,11 @@ impl VfsNode for TerminalFramebufferDevice {
         let Ok(offset) = usize::try_from(offset) else {
             return Ok(0);
         };
-        Ok(crate::drivers::offscreen::read_snapshot(1, offset, buf))
+        Ok(crate::drivers::offscreen::read_snapshot(
+            self.session,
+            offset,
+            buf,
+        ))
     }
     fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
         Err(super::VfsError::NotSupported)
@@ -290,18 +319,26 @@ impl VfsNode for TerminalFramebufferDevice {
     }
 }
 
-/// `/dev/vtinput1` — write-only приём VT-байтов терминальной сессии 1.
-pub struct TerminalInputDevice;
+/// `/dev/vtinput{N}` — write-only приём VT-байтов терминальной сессии `N`.
+pub struct TerminalInputDevice {
+    session: usize,
+}
+
+impl TerminalInputDevice {
+    pub fn new(session: usize) -> TerminalInputDevice {
+        TerminalInputDevice { session }
+    }
+}
 
 impl VfsNode for TerminalInputDevice {
     fn name(&self) -> &str {
-        "vtinput1"
+        session_name("vtinput", self.session)
     }
     fn is_directory(&self) -> bool {
         false
     }
-    fn is_vtinput1(&self) -> bool {
-        true
+    fn vtinput_session(&self) -> Option<usize> {
+        Some(self.session)
     }
     /// `root:input 0660`: ввод окна — sensitive, как evdev и `vtinput`.
     fn mode(&self) -> u32 {
@@ -314,7 +351,49 @@ impl VfsNode for TerminalInputDevice {
         Err(super::VfsError::NotSupported)
     }
     fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
-        Ok(crate::drivers::vtinput::write_session(1, buf))
+        Ok(crate::drivers::vtinput::write_session(self.session, buf))
+    }
+}
+
+/// `/dev/vtmouse{N}` — write-only поток указателя терминальной сессии `N`.
+///
+/// Записи по 16 байт [`crate::drivers::vt_mouse_abi::VtMouseEvent`]; клиент
+/// окна переводит координаты внутри окна в пиксели поверхности и присылает
+/// движение/кнопки/колесо. Kernel-shell читает состояние через
+/// `ps2_mouse::poll()` (маршрут по задаче). `read` — `EBADF`/`NotSupported`:
+/// устройство одностороннее, как `vtinput`.
+pub struct TerminalMouseDevice {
+    session: usize,
+}
+
+impl TerminalMouseDevice {
+    pub fn new(session: usize) -> TerminalMouseDevice {
+        TerminalMouseDevice { session }
+    }
+}
+
+impl VfsNode for TerminalMouseDevice {
+    fn name(&self) -> &str {
+        session_name("vtmouse", self.session)
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+    fn vtmouse_session(&self) -> Option<usize> {
+        Some(self.session)
+    }
+    /// `root:input 0660`: указатель окна — sensitive (позиция/кнопки), как evdev.
+    fn mode(&self) -> u32 {
+        0o660
+    }
+    fn owner(&self) -> (u32, u32) {
+        (0, gid::INPUT)
+    }
+    fn read(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Err(super::VfsError::NotSupported)
+    }
+    fn write(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        Ok(crate::drivers::vt_mouse::write_session(self.session, buf))
     }
 }
 
@@ -328,9 +407,24 @@ pub fn vtinput() -> Arc<dyn VfsNode> {
     Arc::new(VtInputDevice) as Arc<dyn VfsNode>
 }
 
-/// `/dev/vtfb1` как `Arc<dyn VfsNode>`.
+/// `/dev/vtfb{N}` как `Arc<dyn VfsNode>`.
+pub fn vtfb(session: usize) -> Arc<dyn VfsNode> {
+    Arc::new(TerminalFramebufferDevice::new(session)) as Arc<dyn VfsNode>
+}
+
+/// `/dev/vtinput{N}` как `Arc<dyn VfsNode>`.
+pub fn vtinput_session(session: usize) -> Arc<dyn VfsNode> {
+    Arc::new(TerminalInputDevice::new(session)) as Arc<dyn VfsNode>
+}
+
+/// `/dev/vtmouse{N}` как `Arc<dyn VfsNode>`.
+pub fn vtmouse(session: usize) -> Arc<dyn VfsNode> {
+    Arc::new(TerminalMouseDevice::new(session)) as Arc<dyn VfsNode>
+}
+
+/// `/dev/vtfb1` как `Arc<dyn VfsNode>` (слот сессии 1; сохранено для тестов).
 pub fn vtfb1() -> Arc<dyn VfsNode> {
-    Arc::new(TerminalFramebufferDevice) as Arc<dyn VfsNode>
+    vtfb(1)
 }
 
 /// `/dev/vtinput1` как `Arc<dyn VfsNode>`.
@@ -340,5 +434,10 @@ pub fn uevent() -> Arc<dyn VfsNode> {
 }
 
 pub fn vtinput1() -> Arc<dyn VfsNode> {
-    Arc::new(TerminalInputDevice) as Arc<dyn VfsNode>
+    vtinput_session(1)
+}
+
+/// `/dev/vtmouse1` как `Arc<dyn VfsNode>`.
+pub fn vtmouse1() -> Arc<dyn VfsNode> {
+    vtmouse(1)
 }
