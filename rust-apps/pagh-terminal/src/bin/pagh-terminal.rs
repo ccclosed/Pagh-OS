@@ -144,7 +144,7 @@ struct Args {
     print_full: bool,
     dump_selection: bool,
     scroll: Option<usize>,
-    select: Option<(usize, usize, usize, usize)>,
+    select: Option<SelectSpec>,
     window: bool,
     focused: bool,
     title: String,
@@ -332,11 +332,15 @@ fn run_headless(args: &Args) -> Result<(), String> {
     if let Some(scroll) = args.scroll {
         terminal.screen.set_view_offset(scroll);
     }
-    if let Some((r1, c1, r2, c2)) = args.select {
-        terminal
-            .screen
-            .begin_selection_view(r1, c1, SelectionMode::Char);
-        terminal.screen.extend_selection_view(r2, c2);
+    match args.select {
+        Some(SelectSpec::All) => terminal.screen.select_all_view(),
+        Some(SelectSpec::Rect { r1, c1, r2, c2 }) => {
+            terminal
+                .screen
+                .begin_selection_view(r1, c1, SelectionMode::Char);
+            terminal.screen.extend_selection_view(r2, c2);
+        }
+        None => {}
     }
 
     if args.print || args.print_full {
@@ -884,6 +888,13 @@ fn run_client(args: &Args, socket: &str) -> Result<(), String> {
                     if dragging && held != 0 {
                         if let Some((cell_x, cell_y)) = cell_at(x, y, width, height) {
                             shell.terminal.screen.extend_selection_view(cell_y, cell_x);
+                            // A drag that reaches every visible row is the
+                            // "select the whole terminal" gesture: promote it
+                            // to whole-area selection so the rows under the
+                            // press/release columns are not clipped.  A drag
+                            // that stays inside the view keeps character
+                            // granularity (see `SelectionMode::Area`).
+                            shell.terminal.screen.promote_selection_to_area();
                             dirty = true;
                         }
                     }
@@ -2307,7 +2318,24 @@ fn parse_size(text: &str) -> Result<(u32, u32), String> {
     ))
 }
 
-fn parse_select(text: &str) -> Result<(usize, usize, usize, usize), String> {
+/// `--select` argument: a rectangle in view coordinates, or the whole output
+/// area.  `all` exists so a snapshot/evidence frame can show whole-area
+/// selection without having to guess the grid size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectSpec {
+    All,
+    Rect {
+        r1: usize,
+        c1: usize,
+        r2: usize,
+        c2: usize,
+    },
+}
+
+fn parse_select(text: &str) -> Result<SelectSpec, String> {
+    if text.eq_ignore_ascii_case("all") {
+        return Ok(SelectSpec::All);
+    }
     let (start, end) = text
         .split_once(':')
         .ok_or_else(|| format!("selection must be R1,C1:R2,C2, got {text:?}"))?;
@@ -2322,7 +2350,7 @@ fn parse_select(text: &str) -> Result<(usize, usize, usize, usize), String> {
     };
     let (r1, c1) = parse_pair(start)?;
     let (r2, c2) = parse_pair(end)?;
-    Ok((r1, c1, r2, c2))
+    Ok(SelectSpec::Rect { r1, c1, r2, c2 })
 }
 
 fn print_help() {
@@ -2332,7 +2360,7 @@ fn print_help() {
 USAGE:
   pagh-terminal --headless [--demo NAME|--script FILE] [--cols N --rows N]
                 [--out FILE.png] [--print|--print-full] [--window|--no-window]
-                [--scroll N] [--select R1,C1:R2,C2] [--dump-selection]
+                [--scroll N] [--select R1,C1:R2,C2|all] [--dump-selection]
   pagh-terminal --socket PATH [--size WxH] [--title TITLE]
                 [--vt-fb /dev/vtfb1] [--vt-input /dev/vtinput1]
   pagh-terminal --vt /dev/vtconsole0 [--socket PATH] [--vt-input /dev/vtinput]
@@ -2365,6 +2393,8 @@ HEADLESS:
   --out FILE       write PNG (window chrome by default; --no-window for viewport)
   --print          print the visible text
   --print-full     print scrollback + visible text
+  --select SPEC    R1,C1:R2,C2 picks a rectangle; `all` selects the whole
+                   visible output area (whole-area mode, no partial rows)
   --dump-selection print selected text
 
 LIVE:

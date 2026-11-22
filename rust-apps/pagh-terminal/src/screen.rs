@@ -43,6 +43,18 @@ pub enum SelectionMode {
     Char,
     /// Whole-line selection.
     Line,
+    /// Whole-area selection: the drag picks *rows*, and every picked row is
+    /// selected across its full width.
+    ///
+    /// Character mode clips the first row at the press column and the last row
+    /// at the release column, which is exactly wrong for output that is a
+    /// *picture* built from columns in different colours (a fastfetch logo plus
+    /// its ANSI palette strip): starting the drag past the logo's first column
+    /// or ending before the strip's last column leaves a ragged edge.  Area
+    /// mode has no partial rows, so a drag across the whole grid selects the
+    /// whole visible output area — see [`Screen::select_all_view`] and
+    /// [`Screen::promote_selection_to_area`].
+    Area,
 }
 
 /// A selection anchor and focus in *absolute* line coordinates.  Absolute line
@@ -1277,6 +1289,63 @@ impl Screen {
         self.selection = None;
     }
 
+    /// Select the whole visible output area in one operation.
+    ///
+    /// "Whole area" is the visible grid, not the scrollback: line 0 of the view
+    /// through the last visible row, column 0 through the last column.  Used by
+    /// select-all (keyboard/CLI) and by the live pointer path once a drag has
+    /// spanned every visible row (see [`Self::promote_selection_to_area`]).
+    pub fn select_all_view(&mut self) {
+        let first = self.absolute_line(0);
+        let last = self.absolute_line(self.rows.saturating_sub(1));
+        self.selection = Some(Selection {
+            anchor: (first, 0),
+            focus: (last, self.cols.saturating_sub(1)),
+            mode: SelectionMode::Area,
+        });
+    }
+
+    /// Does the current selection span every visible row (in either drag
+    /// direction)?
+    ///
+    /// Columns are deliberately ignored: dragging from anywhere in the top row
+    /// to anywhere in the bottom row is the "select the whole terminal" gesture,
+    /// and the columns the pointer happened to start/end on must not clip the
+    /// picture that is being copied.
+    pub fn drag_covers_whole_view(&self) -> bool {
+        let Some((start, end)) = self.selection_bounds() else {
+            return false;
+        };
+        let first = self.absolute_line(0);
+        let last = self.absolute_line(self.rows.saturating_sub(1));
+        start.0 <= first && end.0 >= last
+    }
+
+    /// Promote a char-granular drag that spans the whole visible grid to
+    /// [`SelectionMode::Area`], snapping the anchor to column 0 and the focus to
+    /// the last column so no row is partially selected.
+    ///
+    /// Returns whether the selection was promoted.  A drag that stays inside
+    /// the view keeps character granularity: promotion is the whole-terminal
+    /// gesture, not every multi-row drag.
+    pub fn promote_selection_to_area(&mut self) -> bool {
+        if !self.drag_covers_whole_view() {
+            return false;
+        }
+        let Some(sel) = &mut self.selection else {
+            return false;
+        };
+        if sel.mode == SelectionMode::Area {
+            return false;
+        }
+        let last_col = self.cols.saturating_sub(1);
+        let anchor_leads = sel.anchor <= sel.focus;
+        sel.mode = SelectionMode::Area;
+        sel.anchor.1 = if anchor_leads { 0 } else { last_col };
+        sel.focus.1 = if anchor_leads { last_col } else { 0 };
+        true
+    }
+
     pub fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
         let sel = self.selection?;
         if sel.anchor <= sel.focus {
@@ -1293,7 +1362,10 @@ impl Screen {
         };
         let sel = self.selection.unwrap();
         match sel.mode {
-            SelectionMode::Line => line >= start.0 && line <= end.0,
+            // Line and Area are row-granular: every column of a picked row is
+            // part of the selection.  Area only differs in how the user got
+            // there (a whole-grid drag or `select_all_view`).
+            SelectionMode::Line | SelectionMode::Area => line >= start.0 && line <= end.0,
             SelectionMode::Char => {
                 if line < start.0 || line > end.0 {
                     false
@@ -1319,7 +1391,7 @@ impl Screen {
                 continue;
             };
             let (from, to) = match sel.mode {
-                SelectionMode::Line => (0, self.cols.saturating_sub(1)),
+                SelectionMode::Line | SelectionMode::Area => (0, self.cols.saturating_sub(1)),
                 SelectionMode::Char => {
                     let from = if line == start.0 { start.1 } else { 0 };
                     let to = if line == end.0 { end.1 } else { self.cols - 1 };
@@ -1614,6 +1686,103 @@ mod tests {
         assert_eq!(s.selection_text().as_deref(), Some("ello\nwor"));
         s.begin_selection_abs(2, 0, SelectionMode::Line);
         assert_eq!(s.selection_text().as_deref(), Some("!"));
+    }
+
+    /// Fill the first `texts.len()` rows with `texts`, one row each.
+    fn fill_rows(s: &mut Screen, texts: &[&str]) {
+        for (y, text) in texts.iter().enumerate() {
+            for (x, ch) in text.chars().enumerate() {
+                s.set_cell(
+                    x,
+                    y,
+                    Cell {
+                        ch,
+                        ..Cell::default()
+                    },
+                );
+            }
+        }
+    }
+
+    /// Whole-area mode is row-granular: a drag that starts and ends in the
+    /// middle of a line still selects both lines completely, so a fastfetch
+    /// logo's left columns and its palette strip's right columns are never
+    /// clipped off.
+    #[test]
+    fn area_selection_keeps_full_rows() {
+        let mut s = Screen::new(6, 4);
+        fill_rows(&mut s, &["aaaaaa", "bbbbbb", "cccccc", "dddddd"]);
+        s.begin_selection_abs(1, 4, SelectionMode::Area);
+        s.extend_selection_abs(2, 1);
+        assert_eq!(s.selection_text().as_deref(), Some("bbbbbb\ncccccc"));
+        for line in 1..=2 {
+            for col in 0..6 {
+                assert!(s.is_selected(line, col), "({line},{col}) must be selected");
+            }
+        }
+        assert!(!s.is_selected(0, 4));
+        assert!(!s.is_selected(3, 1));
+    }
+
+    /// `select_all_view` is the one-shot whole-output-area selection: every
+    /// cell of the visible grid, nothing outside it.
+    #[test]
+    fn select_all_view_covers_whole_output_area() {
+        let mut s = Screen::new(5, 3);
+        fill_rows(&mut s, &["abcde", "fghij", "klmno"]);
+        s.select_all_view();
+        assert_eq!(s.selection().unwrap().mode, SelectionMode::Area);
+        for line in 0..3 {
+            for col in 0..5 {
+                assert!(s.is_selected(line, col), "({line},{col}) must be selected");
+            }
+        }
+        assert_eq!(s.selection_text().as_deref(), Some("abcde\nfghij\nklmno"));
+        assert!(!s.is_selected(3, 0), "selection leaked past the last row");
+        assert!(s.drag_covers_whole_view());
+    }
+
+    /// The live pointer gesture: a drag that reaches every visible row becomes
+    /// a whole-area selection; a drag inside the view stays character-granular.
+    #[test]
+    fn whole_view_drag_promotes_to_area_in_both_directions() {
+        let mut s = Screen::new(6, 4);
+        fill_rows(&mut s, &["aaaaaa", "bbbbbb", "cccccc", "dddddd"]);
+
+        // Inside the view: no promotion, character granularity is preserved.
+        s.begin_selection_abs(1, 3, SelectionMode::Char);
+        s.extend_selection_abs(2, 1);
+        assert!(!s.drag_covers_whole_view());
+        assert!(!s.promote_selection_to_area());
+        assert_eq!(s.selection().unwrap().mode, SelectionMode::Char);
+        assert_eq!(s.selection_text().as_deref(), Some("bbb\ncc"));
+
+        // Top row -> bottom row: promoted to whole-area, full width.
+        s.begin_selection_abs(0, 4, SelectionMode::Char);
+        s.extend_selection_abs(3, 1);
+        assert!(s.drag_covers_whole_view());
+        assert!(s.promote_selection_to_area());
+        let sel = s.selection().unwrap();
+        assert_eq!(sel.mode, SelectionMode::Area);
+        assert_eq!(sel.anchor, (0, 0));
+        assert_eq!(sel.focus, (3, 5));
+        for line in 0..4 {
+            for col in 0..6 {
+                assert!(s.is_selected(line, col), "({line},{col}) must be selected");
+            }
+        }
+        assert!(!s.promote_selection_to_area(), "promotion is idempotent");
+
+        // Bottom -> top drag must promote the same way, with the anchor holding
+        // the bottom-right corner.
+        s.begin_selection_abs(3, 4, SelectionMode::Char);
+        s.extend_selection_abs(0, 1);
+        assert!(s.promote_selection_to_area());
+        let sel = s.selection().unwrap();
+        assert_eq!(sel.mode, SelectionMode::Area);
+        assert_eq!(sel.anchor, (3, 5));
+        assert_eq!(sel.focus, (0, 0));
+        assert!(s.is_selected(0, 0) && s.is_selected(3, 5));
     }
 
     #[test]

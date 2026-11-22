@@ -86,7 +86,11 @@ cargo run -- --vt /dev/vtconsole0 --socket /tmp/pagh-desktop.sock --mirror-vt
 
 Headless-демо: `01-welcome`, `02-colors`, `03-scrollback`, `04-unicode`.
 `--select R1,C1:R2,C2 --dump-selection` печатает выделенный текст;
-`--print-full` включает scrollback.
+`--select all` выделяет всю видимую область вывода целиком — режим
+`SelectionMode::Area`: каждая затронутая строка берётся по всей ширине, поэтому
+первая/последняя строка не обрезаются по колонке нажатия. Тот же режим
+включается живым жестом «протяжка от верхней строки до нижней» (в клиентских
+окнах: demo/pipe-shell), `--print-full` включает scrollback.
 
 ## Ограничения
 

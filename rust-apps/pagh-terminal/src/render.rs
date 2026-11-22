@@ -1319,6 +1319,93 @@ mod tests {
         }
     }
 
+    /// Whole-area selection over a fastfetch-shaped block.  The regression this
+    /// guards is visual, not just arithmetic: one `selection_fg` fill turned a
+    /// multi-coloured `#` logo into dark blocks, the key/value column grey, and
+    /// the ANSI background strip into a single blue bar.  Here every cell of the
+    /// area must be washed (background art included), while each glyph keeps its
+    /// *own* colour, byte for byte.
+    #[test]
+    fn whole_area_selection_keeps_every_glyph_colour() {
+        const SCRIPT: &str = "\x1b[1m\x1b[33m##\x1b[0m \x1b[1m\x1b[37mPagh 2.25\x1b[0m\r\n\
+                              \x1b[41m  \x1b[0m\x1b[32mok\x1b[0m\x1b[35mOS\x1b[0m\r\n\
+                              \x1b[1m\x1b[33m####\x1b[0m";
+        let theme = Theme::default();
+        let opts = RenderOptions {
+            show_cursor: false,
+            ..RenderOptions::default()
+        };
+        let mut plain = Terminal::new(16, 3);
+        plain.feed_str(SCRIPT);
+        let before = render_screen(&plain.screen, &theme, &opts);
+
+        let mut selected = Terminal::new(16, 3);
+        selected.feed_str(SCRIPT);
+        selected.screen.select_all_view();
+        let after = render_screen(&selected.screen, &theme, &opts);
+
+        let highlight = theme.bg.lerp(theme.selection, SELECTION_BG_MIX);
+        let yellow = theme.palette[11].lerp(Rgb::WHITE, 0.12);
+        let white = theme.palette[15].lerp(Rgb::WHITE, 0.12);
+        let green = theme.palette[2];
+        let magenta = theme.palette[5];
+        let red_washed = theme.palette[1].lerp(theme.selection, SELECTION_BG_MIX);
+
+        let mut colours_after = std::collections::BTreeSet::new();
+        let mut glyph_pixels = 0usize;
+        let mut washed_backgrounds = 0usize;
+        for row in 0..3 {
+            for col in 0..16 {
+                for (b, a) in cell_pixels(&before, row, col)
+                    .iter()
+                    .zip(cell_pixels(&after, row, col).iter())
+                {
+                    if *b == theme.bg.to_array() {
+                        // Blank cells included: the drag covers the whole area,
+                        // not only the cells that hold text.
+                        assert_eq!(a, &highlight.to_array(), "cell ({row},{col}) not washed");
+                        washed_backgrounds += 1;
+                    } else if [
+                        yellow.to_array(),
+                        white.to_array(),
+                        green.to_array(),
+                        magenta.to_array(),
+                    ]
+                    .contains(b)
+                    {
+                        assert_eq!(b, a, "glyph colour lost in cell ({row},{col})");
+                        colours_after.insert(*a);
+                        glyph_pixels += 1;
+                    } else if *b == theme.palette[1].to_array() {
+                        // ANSI-background art under the wash stays art.
+                        assert_eq!(a, &red_washed.to_array(), "background art erased");
+                    }
+                }
+            }
+        }
+        assert!(glyph_pixels > 60, "too few glyph pixels: {glyph_pixels}");
+        assert!(
+            washed_backgrounds > 1_000,
+            "area barely washed: {washed_backgrounds}"
+        );
+        assert!(
+            colours_after.len() >= 3,
+            "glyphs collapsed into {} colour(s) — graying regression",
+            colours_after.len()
+        );
+        for row in 0..3 {
+            for col in 0..16 {
+                for px in cell_pixels(&after, row, col) {
+                    assert_ne!(
+                        px,
+                        theme.bg.to_array(),
+                        "cell ({row},{col}) kept the plain background"
+                    );
+                }
+            }
+        }
+    }
+
     /// Hidden text must stay hidden: now that the foreground is preserved, the
     /// "paint fg in the background colour" decision has to follow the *washed*
     /// background, not the pre-selection one.
