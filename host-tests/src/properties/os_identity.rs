@@ -11,7 +11,8 @@
 //    проехало молча и не сломало configure-скрипты.
 
 use crate::os_identity::{
-    format_motd, format_os_release, format_pagh_release, is_canonical_os_release, OS_ID, OS_NAME,
+    format_motd, format_os_release, format_pagh_release, is_canonical_os_release,
+    FASTFETCH_CONFIG, FASTFETCH_CONFIG_PATH, FASTFETCH_LOGO, FASTFETCH_LOGO_PATH, OS_ID, OS_NAME,
     UTS_DOMAINNAME, UTS_MACHINE, UTS_NODENAME, UTS_RELEASE, UTS_SYSNAME, UTS_VERSION,
 };
 use proptest::prelude::*;
@@ -126,4 +127,57 @@ fn uname_stays_linux_compat_uts() {
     assert_eq!(UTS_VERSION, "#1 pagh compat");
     assert_eq!(UTS_MACHINE, "x86_64");
     assert_eq!(UTS_DOMAINNAME, "(none)");
+}
+
+/// Оформление `fastfetch` — тоже идентичность: логотип Pagh вместо
+/// автоопределённого пингвина и строка `Kernel`, которая начинается с
+/// `Pagh-OS`, а не с `Linux`. `uname` при этом не меняется (см. предыдущий
+/// тест): UTS-релиз остаётся видимым после имени ОС, но слова `Linux` в
+/// оформлении нет вовсе.
+#[test]
+fn fastfetch_is_branded_as_pagh() {
+    let config = core::str::from_utf8(FASTFETCH_CONFIG).expect("fastfetch config is ASCII");
+    let logo = core::str::from_utf8(FASTFETCH_LOGO).expect("fastfetch logo is ASCII");
+
+    // Логотип — файл, а не встроенный (иначе fastfetch снова покажет пингвина,
+    // как только `ID=pagh` не совпадёт ни с одним брендом).
+    assert!(config.contains("\"type\": \"file\""));
+    assert!(config.contains(&format!("\"source\": \"{FASTFETCH_LOGO_PATH}\"").as_str()));
+    assert_eq!(FASTFETCH_CONFIG_PATH, "/etc/fastfetch/config.jsonc");
+    assert!(!config.contains("penguin"));
+    // Оформление больше не называет ядро Linux-ом ни в каком виде.
+    assert!(!config.contains("Linux"));
+
+    // Строка Kernel называет Pagh-OS и показывает UTS-релиз.
+    let kernel = config
+        .split("\"type\": \"kernel\"")
+        .nth(1)
+        .expect("a kernel module is configured");
+    assert!(kernel.contains("Pagh-OS"));
+    assert!(kernel.contains("{release}"));
+    assert!(!kernel.contains("\"format\": \"{sysname} {release}\""));
+
+    // Логотип печатается и в 8x18-шрифте kernel-консоли, и на serial — только
+    // ASCII 0x20..0x7E, иначе в одном из двух мест будут «квадратики».
+    assert!(!logo.is_empty());
+    assert!(logo.ends_with('\n'));
+    for ch in logo.chars() {
+        assert!(
+            ch == '\n' || (' '..='~').contains(&ch),
+            "non-ASCII logo character {ch:?}"
+        );
+    }
+    // Слово `PAGH` в стиле figlet «standard»: контур из `/ \ | _`, пять строк.
+    // Строки сравниваются дословно — согласованный арт не должен «улучшаться»
+    // молча; ширина (33) влезает в 80-колоночную консоль вместе со сводкой.
+    let expected = " ____       _       ____   _   _\n\
+|  _ \\     / \\     / ___| | | | |\n\
+| |_) |   / _ \\   | |  _  | |_| |\n\
+|  __/   / ___ \\  | |_| | |  _  |\n\
+|_|     /_/   \\_\\  \\____| |_| |_|\n";
+    assert_eq!(logo, expected);
+    let rows: Vec<&str> = logo.lines().collect();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.iter().map(|row| row.len()).max(), Some(33));
+    assert!(rows.iter().all(|row| !row.contains('#')));
 }

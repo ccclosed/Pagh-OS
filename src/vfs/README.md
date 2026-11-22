@@ -32,6 +32,12 @@ mountinfo/statfs и не смоделированные Linux-файлы per-thr
 
 - `VfsResult<T>`, `VfsError::{NotFound, NotSupported, InvalidArgument, IoError, AlreadyExists}`.
 - `FsStat { block_size, blocks_total, blocks_free, inodes_total, inodes_free }` — для `statfs`/`fstatfs`.
+  `fs_stat() == None` означает «ФС не ведёт учёта ёмкости» (псевдо-ФС `/dev`,
+  `/proc`, ramfs `/tmp`): слой Linux-compat отвечает на `statfs` для таких узлов
+  `f_type = RAMFS_MAGIC` и нулевыми блоками, а **не** счётчиками кадров PMM —
+  иначе RAM выдавалась бы за ёмкость диска (`fastfetch` печатал `Disk (/)` равным
+  объёму памяти). Реальную ёмкость отдаёт ext2 через `Some(FsStat)`; гостевой `/`
+  резолвится в его корень.
 - `trait VfsNode: Send + Sync` — обязательные только `name`/`is_directory`; дефолты:
   `read/write/truncate/readdir/create_dir/create_file/remove/create_symlink/link` →
   `Err(NotSupported)`, `lookup` → `Err(NotFound)`, `fs_stat` → `None`, `size`/`fs_ino` → `0`,

@@ -173,6 +173,22 @@ fn seed_identity() -> Result<(), VfsError> {
         "/mnt/etc/os-release",
         &os_identity::format_os_release(env!("CARGO_PKG_VERSION")),
     )?;
+    // Оформление fastfetch: логотип Pagh и системная конфигурация, которая
+    // называет ядро Pagh-OS. Логотип — отдельный файл, потому что fastfetch
+    // (`logo.type = file`) читает его из `logo.source` в конфиге. Оба —
+    // `write_once`: пользователь вправе оформить fastfetch по-своему, и boot-путь
+    // не должен молча возвращать наше оформление. Гостевые пути
+    // (`/etc/fastfetch/...`) отображаются на `/mnt/etc/...` chroot-ом слоя
+    // Linux-compat, поэтому ядро пишет их под `/mnt`.
+    ensure_dir("/mnt/etc/fastfetch")?;
+    write_once(
+        &alloc::format!("/mnt{}", os_identity::FASTFETCH_CONFIG_PATH),
+        os_identity::FASTFETCH_CONFIG,
+    )?;
+    write_once(
+        &alloc::format!("/mnt{}", os_identity::FASTFETCH_LOGO_PATH),
+        os_identity::FASTFETCH_LOGO,
+    )?;
     ensure_dir_owned("/mnt/home/oleg", 1000, gid::OLEG, 0o755)?;
     Ok(())
 }

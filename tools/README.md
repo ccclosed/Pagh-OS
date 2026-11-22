@@ -136,7 +136,9 @@
   `ppkg update`, `ppkg install nano fastfetch ncurses-base`, `lxrun nano -I`
   (`Ctrl+O`/Enter/`Ctrl+X`) и голое `fastfetch` (PATH-fallback, без `lxrun`). Утверждения: пара
   `[DIAG] window session=1 command=…/done=…` на каждую команду (ядро печатает её мимо
-  фильтра сессии) + PNG кадра (`.cache/termwindow-*.png`), отсутствие вывода команд окна
+  фильтра сессии) + PNG кадра (`.cache/termwindow-*.png`), идентичность `fastfetch`
+  (строки `OS:`/`Kernel:` называют `Pagh-OS`, а не `Linux`; `Disk (/)` — ёмкость ext2,
+  а не объём RAM — сравнивается с `Memory`), отсутствие вывода команд окна
   в serial (`1K-blocks`/`STAT COMMAND`/`uid=0(root)` — иначе команда исполнилась в
   boot-shell), сохранённые `nano` файлы, прочитанные обратно из ext2 через `debugfs`, и
   отсутствие `PANIC`/`[EXC`. Диск по умолчанию 256 МиБ (`--disk-mb`; 64 МиБ хватает

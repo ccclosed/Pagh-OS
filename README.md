@@ -512,8 +512,12 @@ ARCH=x86_64
 
 Поэтому os-release-совместимые инструменты видят правильное имя; например,
 `lxrun /mnt/usr/bin/fastfetch` печатает строку `OS: Pagh-OS 2.24.0 x86_64`.
-`/proc/sys/kernel/ostype` отвечает `Pagh`, `/proc/sys/kernel/osrelease` и
-`/proc/version` несут настоящую версию.
+Системная конфигурация `/etc/fastfetch/config.jsonc` (её засеивает
+`provision.rs` вместе с ASCII-логотипом `/etc/fastfetch/pagh-logo.txt`) заменяет
+пингвина на figlet-логотип `PAGH` и оформляет строку `Kernel` как
+`Pagh-OS 6.1.0-pagh`; `Disk (/)` показывает реальную ёмкость
+ext2, а не объём RAM. `/proc/sys/kernel/ostype` отвечает `Pagh`,
+`/proc/sys/kernel/osrelease` и `/proc/version` несут настоящую версию.
 
 `uname(2).sysname` при этом остаётся `Linux` — это **UTS-идентификатор
 Linux-совместимости**, а не имя ОС: его опрашивают Linux-бинарники, `configure` и

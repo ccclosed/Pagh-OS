@@ -3808,6 +3808,35 @@ def mode_termwindow(h: "Harness") -> tuple[str, int]:
             ok &= h.check("bare `fastfetch` produced output (compat stdout on serial)",
                           len(fastfetch_out.strip()) > 120,
                           f"{len(fastfetch_out)} bytes after the command")
+            # Identity, not just "it printed something": the OS and Kernel lines
+            # name Pagh-OS (the UTS compat release may follow, but the name must
+            # not be the Linux kernel's), and the Disk (/) total must be the ext2
+            # volume's, not the guest's RAM. The old `statfs` fallback made the
+            # disk total equal the Memory total; comparing the two strings is the
+            # regression assertion for that bug. ANSI is stripped first: the
+            # kernel console mirrors compat stdout to serial byte-for-byte,
+            # colour escapes included, and a key is followed by a reset escape
+            # before the `:` separator. The `Disk (/)` mount point also arrives
+            # wrapped in an OSC-8 hyperlink (`\e]8;;file:///\e\\`), which is not
+            # a CSI sequence and would otherwise split the key.
+            plain_out = re.sub(
+                r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[A-Za-z]",
+                "", fastfetch_out)
+            ok &= h.check("bare `fastfetch` shows Pagh-OS identity",
+                          re.search(r"OS:\s+Pagh-OS\b", plain_out) is not None
+                          and re.search(r"Kernel:\s+Pagh-OS\b", plain_out) is not None
+                          and re.search(r"Kernel:\s+Linux\b", plain_out) is None,
+                          "OS/Kernel lines: "
+                          + (regex_first(r"(?m)^(OS|Kernel):.*$", plain_out) or "missing"))
+            memory_total = re.search(
+                r"Memory:\s+[\d.]+ \w+iB / ([\d.]+ \w+iB)", plain_out)
+            disk_total = re.search(
+                r"Disk \(/\):\s+[\d.]+ \w+iB / ([\d.]+ \w+iB)", plain_out)
+            ok &= h.check("fastfetch Disk (/) is the ext2 volume, not RAM",
+                          memory_total is not None and disk_total is not None
+                          and memory_total.group(1) != disk_total.group(1),
+                          f"memory={memory_total.group(1) if memory_total else '?'} "
+                          f"disk={disk_total.group(1) if disk_total else '?'}")
             linux_nano_exited = closed is not None
             ok &= run_in_window("20-sync", "sync", "sync")
 

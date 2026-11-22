@@ -17,8 +17,13 @@
 //!   остаётся `Linux`, потому что его опрашивают Linux-бинарники, configure-
 //!   скрипты и `config.guess`; менять его значило бы ломать совместимость,
 //!   ради которой слой и существует. Это ABI-идентификатор, а не имя ОС:
-//!   `fastfetch` берёт строку `OS` из `/etc/os-release`, а `Kernel` — из
-//!   `uname` (`Linux 6.1.0-pagh`), и вторая строка описывает UTS-совместимость.
+//!   `fastfetch` берёт строку `OS` из `/etc/os-release`, а строку `Kernel`
+//!   оформляет [`FASTFETCH_CONFIG`] (`Pagh-OS {release}`), чтобы имя ядра не
+//!   читалось как имя ОС.
+//! * `/etc/fastfetch/{config.jsonc,pagh-logo.txt}` ([`FASTFETCH_CONFIG`],
+//!   [`FASTFETCH_LOGO`]) — **оформление `fastfetch`**: логотип Pagh вместо
+//!   пингвина и строка `Kernel`, называющая Pagh-OS. `provision.rs` засеивает
+//!   её как и остальные идентичность-файлы.
 //!
 //! Полная модель и обоснование — `docs/os-identity.md`.
 //!
@@ -122,6 +127,77 @@ pub fn format_pagh_release(version: &str) -> Vec<u8> {
     out.push(b'\n');
     out
 }
+
+/// Гостевой путь конфигурации `fastfetch` (стандартный системный config-dir).
+///
+/// `fastfetch` обходит `$XDG_CONFIG_HOME`, `~/.config`, `/etc/xdg` и последним
+/// `/etc`; файл здесь — системное оформление Pagh-OS, а не пользовательская
+/// настройка, поэтому он лежит в `/etc/fastfetch/config.jsonc` и не
+/// перезаписывает `~/.config/fastfetch/config.jsonc`.
+pub const FASTFETCH_CONFIG_PATH: &str = "/etc/fastfetch/config.jsonc";
+
+/// Гостевой путь ASCII-логотипа Pagh, на который ссылается
+/// [`FASTFETCH_CONFIG`] (`"logo": { "type": "file" }`).
+pub const FASTFETCH_LOGO_PATH: &str = "/etc/fastfetch/pagh-logo.txt";
+
+/// Системная конфигурация `fastfetch`: идентичность Pagh-OS вместо
+/// автоопределённого Linux-логотипа.
+///
+/// Что фиксируется (и почему):
+///
+/// * `logo` — файл [`FASTFETCH_LOGO`] (слово `PAGH` в стиле figlet «standard»)
+///   вместо встроенного пингвина, который `fastfetch` выбирает, когда
+///   `ID=pagh` не совпал ни с одним брендом;
+/// * `kernel.format` — строка `Kernel` начинается с `Pagh-OS`, а не с `Linux`.
+///   `uname(2).sysname` остаётся `Linux` (UTS-совместимость ABI — см.
+///   [`UTS_SYSNAME`]), но в оформлении это имя не печатается: виден только
+///   UTS-релиз `6.1.0-pagh` после `Pagh-OS`;
+/// * `modules` — только модули, которые в этом госте действительно отвечают;
+///   `os` берёт `PRETTY_NAME`/`ARCH` из `/etc/os-release`, `memory` — реальный
+///   объём RAM из `/proc/meminfo`, `disk` — `statvfs` корня ext2 (см.
+///   `docs/os-identity.md` §2.1–2.2).
+///
+/// Файл статический (версию печатают `os`/`kernel` из живых источников), поэтому
+/// это байтовая константа, а не форматтер.
+pub const FASTFETCH_CONFIG: &[u8] = br#"{
+    "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+    "logo": {
+        "type": "file",
+        "source": "/etc/fastfetch/pagh-logo.txt",
+        "padding": { "top": 1, "left": 2, "right": 6 },
+        "color": { "1": "light_cyan" }
+    },
+    "display": {
+        "color": { "keys": "light_cyan" }
+    },
+    "modules": [
+        "title",
+        "os",
+        { "type": "kernel", "format": "Pagh-OS {release}" },
+        "uptime",
+        "cpu",
+        "memory",
+        "disk",
+        "break",
+        "colors"
+    ]
+}
+"#;
+
+/// ASCII-логотип Pagh-OS для `fastfetch` — слово `PAGH` в стиле figlet
+/// «standard» (контур из `/ \ | _`).
+///
+/// Только ASCII 0x20..0x7E: тот же файл печатается и в терминальном окне
+/// (kernel-сессия рендерится встроенным шрифтом 8x18, у которого нет
+/// Unicode-глифов блоков), и на serial, поэтому Unicode-арт здесь был бы
+/// «квадратиками» в одном из двух мест. Цвет задаёт `logo.color` в
+/// [`FASTFETCH_CONFIG`], а не escape-последовательности в файле.
+pub const FASTFETCH_LOGO: &[u8] = br#" ____       _       ____   _   _
+|  _ \     / \     / ___| | | | |
+| |_) |   / _ \   | |  _  | |_| |
+|  __/   / ___ \  | |_| | |  _  |
+|_|     /_/   \_\  \____| |_| |_|
+"#;
 
 /// Отрендерить `/etc/motd` первого boot'а.
 pub fn format_motd(version: &str) -> Vec<u8> {
