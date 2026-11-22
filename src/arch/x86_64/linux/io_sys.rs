@@ -1241,9 +1241,11 @@ fn current_cwd() -> String {
 /// если она относительная, и схлопнуть `.`/`..`/пустые компоненты в чистый
 /// абсолютный путь.
 ///
-/// `..` в корне остаётся в корне; результат всегда начинается с `/` и не имеет
-/// завершающего слэша (кроме голого `/`). Это единственное место, где
-/// относительные пути `open`/`openat`/`access`/`chdir`/`statfs`/`readlink`
+/// Гостевой корень `/` отображается в `/mnt` (корень ext2), поэтому результат
+/// здесь — уже путь пространства VFS, а не гостевой: голый `/` становится
+/// `/mnt`, `/etc/x` — `/mnt/etc/x`, а деревья ядра (`/dev`, `/proc`, `/sys`,
+/// `/tmp`, явный `/mnt`, USB-тома) сохраняют корень. Это единственное место,
+/// где относительные пути `open`/`openat`/`access`/`chdir`/`statfs`/`readlink`
 /// становятся абсолютными до [`vfs::lookup_path`].
 fn resolve_path(path: &str) -> String {
     let combined = if path.starts_with('/') {
@@ -1268,7 +1270,17 @@ fn resolve_path(path: &str) -> String {
         }
     }
     if stack.is_empty() {
-        return String::from("/");
+        // Гостевой корень — дерево ext2, а не синтетический корень VFS. Без
+        // этого `/` оставался пустым rootfs'ом (в нём только /dev, /proc, /tmp,
+        // /mnt): `ls /` не показывал /etc, /usr, /home, а `statvfs("/")`
+        // отчитывался о RAM (PMM-кадрах) как о ёмкости диска — fastfetch
+        // показывал «Disk (/) 6/16 GiB» на образе в 256 МиБ. Это то же
+        // chroot-отображение, что и для `/etc/x` → `/mnt/etc/x`, и симлинк с
+        // целью `/` отображается так же
+        // (`vfs::link_walk::map_guest_target`). `mount_at("/mnt")` выполняется
+        // до появления любых compat-процессов (их образы лежат на ext2), так что
+        // промах здесь означает «диска нет», а не рабочую загрузку без корня.
+        return String::from("/mnt");
     }
     let mut out = String::new();
     for comp in &stack {
@@ -1280,7 +1292,7 @@ fn resolve_path(path: &str) -> String {
     // явное представление /mnt), всё остальное резолвится под /mnt — именно так
     // /etc/resolv.conf виден резолверу glibc. Предикат сравнивает целые
     // компоненты пути (`/process` — гостевой путь, а не путь `/proc`).
-    if out != "/" && !super::io::guest_path_keeps_root(&out) {
+    if !super::io::guest_path_keeps_root(&out) {
         let mut mapped = String::with_capacity(out.len() + 4);
         mapped.push_str("/mnt");
         mapped.push_str(&out);
@@ -3819,9 +3831,21 @@ struct LinuxStatfs {
 /// Магия суперблока ext2, сообщается в `f_type`, чтобы `df`-подобные пробы узнавали ФС.
 const EXT2_SUPER_MAGIC: i64 = 0xEF53;
 
+/// Магия ramfs (`RAMFS_MAGIC` в Linux): псевдо-ФС, у которой нет блочной
+/// ёмкости. Сообщается в `f_type` для узлов без [`vfs::FsStat`] (`/dev`,
+/// `/proc`, ramfs `/tmp`), чтобы `statfs` не выдавал их за ext2.
+const RAMFS_MAGIC: i64 = 0x858458F6;
+
 /// Собрать снимок `statfs`. Если ФС узла сообщает ёмкость (`vfs::FsStat`, ext2),
-/// используются реальные счётчики блоков/inode; иначе подставляются счётчики
-/// кадров PMM (ramfs, синтетические узлы /dev).
+/// используются реальные счётчики блоков/inode.
+///
+/// Для псевдо-ФС (`fs == None`) ёмкости нет: ветка отдаёт `RAMFS_MAGIC` и нули.
+/// Раньше здесь стояли счётчики кадров PMM, и `statfs` показывал **RAM как
+/// ёмкость диска**: `fastfetch` на образе в 256 МиБ печатал `Disk (/) 6.00 GiB`
+/// (равно объёму памяти QEMU), а `df /tmp` — гигабайты, которых у ramfs нет.
+/// Гостевой `/` резолвится в корень ext2 (`resolve_path`), поэтому реальную
+/// ёмкость диска отдаёт ветка `Some`; нули здесь — честное «учёта ёмкости нет»,
+/// а не выдуманный размер.
 fn build_statfs_for(fs: Option<vfs::FsStat>) -> LinuxStatfs {
     match fs {
         Some(fs) => LinuxStatfs {
@@ -3838,24 +3862,20 @@ fn build_statfs_for(fs: Option<vfs::FsStat>) -> LinuxStatfs {
             f_flags: 0,
             f_spare: [0; 4],
         },
-        None => {
-            let total = crate::memory::pmm::total_frames() as u64;
-            let free = crate::memory::pmm::free_frames() as u64;
-            LinuxStatfs {
-                f_type: EXT2_SUPER_MAGIC,
-                f_bsize: 4096,
-                f_blocks: total,
-                f_bfree: free,
-                f_bavail: free,
-                f_files: total,
-                f_ffree: free,
-                f_fsid: [0, 0],
-                f_namelen: 255,
-                f_frsize: 4096,
-                f_flags: 0,
-                f_spare: [0; 4],
-            }
-        }
+        None => LinuxStatfs {
+            f_type: RAMFS_MAGIC,
+            f_bsize: 4096,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_fsid: [0, 0],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: 0,
+            f_spare: [0; 4],
+        },
     }
 }
 

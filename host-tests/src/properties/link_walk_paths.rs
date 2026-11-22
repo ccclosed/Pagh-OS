@@ -336,6 +336,16 @@ fn guest_target_mapping() {
             }
         );
     }
+    // The guest root itself is the ext2 root, not the synthetic VFS root: a
+    // symlink to `/` and `resolve_path("/")` must land on the same directory
+    // (otherwise `statvfs("/")` reports RAM instead of the disk).
+    assert_eq!(
+        map_guest_target("/"),
+        LinkTarget {
+            path: "/mnt".to_string(),
+            absolute: true
+        }
+    );
     // Relative targets stay verbatim and are flagged relative.
     assert_eq!(
         map_guest_target("../real"),
