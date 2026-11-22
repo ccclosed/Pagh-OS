@@ -34,8 +34,8 @@ use pagh_terminal::client::{close_name, error_name, Event, ShmFrame, SurfaceClie
 use pagh_terminal::demo::{self, DemoShell};
 use pagh_terminal::font::{CELL_H, CELL_W};
 use pagh_terminal::kernelsession::{
-    is_missing_device, is_session_end, render_notice, Draw, FileInput, FrameSource, KernelFrame,
-    KeyForwarder, VtFbError,
+    fit_placement, is_missing_device, is_session_end, render_notice, Draw, FileInput, FrameSource,
+    KernelFrame, KeyForwarder, MouseForwarder, VtFbError,
 };
 use pagh_terminal::keys::{self, KeyModes};
 use pagh_terminal::protocol::{buttons, InputEvent};
@@ -106,7 +106,6 @@ impl Diag {
 /// Kernel shell-session pixel surface (mode default).
 const KERNEL_FB: &str = "/dev/vtfb1";
 /// Kernel shell-session input device.
-const KERNEL_INPUT: &str = "/dev/vtinput1";
 /// Boot VT text surface (legacy `--vt`/`--mirror-vt`).
 const MIRROR_VT: &str = "/dev/vtconsole0";
 /// Boot VT input device (legacy mirror).
@@ -123,6 +122,12 @@ struct Args {
     /// Input device override; per-mode default (`/dev/vtinput` for the boot-VT
     /// mirror, `/dev/vtinput1` for the kernel session) when absent.
     vt_input: Option<String>,
+    /// Приёмник указателя окна (`/dev/vtmouse{N}` по умолчанию).
+    vt_mouse: Option<String>,
+    /// `--vt-fb` задан явно: не перебирать слоты сессий.
+    vt_fb_explicit: bool,
+    /// `--window-id` задан явно: не выводить id из pid.
+    window_id_explicit: bool,
     /// Pixel surface of the kernel shell session (default `/dev/vtfb1`).
     vt_fb: String,
     /// Log every drawn kernel frame (generation evidence for live runs).
@@ -170,7 +175,10 @@ impl Default for Args {
             socket: None,
             vt: None,
             vt_input: None,
+            vt_mouse: None,
             vt_fb: KERNEL_FB.to_string(),
+            vt_fb_explicit: false,
+            window_id_explicit: false,
             vt_trace: false,
             log_file: None,
             size: (900, 600),
@@ -208,11 +216,6 @@ impl Args {
     /// Where the boot-VT mirror writes VT input bytes.
     fn mirror_input(&self) -> &str {
         self.vt_input.as_deref().unwrap_or(MIRROR_INPUT)
-    }
-
-    /// Where the kernel-session mode writes VT input bytes.
-    fn kernel_input(&self) -> &str {
-        self.vt_input.as_deref().unwrap_or(KERNEL_INPUT)
     }
 }
 
@@ -1352,6 +1355,152 @@ fn run_shell_session(args: &Args, socket: &str) -> Result<(), String> {
 ///   **в окне** и выход с кодом 2, без отката в демо;
 /// * `exit` в сессии (`ENODEV`): сообщение «сессия завершена», окно закрывается.
 ///   Реконнект — повторный запуск окна: первый `open` спавнит новую сессию.
+/// Сколько слотов терминальных сессий клиент пробует при автоподключении.
+///
+/// Ядро сегодня даёт три (`MAX_SESSIONS - 1`); запас не вредит — лишний слот
+/// отвечает `ENOENT`, и перебор останавливается. Число должно быть не меньше
+/// `MAX_SESSIONS - 1` ядра, иначе третье окно не найдёт свой слот.
+const MAX_TERMINAL_SESSIONS: usize = 8;
+
+/// Номер слота из имени устройства (`/dev/vtfb2` → `2`).
+fn device_session(path: &str) -> Option<usize> {
+    let digits: String = path
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+/// Открытые устройства одной kernel-shell сессии.
+///
+/// Сессия — это **набор** из трёх устройств (поверхность, клавиатура,
+/// указатель), и номер слота у них общий. Держать их вместе нужно, потому что
+/// переоткрытие после `exit` — это новый набор: старые fd обязаны быть закрыты
+/// до `open`, иначе `note_close` новой генерации увидит старый счётчик.
+struct KernelDevices {
+    session: usize,
+    frame: KernelFrame<Box<dyn FrameSource>>,
+    keys: KeyForwarder<FileInput>,
+    /// `None` — ядро без `/dev/vtmouse{N}`: окно работает, но scrollback и
+    // выделение мышью остаются недоступны (честная деградация, не «немой» клик).
+    mouse: Option<MouseForwarder<FileInput>>,
+    note: String,
+}
+
+/// Открыть свободную терминальную сессию: перебрать слоты 1..N, пока ядро не
+/// даст поверхность (занятые отвечают `EBUSY`, отсутствующие — `ENOENT`).
+///
+/// `hint` — переподключение к конкретному слоту (после `exit`): ядро поднимает
+/// его заново тем же `open`.
+fn open_kernel_devices(
+    args: &Args,
+    hint: Option<usize>,
+) -> Result<KernelDevices, devfs::OpenError> {
+    let candidates: std::vec::Vec<usize> = match hint {
+        Some(session) => std::vec::Vec::from([session]),
+        None if args.vt_fb_explicit => {
+            std::vec::Vec::from([device_session(&args.vt_fb).unwrap_or(1)])
+        }
+        None => (1..=MAX_TERMINAL_SESSIONS).collect(),
+    };
+    let mut saw_busy = false;
+    for session in candidates {
+        let fb_path = if args.vt_fb_explicit {
+            args.vt_fb.clone()
+        } else {
+            format!("/dev/vtfb{session}")
+        };
+        let opened = match devfs::open_frame_source(&fb_path) {
+            Ok(opened) => opened,
+            Err(devfs::OpenError::Busy) => {
+                saw_busy = true;
+                continue;
+            }
+            Err(devfs::OpenError::Missing) => {
+                if hint.is_some() || args.vt_fb_explicit || session == 1 {
+                    return Err(devfs::OpenError::Missing);
+                }
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let input_path = args
+            .vt_input
+            .clone()
+            .unwrap_or_else(|| format!("/dev/vtinput{session}"));
+        let mouse_path = args
+            .vt_mouse
+            .clone()
+            .unwrap_or_else(|| format!("/dev/vtmouse{session}"));
+        let keys = FileInput::open(&input_path)
+            .map_err(|error| devfs::OpenError::Failed(format!("{input_path}: {error}")))?;
+        // Указатель необязателен: ядро без `/dev/vtmouse{N}` — это старое ядро,
+        // где окно всё ещё умеет печатать и принимать клавиатуру. Отсутствие
+        // устройства не повод отказывать в окне, но и не повод молча
+        // игнорировать клики: причина попадает в лог.
+        let (mouse, mouse_note) = match FileInput::open(&mouse_path) {
+            Ok(sink) => (Some(sink), None),
+            Err(error) if is_missing_device(&error) => (
+                None,
+                Some(format!(
+                    "{mouse_path} is not present; pointer input (scrollback/selection) disabled"
+                )),
+            ),
+            Err(error) => {
+                return Err(devfs::OpenError::Failed(format!("{mouse_path}: {error}")));
+            }
+        };
+        let frame = KernelFrame::open(opened.source)
+            .map_err(|error| devfs::OpenError::Failed(error.message()))?;
+        let info = frame.info();
+        let place = fit_placement(
+            info.width as usize,
+            info.height as usize,
+            args.size.0 as usize,
+            args.size.1 as usize,
+        )
+        .ok_or_else(|| {
+            devfs::OpenError::Failed("the kernel reported an empty surface or window".to_string())
+        })?;
+        // Клавиатурный приёмник не имеет геометрии; указатель — имеет.
+        let keys = KeyForwarder::new(keys);
+        let mouse = mouse.map(|sink| MouseForwarder::new(sink, &info, place));
+        let note = match mouse_note {
+            Some(extra) => format!("{}; {extra}", opened.note),
+            None => opened.note,
+        };
+        return Ok(KernelDevices {
+            session,
+            frame,
+            keys,
+            mouse,
+            note,
+        });
+    }
+    if saw_busy {
+        Err(devfs::OpenError::Busy)
+    } else {
+        Err(devfs::OpenError::Missing)
+    }
+}
+
+/// Текст ошибки открытия устройств для окна/лога.
+fn open_error_text(error: &devfs::OpenError) -> String {
+    match error {
+        devfs::OpenError::Missing => {
+            "the kernel has no terminal-session devices (/dev/vtfbN)".to_string()
+        }
+        devfs::OpenError::Busy => {
+            "every terminal session is already attached to another window".to_string()
+        }
+        devfs::OpenError::Failed(reason) => reason.clone(),
+    }
+}
+
 /// Сообщить ядру размер терминала в клетках (окно → `TIOCSWINSZ` → `SIGWINCH`).
 ///
 /// Возвращает строку диагностики, только когда размер реально изменился (или
@@ -1386,8 +1535,6 @@ fn forward_winsize(
 }
 
 fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
-    let fb_path = args.vt_fb.as_str();
-    let input_path = args.kernel_input();
     // Все строки режима — через `Diag`: при запуске композитором они уходят в
     // `--log-file`, иначе первая же строка в stderr остановила бы клиента
     // SIGTTOU (фоновая группа консоли + TOSTOP).
@@ -1398,44 +1545,30 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         };
     }
 
-    let opened = match devfs::open_frame_source(fb_path) {
-        Ok(opened) => opened,
+    let devices = match open_kernel_devices(args, None) {
+        Ok(devices) => devices,
         Err(devfs::OpenError::Missing) => {
             note!(
-                "{fb_path} is not present (kernel without the shell-session \
-                 surface); falling back to the private userspace shell session"
-            );
-            return run_shell_session(args, socket);
-        }
-        Err(devfs::OpenError::Failed(reason)) => {
-            return fail_with_notice(args, socket, &mut diag, &reason)
-        }
-    };
-    note!("{}", opened.note);
-    let key_sink = match FileInput::open(input_path) {
-        Ok(sink) => sink,
-        Err(error) if is_missing_device(&error) => {
-            note!(
-                "{input_path} is not present (kernel without the shell-session \
-                 input); falling back to the private userspace shell session"
+                "{fb} is not present (kernel without the shell-session surface); \
+                 falling back to the private userspace shell session",
+                fb = args.vt_fb.as_str()
             );
             return run_shell_session(args, socket);
         }
         Err(error) => {
-            return fail_with_notice(args, socket, &mut diag, &format!("{input_path}: {error}"))
+            let reason = open_error_text(&error);
+            return fail_with_notice(args, socket, &mut diag, &reason);
         }
     };
-    let mut frame = match KernelFrame::open(opened.source) {
-        Ok(frame) => frame,
-        Err(error) => return fail_with_notice(args, socket, &mut diag, &error.message()),
-    };
-    let info = frame.info();
+    note!("{}", devices.note);
+    let info = devices.frame.info();
     note!(
-        "kernel session {}x{} (stride {}, generation {}) on {fb_path}",
+        "kernel session {}x{} (stride {}, generation {}) in slot {}",
         info.width,
         info.height,
         info.stride,
-        info.generation
+        info.generation,
+        devices.session
     );
 
     let mut client = SurfaceClient::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
@@ -1448,9 +1581,19 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         welcome.screen_width,
         welcome.screen_height
     );
+    // Идентификатор окна выбирает клиент, и композитор отвергает занятый.
+    // Фиксированный 101 переживал выход старого процесса (окно могло ещё
+    // существовать) и следующий запуск терминала не мог создать окно. Ядро
+    // pid'ов уникально среди живых процессов, поэтому id из pid не конфликтует;
+    // `--window-id` остаётся для тестов/скриптов, которым нужен точный id.
+    let my_window_id = if args.window_id_explicit {
+        args.window_id
+    } else {
+        1000 + (std::process::id() % 90_000)
+    };
     client
-        .create_window(args.window_id, args.size.0, args.size.1, &args.title)
-        .map_err(|e| format!("create_window: {e}"))?;
+        .create_window(my_window_id, args.size.0, args.size.1, &args.title)
+        .map_err(|error| format!("create_window: {error}"))?;
     // Ядро игнорирует SO_RCVTIMEO (см. TERMINAL.md), поэтому окно обязано
     // опрашивать сокет неблокирующе и само возвращаться к кадру поверхности.
     client
@@ -1479,16 +1622,25 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         pagh_ui::geom::Rect::new(0, 0, width as i32, height as i32),
         pagh_ui::damage::DEFAULT_TILE,
     );
-    let mut forwarder = KeyForwarder::new(key_sink);
+    let mut frame = devices.frame;
+    let mut keys = devices.keys;
+    let mut forwarder = devices.mouse;
+    // #172: размер терминала — пери-сессионный TIOCSWINSZ.
     // Размер терминала сообщается ядру до первого кадра: приложение, которое
     // уже работает в сессии, получает `SIGWINCH` и перестраивается под окно.
     let mut reported_winsize: Option<(u16, u16)> = None;
-    if let Some(line) = forward_winsize(forwarder.sink(), width, height, &mut reported_winsize) {
+    if let Some(line) = forward_winsize(keys.sink(), width, height, &mut reported_winsize) {
         note!("{line}");
     }
     let mut dirty = true;
     let mut last_commit = Instant::now();
     let mut input_error_reported = false;
+    let mut mouse_error_reported = false;
+    let mut focus_reported = false;
+    // Последний известный фокус клавиатуры: после перезапуска сессии
+    // композитор не присылает `Focus` повторно (окно и так сфокусировано),
+    // поэтому клиент обязан восстановить состояние сам.
+    let mut keyboard_focus = false;
     // `--vt-trace` (или переменная окружения) печатает каждый отрисованный
     // кадр: в гостевой консоли это serial-доказательство того, что generation
     // растёт с выводом сессии, а не «кадр застыл».
@@ -1510,8 +1662,8 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                 Err(VtFbError::Ended) => {
                     // `exit` в сессии завершил её (`ENODEV`) — окно НЕ закрывается
                     // само: плашка, Enter/Space поднимает новую сессию в этом же
-                    // окне, Esc закрывает. Это тот самый restart-UX, который #167
-                    // расширяет (та же семантика, тот же путь).
+                    // окне, Esc закрывает. Единый restart-UX — `wait_for_restart`
+                    // (#147/#174), второй машины состояний здесь нет.
                     diag.line(
                         "kernel session ended (the shell exited); window kept, \
                          waiting for Enter to restart the session",
@@ -1522,19 +1674,21 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                         diag.line("kernel session ended; window closed");
                         return Ok(());
                     }
-                    match respawn_kernel_session(&mut frame, &mut forwarder, &mut diag) {
+                    match respawn_kernel_session(
+                        &mut frame,
+                        &mut keys,
+                        forwarder.as_mut(),
+                        &mut diag,
+                    ) {
                         Ok(()) => {
                             // Новая kernel-сессия стартует с размером по
                             // умолчанию: сообщить ей текущий window-winsize,
                             // иначе TUI внутри respawn'нутого окна останется с
                             // чужой геометрией.
                             reported_winsize = None;
-                            if let Some(line) = forward_winsize(
-                                forwarder.sink(),
-                                width,
-                                height,
-                                &mut reported_winsize,
-                            ) {
+                            if let Some(line) =
+                                forward_winsize(keys.sink(), width, height, &mut reported_winsize)
+                            {
                                 note!("{line}");
                             }
                             // `draw_notice_frame` отпустил ShmSurface: дальше
@@ -1546,7 +1700,20 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                                 width as i32,
                                 height as i32,
                             ));
+                            frame.invalidate();
                             dirty = true;
+                            input_error_reported = false;
+                            mouse_error_reported = false;
+                            focus_reported = false;
+                            // Новая сессия — новое устройство ввода: вернуть ему
+                            // фокус, который композитор уже не переотправит.
+                            set_keyboard_focus(
+                                &keys,
+                                &mut diag,
+                                &mut focus_reported,
+                                keyboard_focus,
+                            );
+                            continue;
                         }
                         Err(error) => {
                             let message = error.message();
@@ -1624,11 +1791,10 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
             last_commit = Instant::now();
         }
 
-        // 3. События окна. Клавиши → VT-байты в `/dev/vtinput1`; колесо и
-        //    протяжка не транслируются: scrollback и selection живут в ядре.
-        //    Нулевой дедлайн: ядро игнорирует SO_RCVTIMEO, поэтому «чтение с
-        //    таймаутом» на блокирующем сокете означало бы вечное ожидание, а
-        //    окно обязано возвращаться к кадру поверхности.
+        // 3. События окна. Клавиши → VT-байты в `/dev/vtinput{N}`; указатель →
+        //    записи `/dev/vtmouse{N}` (координаты поверхности сессии, кнопки,
+        //    колесо). Scrollback и selection исполняет ядро: клиент только
+        //    переносит события, как и требует контракт.
         for event in client
             .poll_events(Duration::ZERO)
             .map_err(|e| format!("poll: {e}"))?
@@ -1637,13 +1803,31 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                 Event::Configure(configure) => {
                     width = configure.width.max(64);
                     height = configure.height.max(32);
+                    // Клавиатурный фокус: пока он у окна, ядро не кладёт
+                    // физические клавиши в boot-кольцо (иначе ввод терминала
+                    // дублировался бы в boot-shell).
+                    keyboard_focus = configure.focused();
+                    set_keyboard_focus(&keys, &mut diag, &mut focus_reported, keyboard_focus);
+                    // Геометрия поверхности могла не меняться, но масштаб в окне
+                    // изменился: указатель обязан переводиться новой раскладкой.
+                    let info = frame.info();
+                    if let Some(place) = fit_placement(
+                        info.width as usize,
+                        info.height as usize,
+                        width as usize,
+                        height as usize,
+                    ) {
+                        if let Some(forwarder) = forwarder.as_mut() {
+                            forwarder.set_geometry(&info, place);
+                        }
+                    }
                     let same_size = shm.as_ref().is_some_and(|frame| {
                         frame.canvas.width == width as usize
                             && frame.canvas.height == height as usize
                     });
                     if same_size {
                         if let Some(line) =
-                            forward_winsize(forwarder.sink(), width, height, &mut reported_winsize)
+                            forward_winsize(keys.sink(), width, height, &mut reported_winsize)
                         {
                             note!("{line}");
                         }
@@ -1670,7 +1854,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     // Окно resize → winsize в клетках → `SIGWINCH` приложению
                     // в сессии. Это не косметика: TUI перестраивается по нему.
                     if let Some(line) =
-                        forward_winsize(forwarder.sink(), width, height, &mut reported_winsize)
+                        forward_winsize(keys.sink(), width, height, &mut reported_winsize)
                     {
                         note!("{line}");
                     }
@@ -1679,7 +1863,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     window_id,
                     generation,
                 } => {
-                    if window_id == args.window_id
+                    if window_id == my_window_id
                         && shm
                             .as_ref()
                             .is_some_and(|frame| frame.generation == generation)
@@ -1698,11 +1882,12 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     code,
                     pressed,
                     modifiers,
-                }) => match forwarder.handle_key(code, pressed, modifiers) {
+                }) => match keys.handle_key(code, pressed, modifiers) {
                     Ok(_) => {}
                     Err(error) if is_session_end(&error) => {
                         // Сессия закончилась между кадром и нажатием: следующий
-                        // опрос поверхности вернёт ENODEV и закроет окно честно.
+                        // опрос поверхности вернёт ENODEV и покажет честное
+                        // сообщение с перезапуском.
                         if !input_error_reported {
                             note!("session ended while forwarding a key ({error})");
                             input_error_reported = true;
@@ -1710,19 +1895,45 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     }
                     Err(error) => {
                         if !input_error_reported {
-                            note!("cannot write {input_path}: {error}");
+                            note!("cannot write session input: {error}");
                             input_error_reported = true;
                         }
                     }
                 },
-                Event::Focus { .. } => {
+                Event::Focus { focused, .. } => {
                     // Курсор рисует ядро в пикселях: подсветка фокуса здесь не наша.
+                    // А вот клавиатурный фокус — наша: он решает, дублируются ли
+                    // нажатия в boot-shell.
+                    keyboard_focus = focused;
+                    set_keyboard_focus(&keys, &mut diag, &mut focus_reported, focused);
                 }
-                Event::Input(InputEvent::Axis { .. }) | Event::Input(InputEvent::Button { .. }) => {
-                    // Скроллбек и selection принадлежат сессии ядра; у окна нет
-                    // доступа к её сетке, поэтому событие честно игнорируется.
+                Event::Input(InputEvent::Axis {
+                    x,
+                    y,
+                    vertical,
+                    buttons,
+                    ..
+                }) => {
+                    if let Some(forwarder) = forwarder.as_mut() {
+                        if let Err(error) = forwarder.axis(x, y, buttons, vertical) {
+                            note_mouse_error(&mut diag, &mut mouse_error_reported, &error);
+                        }
+                    }
                 }
-                Event::Input(InputEvent::Motion { .. }) => {}
+                Event::Input(InputEvent::Button { x, y, buttons, .. }) => {
+                    if let Some(forwarder) = forwarder.as_mut() {
+                        if let Err(error) = forwarder.button(x, y, buttons) {
+                            note_mouse_error(&mut diag, &mut mouse_error_reported, &error);
+                        }
+                    }
+                }
+                Event::Input(InputEvent::Motion { x, y, buttons, .. }) => {
+                    if let Some(forwarder) = forwarder.as_mut() {
+                        if let Err(error) = forwarder.motion(x, y, buttons) {
+                            note_mouse_error(&mut diag, &mut mouse_error_reported, &error);
+                        }
+                    }
+                }
                 Event::Close { reason, .. } => {
                     note!("server closed the window ({})", close_name(reason));
                     return Ok(());
@@ -1749,6 +1960,39 @@ const ENDED_NOTICE: &[&str] = &[
     "Press Enter to start a new session in this window,",
     "or Esc to close it. Nothing is simulated in the meantime.",
 ];
+
+/// Сообщить ядру фокус клавиатуры окна (`ioctl 0x4710` на `/dev/vtinput{N}`).
+///
+/// Не-терминальный `ioctl` (старое ядро) — не повод ломать ввод: окно
+/// продолжает работать, просто физические клавиши видны и boot-shell'у. Об
+/// этом честно пишется одна строка в лог.
+fn set_keyboard_focus(
+    keys: &KeyForwarder<FileInput>,
+    diag: &mut Diag,
+    reported: &mut bool,
+    focused: bool,
+) {
+    let Some(file) = keys.sink().file() else {
+        return;
+    };
+    if let Err(error) = devfs::set_focus(file, focused) {
+        if !*reported {
+            diag.line(&format!(
+                "cannot report keyboard focus (kernel without VTINPUT_SET_FOCUS): {error}"
+            ));
+            *reported = true;
+        }
+    }
+}
+
+/// Ошибка записи указателя: сессия могла завершиться между кадром и событием.
+/// Не спамим лог на каждое движение — только первое сообщение.
+fn note_mouse_error(diag: &mut Diag, reported: &mut bool, error: &std::io::Error) {
+    if !*reported {
+        diag.line(&format!("cannot write session pointer input: {error}"));
+        *reported = true;
+    }
+}
 
 /// Нарисовать плашку клиента в окне и отдать её композитору.
 ///
@@ -1816,13 +2060,17 @@ fn wait_for_restart(
 fn respawn_kernel_session(
     frame: &mut KernelFrame<Box<dyn FrameSource>>,
     forwarder: &mut KeyForwarder<FileInput>,
+    mouse: Option<&mut MouseForwarder<FileInput>>,
     diag: &mut Diag,
 ) -> Result<(), VtFbError> {
-    // Сначала закрыть ОБА старых устройства, и только потом открывать новые:
+    // Сначала закрыть ВСЕ старые устройства, и только потом открывать новые:
     // ядро сбрасывает счётчик открытых fd при выходе сессии, поэтому «поздний»
     // close после `open` новой сессии попросил бы её выйти (ENODEV на ioctl).
     forwarder.close().map_err(VtFbError::Io)?;
     frame.close_source()?;
+    if let Some(mouse) = mouse {
+        mouse.close().map_err(VtFbError::Io)?;
+    }
     diag.line("restart: devices closed, reopening input");
     forwarder.respawn().map_err(VtFbError::Io)?;
     diag.line("restart: input reopened, reopening the surface");
@@ -1892,12 +2140,7 @@ fn show_notice(
     height: u32,
     lines: &[&str],
 ) -> Result<(), String> {
-    if let Some(stale) = shm.take() {
-        let _ = client.release_shm(&stale);
-    }
-    let mut canvas = Canvas::new(width.max(64) as usize, height.max(32) as usize, theme.bg);
-    render_notice(&mut canvas, theme, lines);
-    commit_blocking(client, &canvas)?;
+    draw_notice_frame(client, shm, theme, width, height, lines)?;
     std::thread::sleep(NOTICE_HOLD);
     Ok(())
 }
@@ -1991,7 +2234,11 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             "--socket" => out.socket = Some(next_value(&mut args, "--socket")?),
             "--vt" => out.vt = Some(next_value(&mut args, "--vt")?),
             "--vt-input" => out.vt_input = Some(next_value(&mut args, "--vt-input")?),
-            "--vt-fb" => out.vt_fb = next_value(&mut args, "--vt-fb")?,
+            "--vt-mouse" => out.vt_mouse = Some(next_value(&mut args, "--vt-mouse")?),
+            "--vt-fb" => {
+                out.vt_fb = next_value(&mut args, "--vt-fb")?;
+                out.vt_fb_explicit = true;
+            }
             "--vt-trace" => out.vt_trace = true,
             "--log-file" => {
                 out.log_file = Some(PathBuf::from(next_value(&mut args, "--log-file")?))
@@ -2011,7 +2258,10 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             "--no-window" => out.window = false,
             "--unfocused" => out.focused = false,
             "--title" => out.title = next_value(&mut args, "--title")?,
-            "--window-id" => out.window_id = parse_u32(&next_value(&mut args, "--window-id")?)?,
+            "--window-id" => {
+                out.window_id = parse_u32(&next_value(&mut args, "--window-id")?)?;
+                out.window_id_explicit = true;
+            }
             "--feed" => out.feed = Some(PathBuf::from(next_value(&mut args, "--feed")?)),
             "--screenshots" => {
                 out.screenshots = Some(PathBuf::from(next_value(&mut args, "--screenshots")?))
@@ -2095,8 +2345,9 @@ WINDOW (default with --socket): KERNEL SHELL SESSION
   /dev/vtinput1.  Commands (df, ps, ppkg, lxrun, disk, nano, history, line
   editing, scrollback) are the kernel's — the client renders and forwards input
   only, and simulates nothing.
-  --vt-fb PATH      session pixel surface (default /dev/vtfb1)
-  --vt-input PATH   session input device (default /dev/vtinput1)
+  --vt-fb PATH      session pixel surface (default: first free /dev/vtfbN)
+  --vt-input PATH   session input device (default /dev/vtinputN)
+  --vt-mouse PATH   session pointer device (default /dev/vtmouseN)
   --vt-trace        log every drawn frame (its kernel generation);
                    the guest console forwards that to the serial log
   --log-file PATH   send client diagnostics to PATH instead of stderr.  Needed
@@ -2119,7 +2370,8 @@ HEADLESS:
 LIVE:
   --socket PATH    AF_UNIX control socket of pagh-desktop
   --size WxH       initial window content size (default 900x600)
-  --window-id N    client-chosen window id (default 101)
+  --window-id N    client-chosen window id (default: derived from pid in
+                   kernel-session mode, 101 elsewhere)
   --feed FILE      preload terminal output into the demo shell
   --demo-shell     explicit demo-shell window (screenshots, A/B comparison)
   --pipe-shell     explicit userspace shell over two pipes (fallback/test mode;

@@ -8775,7 +8775,7 @@ mod desktop_b_tests {
             // умрёт уже после open и ioctl клиента вернёт `ENODEV`.
             session::request_reap(1);
             assert_kernel!(
-                session::note_open(1),
+                session::note_open(1) != session::SessionOpen::Busy,
                 "respawn: fast reopen is accepted while the session is live"
             );
             // Дать циклу сессии шанс увидеть (уже снятый) флаг.
@@ -11485,8 +11485,13 @@ mod terminal_session_tests {
     /// Текстовая модель консоли сессии (не пиксели): по ней видно, что shell
     /// окна действительно выполнил команду.
     fn grid_text() -> alloc::string::String {
+        grid_text_for(S)
+    }
+
+    /// То же для произвольной сессии (изоляция: у каждой свой экран).
+    fn grid_text_for(session: usize) -> alloc::string::String {
         let mut out = alloc::string::String::new();
-        if let Some(snap) = framebuffer::writer_for(S).with(|w| w.text_snapshot()) {
+        if let Some(snap) = framebuffer::writer_for(session).with(|w| w.text_snapshot()) {
             for row in 0..snap.rows {
                 for col in 0..snap.cols {
                     let (ch, _, _) = snap.cells[row * snap.cols + col];
@@ -11645,7 +11650,10 @@ mod terminal_session_tests {
     pub fn session_spawn_input_output_exit_reopen() {
         assert_kernel!(!session::live(S), "session 1 is not live before the test");
 
-        assert_kernel!(session::note_open(S), "the first open spawns the session");
+        assert_kernel!(
+            session::note_open(S) == session::SessionOpen::Started,
+            "the first open spawns the session"
+        );
         assert_kernel!(session::live(S), "session is live after open");
         // Баннер печатается через `fb_println!` в поверхность сессии (без
         // serial-эха): значит, задача действительно запустилась и говорит в своё
@@ -11684,7 +11692,7 @@ mod terminal_session_tests {
 
         // Повторный open поднимает сессию заново (контракт vtfb1).
         assert_kernel!(
-            session::note_open(S),
+            session::note_open(S) != session::SessionOpen::Busy,
             "a repeated open respawns the session"
         );
         assert_kernel!(session::live(S), "session is live again after reopen");
@@ -11720,7 +11728,10 @@ mod terminal_session_tests {
             !session::live(S),
             "window session is not live before the test"
         );
-        assert_kernel!(session::note_open(S), "open for the command-coverage test");
+        assert_kernel!(
+            session::note_open(S) != session::SessionOpen::Busy,
+            "open for the command-coverage test"
+        );
         assert_kernel!(
             wait_until(3000, || grid_text().contains("Welcome to pagh OS Shell!")),
             "window session shell is ready before the commands"
@@ -11789,10 +11800,198 @@ mod terminal_session_tests {
         cleanup();
     }
 
+    /// Этап 4: указатель окна — состояние **своей** сессии.
+    ///
+    /// Клиент пишет `/dev/vtmouse1`; shell читает `ps2_mouse::poll()` и получает
+    /// именно эту позицию/кнопки/колесо. Boot-указатель (физическая PS/2-мышь)
+    /// при этом не сдвигается: иначе выделение в окне уводило бы курсор
+    /// boot-консоли. Запись, разорванная между `write(2)`, достраивается.
+    pub fn session_pointer_is_isolated_per_slot() {
+        use crate::drivers::vt_mouse;
+        use crate::drivers::vt_mouse_abi::{encode_event, VtMouseEvent, BTN_LEFT, BTN_RIGHT};
+
+        let up = framebuffer::init_session(S);
+        assert_kernel!(up, "session surface for the pointer test");
+        if !up {
+            return;
+        }
+        vt_mouse::reset_all();
+        let boot_before = crate::drivers::ps2_mouse::physical();
+        let device = crate::vfs::desktop_dev::vtmouse1();
+        let event = VtMouseEvent {
+            x: 37,
+            y: 45,
+            buttons: BTN_LEFT,
+            wheel: 2,
+        };
+        let bytes = encode_event(&event);
+        // Неполная запись — ещё не событие: 9 + 7 байт склеиваются в одну.
+        assert_eq_kernel!(
+            device.write(0, &bytes[..9]).unwrap_or(0),
+            9,
+            "the device accepts a partial record"
+        );
+        assert_eq_kernel!(
+            crate::drivers::ps2_mouse::poll_for(S).seq,
+            0,
+            "a partial record is not an event"
+        );
+        assert_eq_kernel!(
+            device.write(0, &bytes[9..]).unwrap_or(0),
+            7,
+            "the tail completes the record"
+        );
+        let state = crate::drivers::ps2_mouse::poll_for(S);
+        assert_eq_kernel!((state.x, state.y), (37, 45), "position reaches the session");
+        assert_kernel!(state.left, "left button reaches the session");
+        assert_eq_kernel!(state.wheel, 2, "wheel delta reaches the session");
+        assert_eq_kernel!(
+            crate::drivers::ps2_mouse::poll_for(0).seq,
+            boot_before.seq,
+            "the boot pointer is untouched by window input"
+        );
+
+        // Отпускание кнопки и прокрутка в обратную сторону — накопление колеса.
+        let release = VtMouseEvent {
+            x: 40,
+            y: 50,
+            buttons: BTN_RIGHT,
+            wheel: -3,
+        };
+        assert_eq_kernel!(
+            device.write(0, &encode_event(&release)).unwrap_or(0),
+            16,
+            "a full record is accepted"
+        );
+        let state = crate::drivers::ps2_mouse::poll_for(S);
+        assert_kernel!(!state.left && state.right, "button mask follows the record");
+        assert_eq_kernel!(state.wheel, -1, "wheel accumulates with sign");
+        assert_eq_kernel!(
+            (state.x, state.y),
+            (40, 50),
+            "a new record moves the pointer"
+        );
+
+        // Выход окна забывает состояние: новое окно в слоте не наследует кнопку.
+        vt_mouse::reset(S);
+        let cleared = crate::drivers::ps2_mouse::poll_for(S);
+        assert_eq_kernel!(
+            (cleared.seq, cleared.left, cleared.right, cleared.wheel),
+            (0, false, false, 0),
+            "reset forgets the window pointer state"
+        );
+        framebuffer::reset_session(S);
+        offscreen::free(S);
+    }
+
+    /// Этап 4: второе окно — **своя** сессия: отдельный экран, отдельное кольцо
+    /// ввода, отдельный `cwd`, и занятый слот отвечает `EBUSY`, а не отдаётся
+    /// второму клиенту (иначе два окна делили бы один shell).
+    pub fn second_session_is_isolated_and_slots_are_exclusive() {
+        use crate::drivers::session::SessionOpen;
+
+        const SECOND: usize = 2;
+        let first = session::note_open(S);
+        assert_kernel!(
+            matches!(first, SessionOpen::Started | SessionOpen::Attached),
+            "first window opens session 1"
+        );
+        let second = session::note_open(SECOND);
+        assert_kernel!(
+            matches!(second, SessionOpen::Started | SessionOpen::Attached),
+            "second window opens its own slot, not the first one"
+        );
+        assert_kernel!(
+            session::live(S) && session::live(SECOND),
+            "both terminal sessions are live"
+        );
+        // Повторный open того же клиента — не занятость: окно открывает три
+        // устройства (vtfb/vtinput/vtmouse) и обязано подключиться ко всем.
+        assert_eq_kernel!(
+            session::note_open(S),
+            SessionOpen::Attached,
+            "the same client may open its remaining devices"
+        );
+        assert_eq_kernel!(
+            session::open_fds(S),
+            2,
+            "each successful open of the same client is counted"
+        );
+        // А другое окно на занятый слот — EBUSY: два окна не делят shell.
+        assert_eq_kernel!(
+            session::note_open_as(S, 999_999),
+            SessionOpen::Busy,
+            "a live session with another client is not shared (EBUSY)"
+        );
+        assert_eq_kernel!(
+            session::open_fds(S),
+            2,
+            "the refused open does not bump the owner count"
+        );
+
+        assert_kernel!(
+            wait_until(2000, || {
+                grid_text_for(S).contains("Welcome to pagh OS Shell!")
+                    && grid_text_for(SECOND).contains("Welcome to pagh OS Shell!")
+            }),
+            "both sessions print their own banner"
+        );
+
+        // Ввод во второе окно не должен появиться в первом.
+        let input_two = crate::vfs::desktop_dev::vtinput_session(SECOND);
+        let line = "echo session-two-only\n";
+        assert_eq_kernel!(
+            input_two.write(0, line.as_bytes()).unwrap_or(0),
+            line.len(),
+            "vtinput2 accepts the whole write"
+        );
+        assert_kernel!(
+            wait_until(3000, || grid_text_for(SECOND).contains("session-two-only")),
+            "the second session executed its command"
+        );
+        assert!(
+            !grid_text_for(S).contains("session-two-only"),
+            "input to window 2 must not reach window 1"
+        );
+        // Разный `cwd`: `cd /tmp` во втором окне не меняет первое (этап 4).
+        let cwd_one = crate::shell::path::cwd_for(S);
+        let cd_line = "cd /tmp\n";
+        assert_eq_kernel!(
+            input_two.write(0, cd_line.as_bytes()).unwrap_or(0),
+            cd_line.len(),
+            "vtinput2 accepts the cd line"
+        );
+        assert_kernel!(
+            wait_until(3000, || crate::shell::path::cwd_for(SECOND) == "/tmp"),
+            "session 2 changed its own cwd"
+        );
+        assert_eq_kernel!(
+            crate::shell::path::cwd_for(S),
+            cwd_one,
+            "session 1 cwd is untouched by session 2's cd"
+        );
+
+        // Слот 1 открывался дважды (как три устройства одного окна + повтор) —
+        // последний close наступает после второго decrement.
+        session::note_close(S);
+        session::note_close(S);
+        session::note_close(SECOND);
+        assert_kernel!(
+            wait_until(3000, || !session::live(S) && !session::live(SECOND)),
+            "closing the last fd of each window reaps both sessions"
+        );
+        cleanup();
+        framebuffer::reset_session(SECOND);
+        offscreen::free(SECOND);
+    }
+
     /// Этап 3: `nano` в окне рисует в offscreen-поверхность и корректно
     /// возвращает управление shell'у по Esc.
     pub fn nano_draws_in_session() {
-        assert_kernel!(session::note_open(S), "open for the nano test");
+        assert_kernel!(
+            session::note_open(S) != session::SessionOpen::Busy,
+            "open for the nano test"
+        );
         assert_kernel!(
             wait_until(2000, || grid_text().contains("Welcome to pagh OS Shell!")),
             "session shell is ready before nano"
@@ -12308,7 +12507,15 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
         // selftest поверхность поднимал.
         (
             "desktop-b::/dev/vtfb1 respawn after session exit (device path)",
-            desktop_b_tests::vtfb1_respawn_after_exit
+            desktop_b_tests::vtfb1_respawn_after_exit,
+        ),
+        (
+            "terminal-session::pointer input is isolated per slot (/dev/vtmouse1)",
+            terminal_session_tests::session_pointer_is_isolated_per_slot
+        ),
+        (
+            "terminal-session::second window is its own session; busy slots are EBUSY",
+            terminal_session_tests::second_session_is_isolated_and_slots_are_exclusive
         ),
         // qbug2: текстовая сетка консоли выводится из реального разрешения
         // framebuffer'а. Прежняя фиксированная сетка 100×37 оставляла на 16:9

@@ -71,8 +71,28 @@ pub fn is_present() -> bool {
     INITIALIZED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Current mouse state snapshot.
+/// Current mouse state snapshot of the **current task's console session**.
+///
+/// Boot-сессия читает физическую PS/2-мышь; сессия терминального окна — своё
+/// состояние из `/dev/vtmouse{N}` ([`super::vt_mouse`]). Роутинг по задаче
+/// повторяет роутинг клавиатуры (`ps2_kbd::take_scancode`): shell, `nano`,
+/// `paint` и status-strip зовут одну и ту же функцию и не знают о двух
+/// источниках. Глобальный физический указатель остаётся у boot-сессии, поэтому
+/// чужое окно не может увести его каретку/выделение.
 pub fn poll() -> MouseState {
+    poll_for(crate::drivers::session::current())
+}
+
+/// Снимок указателя конкретной сессии (`0` — физическая PS/2-мышь).
+pub fn poll_for(session: usize) -> MouseState {
+    if session == crate::drivers::session_route::BOOT_SESSION {
+        return physical();
+    }
+    crate::drivers::vt_mouse::poll(session)
+}
+
+/// Физическое состояние PS/2 (только boot-сессия; курсор scanout).
+pub fn physical() -> MouseState {
     let m = MOUSE.lock();
     MouseState {
         x: m.x.max(0) as usize,

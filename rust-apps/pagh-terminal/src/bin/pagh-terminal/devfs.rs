@@ -19,6 +19,11 @@ use pagh_terminal::kernelsession::{
     FrameSource, ReadFrameSource, VtFbError, VtFbInfo, INFO_LEN, VTFB_IOCTL_GET_INFO,
 };
 
+/// `ioctl(fd, VTINPUT_SET_FOCUS, on)` — сообщить ядру, что окно получило (или
+/// потеряло) клавиатуру. Пока фокус у окна, физические клавиши не кладутся в
+/// boot-кольцо: клиент возвращает их через `/dev/vtinput{N}`.
+pub const VTINPUT_IOCTL_SET_FOCUS: c_ulong = 0x4710;
+
 /// `PROT_READ`.
 const PROT_READ: c_int = 0x1;
 /// `MAP_SHARED` — единственный честный вариант для поверхности ядра: копия не
@@ -77,6 +82,28 @@ extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
 }
 
+/// Передать ядру фокус клавиатуры окна (`0x4710`).
+///
+/// Старое ядро без этого ioctl отвечает `ENOTTY` — вызывающий решает, сообщить
+/// ли об этом (ввод при этом продолжает работать, просто boot-shell тоже видит
+/// клавиши).
+pub fn set_focus(file: &File, focused: bool) -> io::Result<()> {
+    // SAFETY: ioctl-запрос определён нашим ядром для fd устройства ввода;
+    // аргумент — скаляр (0/1), не указатель.
+    let rc = unsafe {
+        ioctl(
+            file.as_raw_fd(),
+            VTINPUT_IOCTL_SET_FOCUS,
+            focused as usize as *mut c_void,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Открытая поверхность плюс одна строка о том, **как** получены пиксели.
 ///
 /// Строку пишет вызывающий (bin), а не этот модуль: приложение может быть
@@ -92,6 +119,9 @@ pub struct OpenedSurface {
 pub enum OpenError {
     /// Устройства нет в системе (`ENOENT`): ядро без `/dev/vtfb1`.
     Missing,
+    /// Сессию уже держит другое окно (`EBUSY`): поверхность, ввод и
+    /// scrollback не делятся. Клиент пробует следующий слот.
+    Busy,
     /// Устройство есть, но работать с ним нельзя — честный текст для окна.
     Failed(String),
 }
@@ -106,6 +136,9 @@ pub fn open_frame_source(path: &str) -> Result<OpenedSurface, OpenError> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(OpenError::Missing),
+        // EBUSY = 16: сессия занята другим окном (несколько окон — независимые
+        // сессии, см. `docs/terminal-session.md`).
+        Err(error) if error.raw_os_error() == Some(16) => return Err(OpenError::Busy),
         Err(error) => {
             return Err(OpenError::Failed(format!(
                 "{path}: {error} (the kernel shell-session surface is not readable by this process)"

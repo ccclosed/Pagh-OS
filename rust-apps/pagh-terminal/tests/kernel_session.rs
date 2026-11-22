@@ -18,9 +18,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use pagh_terminal::kernelsession::{
-    encode_key_bytes, encode_snapshot, fit_placement, is_missing_device, is_session_end,
-    render_notice, solid_pixels, winsize_cells, Draw, FileInput, FitPlacement, FrameSource,
-    InputSink, KernelFrame, KeyForwarder, ReadFrameSource, VtFbError, VtFbInfo,
+    buttons_to_mask, encode_key_bytes, encode_mouse_event, encode_snapshot, fit_placement,
+    is_missing_device, is_session_end, render_notice, solid_pixels, wheel_from_axis,
+    window_to_surface, winsize_cells, Draw, FileInput, FitPlacement, FrameSource, InputSink,
+    KernelFrame, KeyForwarder, MouseEvent, MouseForwarder, ReadFrameSource, VtFbError, VtFbInfo,
+    MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_EVENT_LEN,
 };
 use pagh_terminal::protocol::{self, configure_flags, welcome_flags, Message};
 use pagh_terminal::render::{Canvas, Theme};
@@ -789,6 +791,261 @@ fn a_regular_file_surface_uses_read_fallback_and_reports_a_missing_compositor() 
     assert!(
         stderr.contains("no-desktop.sock"),
         "причина отказа композитора обязана быть названа: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── указатель сессии: /dev/vtmouse{N} ─────────────────────────────────────────
+
+#[test]
+fn mouse_event_is_sixteen_little_endian_bytes() {
+    let event = MouseEvent {
+        x: 1234,
+        y: -5,
+        buttons: MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT,
+        wheel: -3,
+    };
+    let bytes = encode_mouse_event(&event);
+    assert_eq!(bytes.len(), MOUSE_EVENT_LEN);
+    assert_eq!(i32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1234);
+    assert_eq!(i32::from_le_bytes(bytes[4..8].try_into().unwrap()), -5);
+    assert_eq!(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT
+    );
+    assert_eq!(i32::from_le_bytes(bytes[12..16].try_into().unwrap()), -3);
+}
+
+#[test]
+fn pdp_button_mask_maps_to_the_kernels_button_bits() {
+    // PDP/1: LEFT = bit0, MIDDLE = bit1, RIGHT = bit2. Ядро: LEFT=1, RIGHT=2,
+    // MIDDLE=4. Ошибка здесь — «нажал левую, выделилась правая».
+    assert_eq!(
+        buttons_to_mask(protocol::buttons::MASK_LEFT),
+        MOUSE_BTN_LEFT
+    );
+    assert_eq!(
+        buttons_to_mask(protocol::buttons::MASK_RIGHT),
+        MOUSE_BTN_RIGHT
+    );
+    assert_eq!(
+        buttons_to_mask(protocol::buttons::MASK_MIDDLE),
+        MOUSE_BTN_MIDDLE
+    );
+    assert_eq!(
+        buttons_to_mask(protocol::buttons::MASK_LEFT | protocol::buttons::MASK_RIGHT),
+        MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT
+    );
+    assert_eq!(buttons_to_mask(0), 0);
+}
+
+#[test]
+fn wheel_axis_is_translated_to_the_kernel_s_sign() {
+    // The compositor forwards QEMU's REL_WHEEL sign (wheel-up = -1); the
+    // kernel shell expects the PS/2 convention where "away from the user" is
+    // negative and computes `lines = -delta`. One inversion in the client makes
+    // wheel-up scroll to older lines — verified live (e2e termux: unchanged
+    // forwarding made wheel-up a no-op).
+    assert_eq!(wheel_from_axis(-1), 1);
+    assert_eq!(wheel_from_axis(1), -1);
+    assert_eq!(wheel_from_axis(0), 0);
+}
+
+#[test]
+fn window_coordinates_map_back_to_surface_pixels() {
+    let surface = info(1280, 800, 1);
+    // 1:1 по центру: поверхность 1280×800 в окне 1400×900 → x=60, y=50.
+    let place = fit_placement(1280, 800, 1400, 900).expect("fit");
+    assert_eq!(
+        (place.x, place.y, place.width, place.height),
+        (60, 50, 1280, 800)
+    );
+    assert_eq!(window_to_surface(60, 50, &surface, &place), (0, 0));
+    assert_eq!(
+        window_to_surface(60 + 1279, 50 + 799, &surface, &place),
+        (1279, 799)
+    );
+    // Точка в поле (левее кадра) прижимается к краю, а не уезжает в минус.
+    assert_eq!(window_to_surface(0, 0, &surface, &place), (0, 0));
+
+    // Downscale: окно 640×400 показывает поверхность 1280×800 вдвое меньше.
+    let small = fit_placement(1280, 800, 640, 400).expect("fit");
+    assert_eq!(
+        (small.x, small.y, small.width, small.height),
+        (0, 0, 640, 400)
+    );
+    assert_eq!(window_to_surface(0, 0, &surface, &small), (0, 0));
+    assert_eq!(window_to_surface(639, 399, &surface, &small), (1278, 798));
+    assert_eq!(window_to_surface(320, 200, &surface, &small), (640, 400));
+}
+
+#[test]
+fn mouse_forwarder_sends_position_buttons_and_wheel() {
+    let surface = info(100, 50, 1);
+    let place = fit_placement(100, 50, 100, 50).expect("fit");
+    let mut forwarder = MouseForwarder::new(
+        MockInput {
+            written: Vec::new(),
+            respawns: 0,
+            closes: 0,
+        },
+        &surface,
+        place,
+    );
+    forwarder.motion(10, 20, 0).unwrap();
+    forwarder
+        .button(10, 20, protocol::buttons::MASK_LEFT)
+        .unwrap();
+    forwarder
+        .axis(10, 20, protocol::buttons::MASK_LEFT, 2)
+        .unwrap();
+    let written = &forwarder.sink().written;
+    assert_eq!(written.len(), 3 * MOUSE_EVENT_LEN);
+    let first = &written[..MOUSE_EVENT_LEN];
+    assert_eq!(i32::from_le_bytes(first[0..4].try_into().unwrap()), 10);
+    assert_eq!(i32::from_le_bytes(first[4..8].try_into().unwrap()), 20);
+    assert_eq!(u32::from_le_bytes(first[8..12].try_into().unwrap()), 0);
+    assert_eq!(i32::from_le_bytes(first[12..16].try_into().unwrap()), 0);
+    let second = &written[MOUSE_EVENT_LEN..2 * MOUSE_EVENT_LEN];
+    assert_eq!(
+        u32::from_le_bytes(second[8..12].try_into().unwrap()),
+        MOUSE_BTN_LEFT
+    );
+    let third = &written[2 * MOUSE_EVENT_LEN..];
+    assert_eq!(i32::from_le_bytes(third[12..16].try_into().unwrap()), -2);
+}
+
+#[test]
+fn mouse_forwarder_reports_a_broken_session_sink() {
+    struct Failing;
+    impl InputSink for Failing {
+        fn send(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(19))
+        }
+    }
+    let surface = info(10, 10, 1);
+    let place = fit_placement(10, 10, 10, 10).unwrap();
+    let mut forwarder = MouseForwarder::new(Failing, &surface, place);
+    let error = forwarder.motion(1, 1, 0).unwrap_err();
+    assert!(is_session_end(&error));
+}
+
+#[test]
+fn help_names_the_pointer_device_and_session_scan() {
+    let out = Command::new(binary()).arg("--help").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("--vt-mouse"),
+        "help must name the pointer device: {text}"
+    );
+    assert!(
+        text.contains("first free /dev/vtfbN"),
+        "help must explain session auto-attach: {text}"
+    );
+}
+
+/// Композитор для kernel-session: окно обязано получить id, производный от
+/// pid (фиксированный 101 мог остаться занятым окном прошлого запуска).
+fn spawn_fake_desktop_kernel_id(socket: &Path) -> std::thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        match protocol::read_message(&mut stream).unwrap() {
+            Message::Hello { .. } => {}
+            other => panic!("expected hello, got {other:?}"),
+        }
+        stream
+            .write_all(
+                &Message::Welcome {
+                    version: 1,
+                    client_id: 9,
+                    width: 1280,
+                    height: 720,
+                    flags: welcome_flags::FORMAT_XRGB8888,
+                }
+                .encode(),
+            )
+            .unwrap();
+        let window_id = match protocol::read_message(&mut stream).unwrap() {
+            Message::Create { window_id, .. } => {
+                assert_ne!(window_id, 101, "kernel mode must not use the fixed demo id");
+                assert!(
+                    (1000..=91_000).contains(&window_id),
+                    "id derives from pid: {window_id}"
+                );
+                window_id
+            }
+            other => panic!("expected create, got {other:?}"),
+        };
+        for message in [
+            Message::Focus {
+                window_id,
+                focused: true,
+            },
+            Message::Configure {
+                window_id,
+                x: 0,
+                y: 0,
+                width: 320,
+                height: 200,
+                flags: configure_flags::FOCUSED,
+            },
+        ] {
+            stream.write_all(&message.encode()).unwrap();
+        }
+        // Дать клиенту отправить хотя бы один кадр, затем закрыть окно.
+        match protocol::read_message(&mut stream).unwrap() {
+            Message::Commit { .. } | Message::ShmOffer { .. } => {}
+            other => panic!("expected a frame, got {other:?}"),
+        }
+        stream
+            .write_all(
+                &Message::Close {
+                    window_id,
+                    reason: protocol::close_reason::SERVER,
+                }
+                .encode(),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    })
+}
+
+#[test]
+fn kernel_mode_uses_a_pid_derived_window_id() {
+    let dir = temp_dir("dupid");
+    let socket = dir.join("desktop.sock");
+    let surface = dir.join("vtfb1");
+    let info = info(8, 6, 1);
+    std::fs::write(
+        &surface,
+        encode_snapshot(info, &solid_pixels(&info, (0x20, 0x30, 0x40))),
+    )
+    .unwrap();
+    let input = dir.join("vtinput1");
+    std::fs::write(&input, b"").unwrap();
+    let server = spawn_fake_desktop_kernel_id(&socket);
+    let out = Command::new(binary())
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["--size", "320x200"])
+        .arg("--vt-fb")
+        .arg(&surface)
+        .arg("--vt-input")
+        .arg(&input)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the client must exit cleanly on Close: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
