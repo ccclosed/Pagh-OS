@@ -597,10 +597,15 @@ pub(crate) fn shell_main_session(session: usize) -> ! {
                 reset_console_view(&mut caret, &mut selection);
             }
             if pressed || (mouse.left && selection.is_active()) {
-                let cell = caret::Cell {
-                    col: mouse.x / crate::drivers::framebuffer::CHAR_WIDTH,
-                    row: mouse.y / crate::drivers::framebuffer::CHAR_HEIGHT,
-                };
+                // Pixel → cell через реальную сетку: указатель может стоять на
+                // полосе статуса (ниже текста) или за правым краем, и клетка
+                // обязана остаться внутри модели. Без зажима диапазон
+                // выделения выходил за сетку, `read_row` подменял такую строку
+                // последней, и копирование дублировало её текст.
+                let (grid_cols, grid_rows) = crate::drivers::framebuffer::console().text_grid();
+                let (col, row) =
+                    crate::drivers::console_layout::cell_at(mouse.x, mouse.y, grid_cols, grid_rows);
+                let cell = caret::Cell { col, row };
                 if pressed {
                     selection.clear();
                     selection.begin(cell);
