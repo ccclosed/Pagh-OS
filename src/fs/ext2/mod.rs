@@ -1745,34 +1745,41 @@ impl Ext2Fs {
         let mut written = 0usize;
         let mut pos = offset;
         while written < data.len() {
-            let mut tx = Tx::new(self);
-            let mut inode = tx.read_inode(ino)?;
-            // Блоки данных есть только у обычных файлов (см. `truncate_file`):
-            // у inode симлинка `map_or_alloc` затёр бы inline-цель.
-            if !inode.is_reg() {
-                return Err(FsError::Corrupt);
-            }
-
-            let mut blocks_touched = 0usize;
-            while written < data.len() && blocks_touched < TX_DATA_BLOCKS {
-                let lbn = pos / BS as u64;
-                let within = (pos % BS as u64) as usize;
-                let blk = tx.map_or_alloc(&mut inode, lbn)?;
-                let chunk = core::cmp::min(BS - within, data.len() - written);
-                {
-                    let full = within == 0 && chunk == BS;
-                    let b = tx.data_block(blk as u64, full)?;
-                    b[within..within + chunk].copy_from_slice(&data[written..written + chunk]);
+            {
+                let mut tx = Tx::new(self);
+                let mut inode = tx.read_inode(ino)?;
+                // Блоки данных есть только у обычных файлов (см. `truncate_file`):
+                // у inode симлинка `map_or_alloc` затёр бы inline-цель.
+                if !inode.is_reg() {
+                    return Err(FsError::Corrupt);
                 }
-                written += chunk;
-                pos += chunk as u64;
-                blocks_touched += 1;
+
+                let mut blocks_touched = 0usize;
+                while written < data.len() && blocks_touched < TX_DATA_BLOCKS {
+                    let lbn = pos / BS as u64;
+                    let within = (pos % BS as u64) as usize;
+                    let blk = tx.map_or_alloc(&mut inode, lbn)?;
+                    let chunk = core::cmp::min(BS - within, data.len() - written);
+                    {
+                        let full = within == 0 && chunk == BS;
+                        let b = tx.data_block(blk as u64, full)?;
+                        b[within..within + chunk].copy_from_slice(&data[written..written + chunk]);
+                    }
+                    written += chunk;
+                    pos += chunk as u64;
+                    blocks_touched += 1;
+                }
+                if pos > inode.i_size as u64 {
+                    inode.i_size = pos as u32;
+                }
+                tx.write_inode(ino, &inode)?;
+                tx.commit()?;
             }
-            if pos > inode.i_size as u64 {
-                inode.i_size = pos as u32;
-            }
-            tx.write_inode(ino, &inode)?;
-            tx.commit()?;
+            // Транзакция отпустила `tx_lock` и `inner`, то есть прерывания снова
+            // разрешены. Явная уступка не даёт длинной записи (распаковка пакета)
+            // монополизировать CPU между транзакциями: композитор получает кадр
+            // посреди установки, а не после неё.
+            crate::task::scheduler::cooperative_checkpoint();
         }
         Ok(written)
     }
