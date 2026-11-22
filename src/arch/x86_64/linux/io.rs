@@ -30,11 +30,20 @@ pub const SEEK_END: u32 = 2;
 /// гостевой путь под `/mnt`, а не путь `/proc` (`docs/procfs.md` §1.3).
 pub const ROOT_KEEPING_COMPONENTS: [&str; 5] = ["mnt", "dev", "proc", "sys", "tmp"];
 
+/// USB-тома монтируются в корень (`/usb0p1`), а не под `/mnt`: `mount(2)`
+/// Phase 1 принимает только `"/" + source`, и Files открывает точку из события
+/// как есть. Точное `"usb"` в списке не сработало бы — компонента называется
+/// `usb0p1`, поэтому проверяется префикс `usb`; `/usbfoo` тоже сохраняет корень
+/// (простое совпадение префикса, как и задокументировано в спеке).
+fn is_usb_root(component: &str) -> bool {
+    component.starts_with("usb")
+}
+
 /// Разрешается ли `abs` (абсолютный нормализованный гостевой путь) от корня
 /// VFS, а не переносится под `/mnt`?
 pub fn guest_path_keeps_root(abs: &str) -> bool {
     let first = abs.trim_start_matches('/').split('/').next().unwrap_or("");
-    ROOT_KEEPING_COMPONENTS.contains(&first)
+    ROOT_KEEPING_COMPONENTS.contains(&first) || is_usb_root(first)
 }
 
 /// Спланировать `read` `count` байт со смещения `off` файла длины `size`.

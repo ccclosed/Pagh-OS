@@ -2,6 +2,7 @@
 // 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
 /// Символьные устройства варианта B: `/dev/fb0` и `/dev/input/event0`.
+pub mod block_dev;
 pub mod desktop_dev;
 pub mod elf;
 /// Чистый `core`-only классификатор ELF + выбор bias для static-PIE
@@ -234,6 +235,18 @@ pub trait VfsNode: Send + Sync {
     /// Является ли узел `/dev/input/event0` (read/poll идут через очередь
     /// [`crate::drivers::evdev`], а не через байтовое смещение файла).
     fn is_evdev(&self) -> bool {
+        false
+    }
+
+    /// Является ли узел сырым блочным устройством (`/dev/block/<name>`):
+    /// `stat` показывает `S_IFBLK`, запись запрещена на уровне узла.
+    fn is_blockdev(&self) -> bool {
+        false
+    }
+
+    /// Является ли узел `/dev/uevent`: один эксклюзивный читатель, fixed-record
+    /// `read`, `poll(POLLIN)`, `PUEV_IOC_SNAPSHOT`.
+    fn is_uevent(&self) -> bool {
         false
     }
 
@@ -555,6 +568,12 @@ impl VfsNode for MountNode {
     fn is_evdev(&self) -> bool {
         self.inner.is_evdev()
     }
+    fn is_blockdev(&self) -> bool {
+        self.inner.is_blockdev()
+    }
+    fn is_uevent(&self) -> bool {
+        self.inner.is_uevent()
+    }
     fn shared_page(&self, index: u64) -> Option<u64> {
         self.inner.shared_page(index)
     }
@@ -700,6 +719,13 @@ pub fn init() {
         "/dev/vtfb1..{} + vtinput + vtmouse — ready",
         crate::drivers::session_route::MAX_SESSIONS - 1
     );
+    // Сырые блочные узлы только для чтения: диагностика (`dd if=/dev/block/usb0`)
+    // без возможности обойти WAL записью.
+    let block = block_dev::block_dir();
+    crate::debug!("/dev/block — ready");
+    // Push-события USB-томов для root-композитора (ABI v2).
+    let uevent = desktop_dev::uevent();
+    crate::debug!("/dev/uevent — ready");
     let dev = Arc::new(DevDirectory {
         children: vec![
             Arc::clone(&null),
@@ -713,6 +739,7 @@ pub fn init() {
         ]
         .into_iter()
         .chain(terminal_devices)
+        .chain([Arc::clone(&block), Arc::clone(&uevent)])
         .collect(),
     }) as Arc<dyn VfsNode>;
     // Записываемый in-memory /tmp: Linux-userspace считает, что он есть, —
@@ -787,6 +814,39 @@ pub fn mount_at_named(path: &str, node: Arc<dyn VfsNode>, fs: &'static str) -> V
     children.push(mount);
     drop(children);
     record_mount(path.trim_end_matches('/'), fs);
+    Ok(())
+}
+
+/// Снять точку монтирования верхнего уровня (`"/usb0p1"`).
+///
+/// Одноуровневый контракт тот же, что у [`mount_at_named`]: вложенные пути и
+/// `"/"` отвергаются. Узлы, которые держат открытые fd, остаются живы через
+/// `Arc`; после снятия новые `open` не находят точку (`ENOENT`).
+pub fn unmount_at(path: &str) -> VfsResult<()> {
+    let name = match path.strip_prefix('/') {
+        Some(rest) => rest.trim_end_matches('/'),
+        None => return Err(VfsError::InvalidArgument),
+    };
+    if name.is_empty() || name.contains('/') {
+        return Err(VfsError::InvalidArgument);
+    }
+    let root = match ROOT_DIR.lock().clone() {
+        Some(r) => r,
+        None => return Err(VfsError::NotFound),
+    };
+    let mut children = root.children.lock();
+    let before = children.len();
+    children.retain(|c| c.name() != name);
+    let removed = children.len() != before;
+    drop(children);
+    if !removed {
+        return Err(VfsError::NotFound);
+    }
+    let trimmed = path.trim_end_matches('/');
+    let mut mounts = MOUNTS.lock();
+    if let Some(table) = mounts.as_mut() {
+        table.retain(|entry| entry.point != trimmed);
+    }
     Ok(())
 }
 

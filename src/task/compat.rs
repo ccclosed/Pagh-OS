@@ -709,6 +709,35 @@ pub fn group_member_pids(tgid: u64, except: u64) -> alloc::vec::Vec<u64> {
         .collect()
 }
 
+/// Есть ли в таблицах fd любого процесса открытый файл или каталог под
+/// `prefix` (`/usb0p1` или `/usb0p1/...`).
+///
+/// `umount2` обязан ответить `EBUSY`, а не оторвать ФС у живого писателя:
+/// `Ext2Fs` не имеет `Drop`, и после снятия mount-узла открытый fd продолжил бы
+/// писать через `Arc`. Скан короткий (без I/O), реестр не держится через
+/// блокирующую работу — инвариант 4 в `AGENTS.md`.
+pub fn fds_open_under(prefix: &str) -> bool {
+    let states = COMPAT_STATES.lock();
+    let under = |path: &str| {
+        path == prefix
+            || path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
+    };
+    for state in states.values() {
+        for fd in 0..crate::task::fd_alloc::FD_TABLE_LIMIT {
+            match state.fds.get(fd as u32) {
+                Some(crate::task::fd::OpenObject::File { path, .. })
+                | Some(crate::task::fd::OpenObject::Dir { path, .. }) => {
+                    if under(path) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Все зарегистрированные задачи группы потоков `tgid`, включая лидера, по
 /// возрастанию (реестр — `BTreeMap`, порядок обхода = порядок pid).
 ///

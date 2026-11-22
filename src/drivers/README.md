@@ -172,6 +172,23 @@ PRP-list страница. `rw_common` режет запрос на LBA-выро
 весь namespace как `nvme0`, а GPT/MBR режет `drivers::partition` — см. «Разделы»),
 несколько I/O-очередей, SMART/self-test и shutdown-notification.
 
+### USB mass storage (BOT/SCSI)
+`xhci::enumerate_slot` находит интерфейс class 8/subclass 6/protocol 0x50, читает
+`GET_MAX_LUN` (STALL → LUN 0), конфигурирует bulk-пару одной Configure Endpoint и
+складывает slot id в очередь; отдельный поток `usb-storage` делает probe
+(TUR/INQUIRY/READ CAPACITY(10)) и регистрирует `usbN`/`usbNpM`. BOT-команда
+выполняется потоком вызывающего под `CONTROLLER` (спинлоки нереентерабельны;
+`usb`-поток в это время стоит): CBW 31 B bulk-OUT, data, CSW 13 B bulk-IN,
+30 с на CSW, STALL → ClearFeature+Reset Endpoint, затем полный Reset Recovery
+(Bulk-Only Reset + Reset Endpoint + Set TR Dequeue Pointer) и один повтор; три
+неудачи — `dead` до переподключения. `BlockDevice::flush` — реальный
+`SYNCHRONIZE CACHE(10)`; неподдержка мостом возвращает ошибку, а не «durable».
+4K-блок и `last_lba = 0xFFFFFFFF` — явный отказ без усечения. Имена `usbN`
+монотонны и не переиспользуются; hot-unplug по `PORTSC.CCS` снимает имена и
+помечает канал dead. `/dev/uevent` (v2, 144 B) и `mount(2)`/`umount2(2)` —
+`usb_uevent_abi.rs`/`usb_uevent.rs`/`usb_storage.rs`; auto-mount — policy
+userspace-композитора, не ядра.
+
 ### Консоль / VT / курсор
 
 ![Консоль pagh: шрифт Fira Code, каретка, статус-бар и программный курсор](../../docs/shell.png)
