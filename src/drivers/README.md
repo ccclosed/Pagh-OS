@@ -65,10 +65,15 @@ PS/2 клавиатура и мышь, framebuffer-консоль, VT-эмуля
 - `framebuffer`: `init()`, `console()`, `clear_screen()`, `set_fg_color()`, `dimensions()`,
   `with(f)`, `draw_status_bar(left, right)`, `fb_print!/fb_println!`; `fb_info() -> Option<FbInfo>`,
   `takeover_active()/acquire()/release()` (release — только in-QEMU selftest);
-  константы `CHAR_WIDTH=8`, `CHAR_HEIGHT=18`, `CHARS_PER_LINE=100`, `MAX_LINES=37`,
-  `STATUS_BAR_HEIGHT=18`. Размер глифа экспортируется **намеренно**: VT, маппинг мыши в
-  клетку и тулбар `paint` берут его отсюда, а не заводят свою копию (вторая копия —
-  молчаливый баг раскладки при смене шрифта).
+  константы `CHAR_WIDTH=8`, `CHAR_HEIGHT=18`, `STATUS_BAR_HEIGHT=18` (реэкспорт из
+  `console_layout`); размер текстовой сетки — не константа, а `console_layout::console_grid(width,
+  height)` от реального разрешения экрана. Размер глифа экспортируется **намеренно**: VT,
+  маппинг мыши в клетку и тулбар `paint` берут его отсюда, а не заводят свою копию (вторая
+  копия — молчаливый баг раскладки при смене шрифта).
+- `console_layout`: `console_grid(width, height) -> (cols, rows)` — сколько клеток 8×18
+  помещается на экране (строки — за вычетом `STATUS_BAR_HEIGHT`), и `cell_at(x, y, cols,
+  rows)` — клетка под указателем, зажатая в сетку. Чистый модуль, host-свойства
+  `properties/console_layout.rs` исполняют его исходник.
 - `vt`: `init()`, `write(bytes)`, `dimensions()`, `take_input_responses()`;
   публикует клетки/курсор в `vtsurface` (когда `/dev/vtconsole0` открыт).
 - `vtsurface`: `init()`, `activate()`/`deactivate()`, `info()`, `page()`,
@@ -380,7 +385,12 @@ userspace-композитора, не ядра.
 - Секторный кэш когерентен только потому, что весь disk I/O идёт через `read_block`/`write_block`.
 - Замыкание `framebuffer::with` НЕ должно логировать (ре-лок той же консоли → дедлок).
 - Шрифт покрывает только ASCII 0x20–0x7E; остальное — fallback-бокс.
-- `CHARS_PER_LINE=100` — фиксированная ширина переноса независимо от разрешения.
+- Текстовая сетка консоли выводится из реального разрешения framebuffer'а
+  (`console_layout::console_grid`): число колонок — `width/CHAR_WIDTH`, строк —
+  `(height-STATUS_BAR_HEIGHT)/CHAR_HEIGHT`. Фиксированные 100×37 (до qbug2) оставляли
+  на 2560×1440 вне консоли и вне mouse-выделения нижние 54% высоты; история
+  прокрутки ограничена **байтами** (`SCROLLBACK_BYTES`), поэтому её ширина следует за
+  сеткой, а бюджет памяти не растёт.
 - DMA-буферы e1000/NVMe — PMM-кадры через HHDM; heap-аллокаций на I/O-пути нет.
   NVMe выделяет data-slot'ы и PRP-list страницы на `attach`, не на каждый запрос.
 - PRP-list entry 0 — вторая страница, не первая (PRP1 уже назвал первую); `QSIZE`

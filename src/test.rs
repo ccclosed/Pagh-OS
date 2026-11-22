@@ -12101,6 +12101,14 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "desktop-b::/dev/vtfb1 respawn after session exit (device path)",
             desktop_b_tests::vtfb1_respawn_after_exit
         ),
+        // qbug2: текстовая сетка консоли выводится из реального разрешения
+        // framebuffer'а. Прежняя фиксированная сетка 100×37 оставляла на 16:9
+        // экране (2560×1440) вне выделения нижние 54% высоты — mouse-выделение
+        // «до середины». Рoutine только читает геометрию, ничего не рисует.
+        (
+            "console::text grid matches the framebuffer resolution",
+            console_grid_tests::grid_matches_framebuffer
+        ),
         // USB mass storage S1: BOT/SCSI/uevent layouts and the guest-path rule.
         // Pure encoding/parsing only — no hardware, no global state.
         (
@@ -14048,5 +14056,56 @@ mod usb_storage_prop_tests {
             !guest_path_keeps_root("/media/usb0p1"),
             "/media/usb0p1 is a guest path"
         );
+    }
+}
+
+/// In-QEMU regression for the console grid geometry (qbug2).
+///
+/// The host properties (`host-tests/src/properties/console_layout.rs`) pin the
+/// pure arithmetic; this routine pins the wiring inside the running kernel: the
+/// writer the shell actually uses must advertise exactly the grid the screen can
+/// hold, and the bottom-right screen pixel must map to the last cell. On the old
+/// fixed 100×37 grid the second check failed at any resolution taller than
+/// 37·18 = 666 px, which is what made a corner-to-corner mouse selection stop in
+/// the middle of a 16:9 screen. Read-only and non-destructive.
+mod console_grid_tests {
+    use crate::drivers::console_layout::{cell_at, console_grid, CHAR_HEIGHT, STATUS_BAR_HEIGHT};
+    use crate::drivers::framebuffer;
+
+    pub fn grid_matches_framebuffer() {
+        let (width, height) = framebuffer::dimensions();
+        assert_kernel!(width > 0 && height > 0, "framebuffer reports a size");
+        let (cols, rows) = framebuffer::console().text_grid();
+        let expected = console_grid(width, height);
+        assert_eq_kernel!(
+            (cols, rows),
+            expected,
+            "console grid is derived from the framebuffer size"
+        );
+        // A corner-to-corner drag must be representable: the bottom-right screen
+        // pixel belongs to the last grid cell, not to a clipped phantom row.
+        assert_eq_kernel!(
+            cell_at(width - 1, height - 1, cols, rows),
+            (cols - 1, rows - 1),
+            "bottom-right pixel maps to the last console cell"
+        );
+        // The grid fills the height down to the status bar and never overlaps it.
+        let text_px = rows * CHAR_HEIGHT;
+        assert_kernel!(
+            text_px + STATUS_BAR_HEIGHT <= height,
+            "text grid must not paint over the status bar"
+        );
+        assert_kernel!(
+            height - (text_px + STATUS_BAR_HEIGHT) < CHAR_HEIGHT,
+            "at most one cell of height may stay unused"
+        );
+        // The regression shape: a 37-row fixed grid could not reach the bottom
+        // of any 1080p/1440p/4K panel.
+        if height >= 1080 {
+            assert_kernel!(
+                rows > 37,
+                "rows must exceed the retired fixed-grid cap on tall screens"
+            );
+        }
     }
 }

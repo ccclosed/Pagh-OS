@@ -1,22 +1,11 @@
 //! Идемпотентное первичное заполнение файловой системы при первой загрузке pagh.
 
 use crate::arch::x86_64::linux::cred::gid;
+use crate::os_identity;
 use crate::vfs::{VfsError, VfsNode};
 use alloc::sync::Arc;
 
 // Версия ОС берётся из версии крейта (Cargo.toml), чтобы они не расходились.
-const RELEASE: &[u8] = concat!(
-    "NAME=pagh OS\nID=pagh\nVERSION=",
-    env!("CARGO_PKG_VERSION"),
-    "\nARCH=x86_64\n"
-)
-.as_bytes();
-const MOTD: &[u8] = concat!(
-    "pagh OS ",
-    env!("CARGO_PKG_VERSION"),
-    "\nType 'help' to list commands. Network apt and nano+ are available.\n"
-)
-.as_bytes();
 const README: &[u8] = b"Welcome to pagh!\n\nTry:\n  help\n  nano --settings\n  nano /mnt/home/user/notes.txt\n  apt update\n";
 
 /// Минимальная база идентичностей фазы 1 «группы отдельно от root»
@@ -116,6 +105,40 @@ fn write_once_owned(
     Ok(())
 }
 
+/// Записать `/etc/os-release`, обновив версию у файла, который уже объявляет
+/// Pagh-OS.
+///
+/// Обычный [`write_once`] здесь недостаточен: версия ОС — это
+/// `CARGO_PKG_VERSION` **работающего** ядра, и после обновления ядра на
+/// существующем диске файл иначе навсегда застыл бы на версии первого boot'а
+/// (именно это случилось с историческим `/etc/pagh-release`: на тестовом
+/// образе он до сих пор `2.3.0`). Поэтому канонический os-release
+/// перезаписывается, когда меняется версия; файл с другой идентичностью —
+/// пользовательская правка, её не трогаем.
+fn write_os_release(path: &str, data: &[u8]) -> Result<(), VfsError> {
+    match crate::vfs::lookup_path(path) {
+        Ok(node) if node.is_directory() => Err(VfsError::InvalidArgument),
+        Ok(node) => {
+            let mut existing = [0u8; 512];
+            let read = node.read(0, &mut existing).unwrap_or(0);
+            if !os_identity::is_canonical_os_release(&existing[..read]) {
+                return Ok(());
+            }
+            if read == data.len() && &existing[..read] == data {
+                return Ok(());
+            }
+            node.truncate(0)?;
+            if node.write(0, data)? != data.len() {
+                return Err(VfsError::IoError);
+            }
+            node.sync();
+            Ok(())
+        }
+        Err(VfsError::NotFound) => write_once(path, data),
+        Err(error) => Err(error),
+    }
+}
+
 /// Создать каталог, если его нет, и сразу выставить владельца/режим **только**
 /// новому каталогу. Существующий каталог не трогается: пользователь мог
 /// переименовать/ужать его, и boot-путь не должен молча возвращать свои права.
@@ -141,6 +164,15 @@ fn seed_identity() -> Result<(), VfsError> {
     write_once("/mnt/etc/group", GROUP)?;
     // Хэши паролей — только root: 0600 root:root, как в Linux.
     write_once_owned("/mnt/etc/shadow", SHADOW, 0, 0, 0o600)?;
+    // Идентичность ОС — стандартный `/etc/os-release`, а не только
+    // исторический `pagh-release`: его читают fastfetch и os-release-совместимые
+    // инструменты. `write_os_release` создаёт файл на диске, провижиненном
+    // старым ядром, обновляет версию у канонического файла и не трогает чужую
+    // идентичность (пользовательскую правку).
+    write_os_release(
+        "/mnt/etc/os-release",
+        &os_identity::format_os_release(env!("CARGO_PKG_VERSION")),
+    )?;
     ensure_dir_owned("/mnt/home/oleg", 1000, gid::OLEG, 0o755)?;
     Ok(())
 }
@@ -164,7 +196,8 @@ pub fn record_mount_choice(device: &str, action: &str) {
 }
 
 /// Установить release-метаданные, скелет домашнего каталога и примеры при первой
-/// загрузке. Существующие файлы никогда не перезаписываются.
+/// загрузке. Существующие файлы не перезаписываются, кроме канонического
+/// `/etc/os-release`, у которого обновляется версия (см. [`write_os_release`]).
 pub fn seed() {
     if crate::vfs::lookup_path("/mnt/etc/pagh-release").is_ok() {
         // Уже провижиненный диск: досоздать только то, что появилось в новых
@@ -176,6 +209,7 @@ pub fn seed() {
         return;
     }
     let result = (|| {
+        let version = env!("CARGO_PKG_VERSION");
         ensure_dir("/mnt/etc")?;
         ensure_dir("/mnt/home/user")?;
         ensure_dir("/mnt/usr/share/pagh")?;
@@ -186,7 +220,7 @@ pub fn seed() {
             b"nameserver 10.0.2.3\noptions timeout:1 attempts:2\n",
         )?;
         write_once("/mnt/etc/hosts", b"127.0.0.1 localhost\n::1 localhost\n");
-        write_once("/mnt/etc/motd", MOTD)?;
+        write_once("/mnt/etc/motd", &os_identity::format_motd(version))?;
         write_once("/mnt/home/user/README.txt", README)?;
         write_once(
             "/mnt/usr/share/pagh/LICENSE-NOTICE.txt",
@@ -197,7 +231,10 @@ pub fn seed() {
         // оборвалась посередине, следующий boot увидит его отсутствие и
         // безопасно доделает остаток (все записи идемпотентны). Раньше маркер
         // шёл первым, и обрыв после него навсегда оставлял диск полу-засеянным.
-        write_once("/mnt/etc/pagh-release", RELEASE)?;
+        write_once(
+            "/mnt/etc/pagh-release",
+            &os_identity::format_pagh_release(version),
+        )?;
         Ok::<(), VfsError>(())
     })();
     match result {
