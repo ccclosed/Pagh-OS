@@ -323,6 +323,9 @@ fn terminal_shm_damage_blink_and_resize() {
             path.to_str().unwrap(),
             "--size",
             &format!("{W}x{H}"),
+            // Explicit mode: ShmSurface framing, independent of the kernel
+            // shell-session devices host CI does not have.
+            "--demo-shell",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
