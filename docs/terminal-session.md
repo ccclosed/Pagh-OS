@@ -262,3 +262,42 @@ Write-only приём VT-байтов **этой** сессии:
 9. **Сериализация вывода.** Ввод и вывод сессии идут с её задачей; мьютекс
    поверхности берётся на flush. Долгие команды в окне не блокируют boot-shell
    (разные задачи), но делят один CPU — как и любая kernel-работа.
+## 7. Live-приёмка в реальном окне
+
+Ядровая половина проверяется in-QEMU рутинами §5. Половина «человек видит это в
+окне» проверяется ШИПОВЫМИ бинарями: `pagh-desktop` на `/dev/fb0` + `/dev/input/event0`
+и `pagh-terminal`, который блитит `/dev/vtfb1` и пишет клавиши в `/dev/vtinput1`.
+
+```sh
+python3 tools/e2e.py termwindow            # полный прогон (сеть нужна для ppkg)
+python3 tools/e2e.py termwindow --no-distro [--reuse-termwindow-disk]
+```
+
+Композитор стартует **через `/mnt/etc/autorun`** — ровно как в шиповой рецептуре
+`rust-apps/pagh-desktop/desktop-autorun`. Это не деталь стенда: команда
+`--launch-target` содержит `{socket}`, и набранные скобки через QMP под TCG
+оставляли залипший Ctrl, после чего первый же `c` в гостя превращался в настоящий
+`^C`. Автостарт убирает с клавиатуры всё, кроме набора команд в окно.
+
+Что печатается в окно (каждая команда — отдельный PNG и пара
+`[DIAG] window session=1 command=…/done=…` в serial): `df`, `ps`, `ps -ef`, `id`,
+`id -un`, `groups`, `ls -la /mnt`, `disk list`, `clear`, `help`, `nano` (открыть →
+текст → `Ctrl+S` → `Ctrl+Q`), `ppkg update`, `ppkg install nano fastfetch`,
+`lxrun nano` (Linux nano: `Ctrl+O`/Enter/`Ctrl+X`) и голое `fastfetch`
+(PATH-fallback #158, без префикса `lxrun`).
+
+Утверждения стенда:
+
+* на каждую команду — `done=` в пределах таймаута; отсутствие `command=` значит,
+  что ввод не дошёл до session-shell вообще;
+* **boot-консоль не получила ни одной команды окна**: ни `1K-blocks`, ни
+  `STAT COMMAND`, ни `uid=0(root)` в serial нет (kernel-shell в окне не эхоит в
+  serial, поэтому любое их появление — это исполнение в boot-shell);
+* сохранённые `nano` файлы читаются обратно из образа ext2 через `debugfs`
+  (`QTERM-NANO-OK`, `QTERM-LINUX-NANO-OK`) — доказательство записи, а не кадра;
+* нет `PANIC`/`[EXC`/`SIGSEGV`.
+
+Честные границы §6 от этого не меняются: PTY/termios, per-window job control,
+несколько сессий, per-session identity и мышь — следующие этапы. Клиентский
+рендер полноэкранной поверхности масштабируется nearest-neighbour в окно меньшего
+размера (UX, не маршрутизация).
