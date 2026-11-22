@@ -316,7 +316,7 @@ fn start(session: usize) -> bool {
     // Новая генерация окна начинает с чистого ввода: недоставленный хвост
     // прошлой пачки и недособранная ESC-последовательность не должны съесть
     // первые клавиши пользователя (см. `vtinput::reset_session`).
-crate::drivers::vt_mouse::reset(session);
+    crate::drivers::vt_mouse::reset(session);
     crate::drivers::vtinput::reset_session(session);
     PENDING.store(session as u64, Ordering::Relaxed);
     // Инвариант 6: путь спавна идёт с замаскированными прерываниями — тик не
