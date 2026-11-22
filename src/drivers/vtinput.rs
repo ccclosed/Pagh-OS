@@ -83,8 +83,21 @@ pub fn client_active() -> bool {
     CLIENT_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Заявить физическую клавиатуру за вызывающим compat-процессом.
+///
+/// Вызывается при `open` устройств терминальной сессии и из записи в
+/// `/dev/vtinput1`: владение должно начаться с ПЕРВОГО нажатия, а не после него,
+/// иначе самый первый `Ctrl+C`/`Ctrl+Z` из окна успевает отработать в boot-сессии
+/// (найдено в live-QEMU: окно исчезало). Не-compat вызывающий (ядро/selftest)
+/// владельцем не становится.
+pub fn claim_keyboard() {
+    if crate::task::compat::current_has_compat() {
+        note_client(crate::task::scheduler::current_pid());
+    }
+}
+
 /// Запомнить писавшего как владельца клавиатуры. Вызывается только из
-/// [`write`] и только когда текущая задача — compat-процесс.
+/// [`claim_keyboard`]/[`write`], когда текущая задача — compat-процесс.
 fn note_client(pid: u64) {
     CLIENT_PID.store(pid, Ordering::Relaxed);
     CLIENT_ACTIVE.store(true, Ordering::Relaxed);
@@ -114,19 +127,86 @@ pub fn reap_dead_client() {
     }
 }
 
-/// Читает ли stdin этого терминала foreground-программа **этой** сессии.
+/// Отдать VT-байты foreground-программе сессии, применив `ISIG`.
 ///
-/// Один глобальный `FG_PID` — named gap (per-window job control — следующий
-/// этап), но сравнивать его сессию обязательно уже сейчас: клиент окна — сам
-/// foreground-задача boot-shell'а, поэтому без сверки `write` в `/dev/vtinput1`
-/// уходил бы в `STDIN_PENDING` «чужой» программы, а session-shell не получал бы
-/// ввода вовсе (живой симптом: окно рисует баннер и промпт, но не эхоит ни одну
-/// набранную клавишу).
-fn stdin_owned_by(session: usize) -> bool {
-    let fg = crate::drivers::ps2_kbd::FG_PID.load(Ordering::Relaxed);
-    fg != 0
-        && crate::task::compat::compat_exists(fg)
-        && crate::drivers::session::bound_session(fg) == session
+/// Пока foreground — Linux-программа (`lxrun`), её stdin читается из очереди
+/// сессии в io_sys; байты идут туда дословно (UTF-8/escape сохраняются). Но
+/// управляющий терминал обязан превращать `^C`/`^Z`/`^\\` в сигналы, пока
+/// программа не сняла `ISIG` (raw-режим): иначе вызов `read(2)` в cooked-режиме
+/// получил бы байт `0x03` вместо `SIGINT`, и `Ctrl+C` в окне не прерывал бы
+/// задание. Сигнальные байты не доставляются (Linux ISIG их не отдаёт).
+///
+/// `true` — байты обработаны как ввод программы; `false` — foreground'а нет, и
+/// вызывающий переводит их в скан-коды shell'а.
+fn deliver_to_job(session: usize, fg: u64, bytes: &[u8]) -> bool {
+    use crate::arch::x86_64::linux::signal_frame::{SIGINT, SIGQUIT, SIGTSTP};
+    if fg == 0 || !crate::task::compat::compat_exists(fg) {
+        return false;
+    }
+    // Raw-режим (nvim/less) сам разбирает управляющие байты: ISIG снят вместе
+    // с ICANON, поэтому байт доставляется как есть в stdin-очередь.
+    if crate::task::compat::compat_is_raw(fg) {
+        crate::arch::x86_64::linux::io_sys::push_stdin_bytes_for(session, bytes);
+        return true;
+    }
+    // Cooked-режим: сигнальные байты — в сигналы (ISIG), остальное — в
+    // scancode-кольцо ЭТОЙ сессии, чтобы `read_stdin_line` применил ту же
+    // cooked-дисциплину (эхо, Backspace, Enter), что и к физической клавиатуре.
+    // Отдавать сырые байты в очередь здесь нельзя: они вернулись бы из `read`
+    // до Enter, и построчное чтение перестало бы быть построчным.
+    let mut kept = [0u8; 64];
+    let mut kept_len = 0usize;
+    let mut flush = |bytes: &[u8], session: usize| {
+        let mut parser = parser_for(session).lock();
+        if session == crate::drivers::session_route::BOOT_SESSION {
+            parser.feed(bytes, &mut |scancode| {
+                crate::drivers::ps2_kbd::inject_scancode_from_vt(scancode);
+            });
+        } else {
+            parser.feed(bytes, &mut |scancode| {
+                crate::drivers::ps2_kbd::push_session_scancode(session, scancode);
+            });
+        }
+    };
+    for &byte in bytes {
+        match byte {
+            0x03 | 0x1A | 0x1C => {
+                let sig = if byte == 0x03 {
+                    SIGINT
+                } else if byte == 0x1A {
+                    SIGTSTP
+                } else {
+                    SIGQUIT
+                };
+                // Защёлка — чтобы foreground_wait shell'а увидел нажатие и
+                // вернул промпт/напечатал `^C`/`^Z` даже когда сигнал доставили
+                // мы, а не декодер скан-кодов.
+                if sig == SIGINT {
+                    crate::drivers::ps2_kbd::set_ctrl_c(session, true);
+                } else if sig == SIGTSTP {
+                    crate::drivers::ps2_kbd::set_ctrl_z(session, true);
+                }
+                if kept_len > 0 {
+                    flush(&kept[..kept_len], session);
+                    kept_len = 0;
+                }
+                let pgid = crate::drivers::tty::foreground_pgid_for(session);
+                let _ = crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(pgid, sig);
+            }
+            _ => {
+                kept[kept_len] = byte;
+                kept_len += 1;
+                if kept_len == kept.len() {
+                    flush(&kept[..kept_len], session);
+                    kept_len = 0;
+                }
+            }
+        }
+    }
+    if kept_len > 0 {
+        flush(&kept[..kept_len], session);
+    }
+    true
 }
 
 /// Перевести VT-байты в скан-коды и разбудить shell. Возвращает `len` — запись
@@ -143,10 +223,10 @@ pub fn write(bytes: &[u8]) -> usize {
         note_client(crate::task::scheduler::current_pid());
     }
     // Пока foreground — Linux-программа (`lxrun`), её stdin читается из
-    // `STDIN_PENDING` в io_sys; отдаём байты туда дословно (UTF-8/escape
-    // сохраняются). Иначе ввод адресован shell-редактору — переводим в set-1.
-    if stdin_owned_by(session) {
-        crate::arch::x86_64::linux::io_sys::push_stdin_bytes(bytes);
+    // очереди сессии; иначе ввод адресован shell-редактору — переводим в set-1.
+    let session = crate::drivers::session::current();
+    let fg = crate::drivers::ps2_kbd::fg_pid(session);
+    if deliver_to_job(session, fg, bytes) {
         return bytes.len();
     }
     {
@@ -174,35 +254,42 @@ pub fn reset() {
 ///
 /// Отличия от boot-пути [`write`]:
 ///
-/// 1. **Защёлкивает владельца клавиатуры, как и boot-путь.** Писавший
-///    compat-процесс (терминальное окно) становится владельцем: `deliver_physical`
-///    перестаёт класть IRQ1/USB-байт в boot-кольцо, и физическая клавиша
-///    доставляется в окно ровно один раз — через `/dev/vtinput1`. Без этой
-///    защёлки набранное в окне исполнялось ДВАЖДЫ: в окне (через композитор) и в
-///    boot-shell (прямой путь IRQ1), то есть команда в window-сессии дублировалась
-///    в фоновую boot-консоль. Это не «окно съело клавиатуру»: desktop с
-///    композитором — это и есть режим, в котором физический ввод адресован окну;
-///    владелец снимается сам, когда процесс-клиент завершается
-///    ([`reap_dead_client`] из boot-shell'а), и прямой путь возвращается.
+/// 1. **Защёлкивает владельца физической клавиатуры** (`client_active`), как и
+///    boot-путь: пока kernel-session окно живо, физические скан-коды не
+///    дублируются в boot-кольцо, а `Ctrl+C`/`Ctrl+Z` из IRQ-трекинга не
+///    убивают/не паркуют boot-задание. Без защёлки одно нажатие доходило до
+///    двух разных терминалов (live-QEMU: `Ctrl+C` в окне убивал композитора, а
+///    `Ctrl+Z` парковал его), то есть «per-session» на бумаге было общим на
+///    деле. `reap_dead_client` возвращает клавиатуру boot-shell'у после выхода
+///    окна.
 /// 2. **Пишет в кольцо сессии** (`ps2_kbd::push_session_scancode`), а не в
 ///    boot-кольцо: иначе ввод окна попадал бы в boot-shell.
 ///
-/// Как и boot-путь, отдаёт байты дословно в `STDIN_PENDING`, пока в системе есть
-/// foreground-программа (`lxrun` в окне): её stdin — это байты терминала, а не
-/// скан-коды shell-редактора. Ограничение (одна глобальная foreground-группа)
-/// названо в `docs/terminal-session.md`.
+/// 3. **Ввод адресуется foreground-программе ЭТОЙ сессии** (`ps2_kbd::fg_pid` —
+///    массив по сессиям): raw-режим получает байты дословно в stdin-очередь
+///    сессии, cooked — `ISIG` (сигналы её foreground-группе) плюс scancode-кольцо
+///    сессии, чтобы `read_stdin_line` применял ту же cooked-дисциплину. Ввод окна
+///    не уходит в stdin программы другого окна или boot-shell'а.
 pub fn write_session(session: usize, bytes: &[u8]) -> usize {
     if bytes.is_empty() || session == crate::drivers::session_route::BOOT_SESSION {
         return write(bytes);
     }
-    // Та же защёлка владельца, что у boot-пути: окно водит клавиатуру, пока в
-    // него пишет живой клиент. kernel-контекст (selftest) владельцем не
-    // становится — иначе тест отобрал бы ввод у настоящей консоли.
+    // Запись из окна забирает физическую клавиатуру у boot-консоли. Это
+    // ОБЯЗАТЕЛЬНО для kernel-session окна: QEMU/железо доставляет нажатие и в
+    // evdev (композитору), и в IRQ1 (shell-кольцо boot), поэтому без защёлки
+    // `Ctrl+C`/`Ctrl+Z`, набранный в окне, ДОПОЛНИТЕЛЬНО убивал/парковал
+    // boot-задание (терминального клиента) из IRQ-трекинга, и окно исчезало.
+    // Теперь физические скан-коды boot-shell'а не пополняются, пока окно живо
+    // (`reap_dead_client` возвращает клавиатуру после его выхода), а сигналы
+    // обрабатывает сессия окна (`ISIG` ниже).
     if crate::task::compat::current_has_compat() {
         note_client(crate::task::scheduler::current_pid());
     }
-    if stdin_owned_by(session) {
-        crate::arch::x86_64::linux::io_sys::push_stdin_bytes(bytes);
+    // Foreground — программа ИМЕННО этой сессии: ввод окна не должен уходить
+    // в stdin программы другого окна/ boot-shell'а, а `ISIG` (`^C`/`^Z`) обязан
+    // слать сигнал foreground-группе этой сессии.
+    let fg = crate::drivers::ps2_kbd::fg_pid(session);
+    if deliver_to_job(session, fg, bytes) {
         return bytes.len();
     }
     {

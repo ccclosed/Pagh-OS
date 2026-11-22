@@ -374,6 +374,10 @@ fn notify_parent_sigchld(parent: u64) {
 }
 
 pub fn finish_compat_exit(pid: u64) {
+    // Ребёнок больше не принадлежит консольной сессии: привязка pid → сессия
+    // живёт ровно столько же, сколько compat-состояние (иначе таблица росла бы
+    // на каждый `lxrun`/fork).
+    crate::drivers::session::unbind(pid);
     if let Some(state) = remove_compat(pid) {
         if state.waitable && state.ppid != 0 {
             EXITED_CHILDREN

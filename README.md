@@ -792,12 +792,16 @@ python
   возобновляется по `SIGCONT`; `wait4` сообщает `WUNTRACED` и `WCONTINUED`, а `SIGCHLD`
   ставится в очередь на exit/stop/continue ребёнка), и фатальный `tgkill`/`kill` без
   обработчика всё равно чисто завершает процесс (glibc `abort()` → exit 134).
-  Консоль — настоящий управляющий терминал: kernel-side foreground process group
-  (`tcgetpgrp`/`tcsetpgrp` через `TIOCGPGRP`/`TIOCSPGRP`), который `lxrun` передаёт
-  ребёнку и восстанавливает для shell на выходе; `SIGTTIN`, когда фоновая job читает
-  терминал, и `SIGTTOU`, когда она пишет при выставленном `TOSTOP` (pagh по умолчанию
-  включает `TOSTOP`; `tcsetattr` его снимает); `^Z` останавливает всю foreground-группу
-  терминала, а не только последний pid. Shell держит таблицу jobs (`jobs`/`fg`/`bg`).
+  Консоль — настоящий управляющий терминал, и терминал этот **свой у каждой консольной
+  сессии**: boot-консоль и каждое окно desktop'а имеют отдельную foreground process group
+  (`tcgetpgrp`/`tcsetpgrp` через `TIOCGPGRP`/`TIOCSPGRP`), которую `lxrun`/`fg` передают
+  ребёнку и восстанавливают для shell на выходе; `SIGTTIN`, когда фоновая job читает
+  терминал, и `SIGTTOU`, когда она пишет при выставленном `TOSTOP` (`TOSTOP` по умолчанию
+  выключен, как в Linux, — включённый по умолчанию останавливал фоновый композитор
+  desktop'а; `tcsetattr` его ставит); `^C`/`^Z` доставляются foreground-группе ЭТОЙ
+  сессии, а не одному последнему pid. У каждой сессии свои `TIOCGWINSZ`/`TIOCSWINSZ` и
+  `SIGWINCH` при resize окна. Shell держит таблицу jobs (`jobs`/`fg`/`bg`) — тоже на
+  сессию.
   Пока нет: сессий/`getsid`, `tcsetattr` из фоновой группы не генерирует `SIGTTOU`, а
   `kill(-pgid)` ставит одну копию лидеру группы, а не по одной на thread group (пути
   stop/continue терминала и shell используют broadcast на thread group).

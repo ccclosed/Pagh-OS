@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use pagh_terminal::kernelsession::{
     encode_key_bytes, encode_snapshot, fit_placement, is_missing_device, is_session_end,
-    render_notice, solid_pixels, Draw, FileInput, FitPlacement, FrameSource, InputSink,
-    KernelFrame, KeyForwarder, ReadFrameSource, VtFbError, VtFbInfo,
+    render_notice, solid_pixels, winsize_cells, Draw, FileInput, FitPlacement, FrameSource,
+    InputSink, KernelFrame, KeyForwarder, ReadFrameSource, VtFbError, VtFbInfo,
 };
 use pagh_terminal::protocol::{self, configure_flags, welcome_flags, Message};
 use pagh_terminal::render::{Canvas, Theme};
@@ -791,4 +791,18 @@ fn a_regular_file_surface_uses_read_fallback_and_reports_a_missing_compositor() 
         "причина отказа композитора обязана быть названа: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Размер терминала в клетках ядра (8×18 px) — то, что клиент шлёт в
+/// `TIOCSWINSZ` после resize окна: целочисленное деление, минимум одна клетка,
+/// кламп в `u16` (структура UAPI — четыре `u16`).
+#[test]
+fn winsize_cells_match_the_kernel_cell_grid() {
+    assert_eq!(winsize_cells(720, 420), (90, 23));
+    assert_eq!(winsize_cells(1280, 800), (160, 44));
+    // Окно меньше клетки — не 0 (TUI делил бы на ноль), а одна клетка.
+    assert_eq!(winsize_cells(1, 1), (1, 1));
+    assert_eq!(winsize_cells(0, 0), (1, 1));
+    // struct winsize — четыре u16: гигантский запрос клампится, не переполняется.
+    assert_eq!(winsize_cells(u32::MAX, u32::MAX), (u16::MAX, u16::MAX));
 }
