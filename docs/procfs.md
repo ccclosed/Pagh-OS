@@ -673,9 +673,13 @@ nodev\tramfs\n
 
 - `ostype` — собственное имя ядра `Pagh`, а не Linux-овское `Linux`: `uname(2)`
   отвечает `Linux` ради совместимости, но этот файл по контракту называет
-  систему.
-- `osrelease` — реальная версия крейта, та же, что в `/proc/version` и
-  `/mnt/etc/pagh-release`; никакой отдельной «release-строки» нет.
+  систему. Имя **ОС** (`Pagh-OS`, `ID=pagh`) и версия для userland живут в
+  `/etc/os-release`; полная модель — `docs/os-identity.md`.
+- `osrelease` — реальная версия крейта, та же, что в `/proc/version`; на
+  историческом `/mnt/etc/pagh-release` она может отставать (файл пишется один
+  раз), поэтому источник истины о версии — `/proc/version`,
+  `/proc/sys/kernel/osrelease` и `/etc/os-release`; никакой отдельной
+  «release-строки» нет.
 - `hostname` — `uname(2).nodename`, который в этом ядре жёстко равен `pagh`;
   переменной hostname и `sethostname(2)` нет. Оба места обязаны меняться вместе,
   если hostname когда-нибудь появится.

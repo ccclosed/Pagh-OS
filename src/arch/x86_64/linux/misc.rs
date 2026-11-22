@@ -64,15 +64,23 @@ fn field(s: &str) -> [u8; 65] {
 
 /// `uname` (63): заполнить пользовательский `struct utsname` фиксированными
 /// строками идентификации и вернуть 0 (R2.11).
+///
+/// `sysname` — `Linux`, и это осознанный выбор совместимости, а не имя ОС:
+/// Linux-бинарники, configure-скрипты и `config.guess` опрашивают UTS-sysname,
+/// чтобы включить Linux-ветку ABI; Pagh — самостоятельная ОС с Linux-
+/// совместимым syscall ABI, поэтому identity ОС живёт в `/etc/os-release`
+/// (`NAME="Pagh-OS"`, `ID=pagh`), а `/proc/sys/kernel/ostype` отвечает `Pagh`.
+/// Модель и обоснование — `docs/os-identity.md`; константы — в
+/// [`crate::os_identity`], чтобы документация и код не расходились.
 pub fn sys_uname(buf: u64) -> Result<u64, Errno> {
     check_user_ptr_writable(buf, core::mem::size_of::<Utsname>() as u64)?;
     let uts = Utsname {
-        sysname: field("Linux"),
-        nodename: field("pagh"),
-        release: field("6.1.0-pagh"),
-        version: field("#1 pagh compat"),
-        machine: field("x86_64"),
-        domainname: field("(none)"),
+        sysname: field(crate::os_identity::UTS_SYSNAME),
+        nodename: field(crate::os_identity::UTS_NODENAME),
+        release: field(crate::os_identity::UTS_RELEASE),
+        version: field(crate::os_identity::UTS_VERSION),
+        machine: field(crate::os_identity::UTS_MACHINE),
+        domainname: field(crate::os_identity::UTS_DOMAINNAME),
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(

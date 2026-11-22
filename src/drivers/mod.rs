@@ -1,6 +1,8 @@
 // drivers/mod.rs — Device Manager и трейты драйверов
 // 64-битное ядро ОС x86_64 на Rust (#![no_std])
 
+/// Чистая геометрия текстовой сетки консоли (клетки 8×18 на экране), host-тестируемая.
+pub mod console_layout;
 pub mod cursor;
 pub mod e1000;
 pub mod earlyfb;

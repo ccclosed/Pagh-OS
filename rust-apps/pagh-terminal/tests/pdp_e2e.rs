@@ -103,7 +103,14 @@ fn pagh_terminal_runs_under_real_pagh_desktop() {
     let empty = capture(&server.control, &shots, "00-empty.png");
     let trace = shots.join("terminal.trace");
     let mut child = Command::new(env!("CARGO_BIN_EXE_pagh-terminal"))
-        .args(["--socket", socket.to_str().unwrap(), "--size", "700x460"])
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--size",
+            "700x460",
+            // Explicit mode: this test drives the demo-shell surface end to end.
+            "--demo-shell",
+        ])
         .env("PAGH_TERMINAL_PDP_TRACE", &trace)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -414,6 +414,14 @@ pub mod nvme_prp;
 #[path = "../../src/drivers/scrollback.rs"]
 pub mod scrollback;
 
+// Текстовая сетка консоли (qbug2): сколько клеток 8×18 помещается на экране.
+// Геометрия выводится из реального разрешения framebuffer'а, а не из прежней
+// константы 100×37, из-за которой на 2560×1440 mouse-выделение консоли доходило
+// только до 46% высоты («до середины»). `core`-only, без состояния — host-cвойства
+// гоняют ровно тот исходник, который компилирует ядро.
+#[path = "../../src/drivers/console_layout.rs"]
+pub mod console_layout;
+
 // `ext2::symlink` is the pure symlink-layout + hard-link accounting core of the
 // ext2 writer (issue #18, contract `EXT2-LINKS.md` §2/§3): which targets stay
 // inline in the inode's `i_block` (≤ 59 bytes) and which need a data block, how
@@ -537,6 +545,13 @@ pub mod release_file;
 #[path = "../../src/vfs/procfs_format.rs"]
 pub mod procfs_format;
 
+// `os_identity` — канонические строки идентичности (`Pagh-OS` / `pagh`) и
+// форматтеры `/etc/os-release`, `/etc/pagh-release`, `/etc/motd`. `core`+`alloc`
+// only, поэтому host-свойство `os_identity` исполняет ровно тот исходник,
+// который компилирует ядро; `uname(2)` берёт UTS-константы отсюда же.
+#[path = "../../src/os_identity.rs"]
+pub mod os_identity;
+
 // `task_stat` is the tick/event accounting behind `/proc/stat` (issue #11,
 // slice 2): the pure user/system/idle classification plus the monotonic
 // `AtomicU64` counters and the seqlock snapshot. `core`-only and self-contained,
@@ -643,6 +658,11 @@ mod properties {
     mod procfs_status;
     mod procfs_task;
 
+    // Идентичность ОС (`docs/os-identity.md`): `/etc/os-release` называет
+    // систему `Pagh-OS`/`pagh` и несёт реальную версию; `uname(2)` остаётся
+    // Linux-совместимым UTS-идентификатором, и свойство это фиксирует.
+    mod os_identity;
+
     // Boot-time device safety (issue #33): only a genuinely blank device is
     // formatted; GPT/MBR/foreign/ext2-like layouts are refused.
     mod p50;
@@ -718,6 +738,12 @@ mod properties {
     // percent/speed/size/ETA widgets, the 10 FPS redraw gate, the ANSI repaint
     // sequence and the carriage-return/plain fallbacks.
     mod ppkg_progress_ui;
+    // Текстовая сетка консоли (qbug2): сетка выводится из реального разрешения
+    // экрана (in-QEMU это доказано live-PNG выделения), поэтому mouse-выделение
+    // из угла в угол покрывает весь экран, а не верхние 37·18 px. Свойства
+    // закрепляют приёмочные разрешения 1280×720/1920×1080/1280×800, «половинный»
+    // случай 2560×1440 и кламп клетки под указателем в сетку.
+    mod console_layout;
     // Поиск программы по PATH (lxrun-волна): env поверх default, кандидаты
     // `dir/name`, отсутствие поиска для путей со `/`, и префиксный ELF-тест,
     // которым поиск отбирает кандидата (сверен с `classify_elf`).
