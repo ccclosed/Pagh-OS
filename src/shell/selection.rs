@@ -1,9 +1,20 @@
 //! Выделение текста мышью на консоли.
 //!
 //! Консоль держит клеточную модель напечатанного (сетка `FramebufferWriter`) и
-//! умеет перекрасить одну клетку фоном — вместе это делает выделение возможным
-//! без правки пиксельного кода рисования: выделение — диапазон клеток,
-//! рисуемый перекраской этих клеток инверсией.
+//! умеет перерисовать одну клетку — вместе это делает выделение возможным без
+//! правки пиксельного кода рисования: выделение — диапазон клеток, который
+//! перерисовывается **только по фону**.
+//!
+//! Раньше здесь была инверсия: все выделенные клетки заливались одним цветом
+//! (`SELECT_FG` поверх `SELECT_BG`). Для цветного вывода это уничтожало ровно то,
+//! что выделение должно сохранить — цветные `#` логотипа fastfetch становились
+//! тёмными блоками, ANSI-полоса палитры сливалась в один прямоугольник, а
+//! цветные key/value серели. Теперь в фон каждой клетки подмешивается акцент
+//! (`selection_math::ACCENT`, та же доля 60%, что у клиента `pagh-terminal`), а
+//! глиф рисуется своим прежним цветом байт-в-байт; снятие выделения возвращает
+//! и фон клетки из модели. Политика «протяжка сверху донизу — это Area»
+//! (все строки целиком) живёт в [`selection_math`], чтобы её можно было
+//! доказать host-свойством.
 //!
 //! Здесь встречаются две системы координат, и весь модуль о том, чтобы их не
 //! путать:
@@ -24,12 +35,7 @@
 
 use crate::drivers::framebuffer;
 use crate::shell::caret::Cell;
-
-/// Цвета выделенной клетки: тёмный текст на светлом фоне, инверсия обычного
-/// светлого-на-тёмном консоли. Инверсия и делает выделение видимым поверх текста
-/// любого цвета.
-pub const SELECT_FG: u32 = 0x000000;
-pub const SELECT_BG: u32 = 0xCCCCCC;
+use crate::shell::selection_math;
 
 /// Диапазон клеток консоли от `a` до `b` включительно, в порядке чтения.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -268,12 +274,50 @@ impl Selection {
     }
 
     /// Расширить перетаскивание до `cell` и сообщить, выделено ли что-то.
-    pub fn extend(&mut self, cell: Cell) -> bool {
+    ///
+    /// `rows`/`cols` — видимая сетка: по ним работает Area-политика. Протяжка,
+    /// начатая в верхней строке и доведённая до нижней, — это «выделить весь
+    /// видимый вывод», поэтому её колонки расширяются до полной ширины
+    /// (`selection_math::promoted_columns`). Протяжка внутри нескольких строк
+    /// остаётся символьной — обрезанные первая/последняя строки там ожидаемы.
+    pub fn extend(&mut self, cell: Cell, rows: usize, cols: usize) -> bool {
         let Some(anchor) = self.anchor else {
             return false;
         };
-        self.range = Some(CellRange::new(anchor, cell));
+        let mut range = CellRange::new(anchor, cell);
+        let (from, to) = selection_math::promoted_columns(
+            range.a.col,
+            range.b.col,
+            range.a.row,
+            range.b.row,
+            rows,
+            cols,
+        );
+        range.a.col = from;
+        range.b.col = to;
+        self.range = Some(range);
         self.range.is_some()
+    }
+
+    /// Выделить весь видимый текст как Area (все строки целиком).
+    ///
+    /// Возвращает `false` для пустой сетки: у неё нет «полной ширины», и
+    /// подставлять `cols - 1` значило бы underflow. Точки `line_range` нет —
+    /// это выделение вывода, а не строки ввода.
+    pub fn select_area(&mut self, rows: usize, cols: usize) -> bool {
+        if rows == 0 || cols == 0 {
+            return false;
+        }
+        self.anchor = None;
+        self.range = Some(CellRange {
+            a: Cell { col: 0, row: 0 },
+            b: Cell {
+                col: cols - 1,
+                row: rows - 1,
+            },
+        });
+        self.line_range = None;
+        true
     }
 
     /// Завершить перетаскивание. Возвращает готовый диапазон, если перетаскивание
@@ -302,17 +346,24 @@ impl Selection {
     /// Перекрасить диапазон как выделенный, сначала восстановив то, что покрывал
     /// предыдущий диапазон. Повторные вызовы дёшевы: перетаскивание двигает
     /// подсветку на клетку-две, и обратно перекрашиваются только покинутые клетки.
+    ///
+    /// `None` у `paint_cell_selected` — восстановление из модели (свой фон
+    /// клетки), `Some(ACCENT)` — подмешать акцент в этот фон. Глиф в обоих
+    /// случаях остаётся своим.
     pub fn paint(&mut self, cols: usize) {
         if self.painted_range == self.range {
             return;
         }
         let (restore, paint) = paint_diff(self.painted_range, self.range, cols);
         for cell in restore {
-            framebuffer::console().paint_cell_selected(cell.col, cell.row, 0, 0x000000, true);
+            framebuffer::console().paint_cell_selected(cell.col, cell.row, None);
         }
         for cell in paint {
-            framebuffer::console()
-                .paint_cell_selected(cell.col, cell.row, SELECT_FG, SELECT_BG, false);
+            framebuffer::console().paint_cell_selected(
+                cell.col,
+                cell.row,
+                Some(selection_math::ACCENT),
+            );
         }
         self.painted_range = self.range;
         self.painted = self.painted_range.is_some();
@@ -331,10 +382,11 @@ impl Selection {
             return;
         };
         for cell in range.cells(cols) {
-            // `restore = true`: каждая клетка возвращается к цвету, которым была
-            // нарисована, так что отпускание выделения поверх зелёного промпта
-            // оставляет его зелёным.
-            framebuffer::console().paint_cell_selected(cell.col, cell.row, 0, 0x000000, true);
+            // `None`: каждая клетка возвращается к цвету, которым была
+            // нарисована (и глиф, и фон), так что отпускание выделения поверх
+            // зелёного промпта оставляет его зелёным, а поверх ANSI-арта —
+            // восстанавливает его фон.
+            framebuffer::console().paint_cell_selected(cell.col, cell.row, None);
         }
         self.painted = false;
     }

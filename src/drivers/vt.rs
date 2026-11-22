@@ -130,10 +130,11 @@ impl Vt {
     fn put(&mut self, x: usize, y: usize, c: Cell) {
         let i = self.idx(x, y);
         self.cells[i] = c;
-        let px = x * CHAR_WIDTH;
-        let py = y * CHAR_HEIGHT;
+        // `draw_cell`, а не `draw_glyph_px`: VT-клетка обязана попасть в модель
+        // консоли (символ/цвет/фон). Иначе выделение мышью перерисовывало эту
+        // клетку из модели, где стоял пробел, и затирало ANSI-арт.
         crate::drivers::framebuffer::with(|fb| {
-            fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
+            fb.draw_cell(x, y, c.ch, c.fg, c.bg);
         });
         crate::drivers::vtsurface::publish_vt_cell(x, y, c.ch, c.fg, c.bg);
     }
@@ -173,10 +174,8 @@ impl Vt {
         for row in 0..self.rows {
             for col in 0..self.cols {
                 let c = self.get(col, row);
-                let px = col * CHAR_WIDTH;
-                let py = row * CHAR_HEIGHT;
                 crate::drivers::framebuffer::with(|fb| {
-                    fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
+                    fb.draw_cell(col, row, c.ch, c.fg, c.bg);
                 });
             }
         }
@@ -495,10 +494,8 @@ impl Vt {
     }
     fn blit(&self, x: usize, y: usize) {
         let c = self.get(x, y);
-        let px = x * CHAR_WIDTH;
-        let py = y * CHAR_HEIGHT;
         crate::drivers::framebuffer::with(|fb| {
-            fb.draw_glyph_px(c.ch, px, py, c.fg, c.bg);
+            fb.draw_cell(x, y, c.ch, c.fg, c.bg);
         });
     }
     pub fn feed(&mut self, b: u8) {

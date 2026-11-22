@@ -12526,6 +12526,15 @@ pub fn all_tests() -> alloc::vec::Vec<(&'static str, fn())> {
             "console::text grid matches the framebuffer resolution",
             console_grid_tests::grid_matches_framebuffer
         ),
+        // Выделение мышью — фон-только wash: цветной глиф сохраняет свой fg,
+        // разные ANSI-фоны остаются различимыми после подмешивания акцента,
+        // протяжка сверху донизу покрывает все строки целиком, а снятие
+        // выделения возвращает клетку к её собственным цветам. Host-половина —
+        // P69; здесь — связка с живой сеткой и пикселями.
+        (
+            "console::selection is a background wash, area covers all rows",
+            selection_wash_tests::selection_is_a_background_wash
+        ),
         // Per-session tty: foreground-группа, TOSTOP, winsize, SIGWINCH,
         // fg-pid, защёлки и очередь stdin окна независимы от boot-консоли.
         (
@@ -14530,5 +14539,310 @@ mod console_grid_tests {
                 "rows must exceed the retired fixed-grid cap on tall screens"
             );
         }
+    }
+}
+
+/// In-QEMU regression: выделение мышью — фон-только wash, а не перекраска глифа.
+///
+/// Host-свойство P69 доказывает арифметику (смешивание и Area-политику), но не
+/// связку с настоящей сеткой и пикселями. Здесь проверяется то, что видит
+/// пользователь, на живом framebuffer'е:
+///
+/// * выделенная цветная клетка сохраняет свой `fg` байт-в-байт (в пикселях есть
+///   ровно этот цвет), а фон только подмешивает акцент — две разные ANSI-заливки
+///   дают разные washed-фоны, а не один плоский;
+/// * протяжка сверху донизу покрывает полную ширину каждой строки, а `select_area`
+///   даёт тот же диапазон;
+/// * снятие выделения возвращает клетку к её собственным цветам (модель и
+///   пиксели совпадают с состоянием до выделения).
+///
+/// NON-DESTRUCTIVE: рутина рисует во временные клетки, снимает их модель и
+/// пиксели до опыта и возвращает и то, и другое в конце. Курсор консоли не
+/// двигается, PMM не трогается.
+mod selection_wash_tests {
+    use crate::drivers::cell_wash::wash_color;
+    use crate::drivers::framebuffer::{self, CHAR_HEIGHT, CHAR_WIDTH};
+    use crate::shell::caret::Cell;
+    use crate::shell::selection::{CellRange, Selection};
+    use crate::shell::selection_math::ACCENT;
+
+    /// Тестовая клетка: символ, цвет глифа, фон — как у цветного вывода
+    /// (`#` логотипа и ANSI-заливка палитры).
+    const CONTENT: [(u8, u32, u32); 4] = [
+        (b'U', 0x00_FF00, 0x00_0000), // logo-like: green glyph on black
+        (b'U', 0xFF_AA00, 0xAA_0000), // ANSI red background
+        (b' ', 0xFF_FFFF, 0x00_00AA), // ANSI blue background, no glyph
+        (b'U', 0xFF_FF00, 0x00_0000), // second coloured logo glyph
+    ];
+    // `U` is the glyph the font asset gives full-coverage (255) pixels, so
+    // "a pixel is exactly `fg`" is a real test of colour preservation rather
+    // than a coincidental antialiasing value (`#`/`X` have none).
+
+    /// Отпечаток прямоугольника клеток: пиксели, чтобы вернуть кадр точно.
+    fn save_pixels(first_col: usize, row: usize) -> alloc::vec::Vec<u32> {
+        let mut pixels = alloc::vec::Vec::with_capacity(CONTENT.len() * CHAR_WIDTH * CHAR_HEIGHT);
+        framebuffer::with(|fb| {
+            for cell in 0..CONTENT.len() {
+                let x = (first_col + cell) * CHAR_WIDTH;
+                let y = row * CHAR_HEIGHT;
+                for dy in 0..CHAR_HEIGHT {
+                    for dx in 0..CHAR_WIDTH {
+                        pixels.push(fb.get_pixel(x + dx, y + dy));
+                    }
+                }
+            }
+        });
+        pixels
+    }
+
+    fn restore_pixels(first_col: usize, row: usize, pixels: &[u32]) {
+        framebuffer::with(|fb| {
+            let mut i = 0;
+            for cell in 0..CONTENT.len() {
+                let x = (first_col + cell) * CHAR_WIDTH;
+                let y = row * CHAR_HEIGHT;
+                for dy in 0..CHAR_HEIGHT {
+                    for dx in 0..CHAR_WIDTH {
+                        fb.set_pixel(x + dx, y + dy, pixels[i]);
+                        i += 1;
+                    }
+                }
+            }
+        });
+        framebuffer::flush();
+    }
+
+    fn cell_pixels(first_col: usize, row: usize, cell: usize) -> alloc::vec::Vec<u32> {
+        let mut pixels = alloc::vec::Vec::with_capacity(CHAR_WIDTH * CHAR_HEIGHT);
+        framebuffer::with(|fb| {
+            let x = (first_col + cell) * CHAR_WIDTH;
+            let y = row * CHAR_HEIGHT;
+            for dy in 0..CHAR_HEIGHT {
+                for dx in 0..CHAR_WIDTH {
+                    pixels.push(fb.get_pixel(x + dx, y + dy));
+                }
+            }
+        });
+        pixels
+    }
+
+    pub fn selection_is_a_background_wash() {
+        let console = framebuffer::console();
+        if !console.is_ready() {
+            crate::skip_kernel!("no framebuffer", "selection wash: serial-only boot");
+            return;
+        }
+        let (cols, rows) = console.text_grid();
+        if cols < CONTENT.len() + 6 || rows < 3 {
+            crate::skip_kernel!("grid too small", "selection wash: grid has no room");
+            return;
+        }
+
+        // Полоса из четырёх клеток посередине экрана: далеко от промпта и от
+        // полосы статуса, и достаточно далеко от краёв.
+        let first_col = (cols - CONTENT.len()) / 2;
+        let row = rows / 2;
+
+        // Снять всё, что рутина может изменить.
+        let mut original_model = alloc::vec::Vec::new();
+        for cell in 0..CONTENT.len() {
+            let model = console
+                .cell_model(first_col + cell, row)
+                .expect("cell in grid");
+            original_model.push(model);
+        }
+        let original_pixels = save_pixels(first_col, row);
+
+        // Нарисовать цветной «вывод» — и запомнить, как он выглядит до выделения.
+        framebuffer::with(|fb| {
+            for (cell, &(ch, fg, bg)) in CONTENT.iter().enumerate() {
+                fb.draw_cell(first_col + cell, row, ch, fg, bg);
+            }
+        });
+        framebuffer::flush();
+        let painted_model: alloc::vec::Vec<_> = (0..CONTENT.len())
+            .map(|cell| console.cell_model(first_col + cell, row).expect("cell"))
+            .collect();
+        let painted_pixels: alloc::vec::Vec<_> = (0..CONTENT.len())
+            .map(|cell| cell_pixels(first_col, row, cell))
+            .collect();
+        for (cell, &(ch, fg, bg)) in CONTENT.iter().enumerate() {
+            assert_eq_kernel!(
+                painted_model[cell],
+                (ch, fg, bg),
+                "selection wash: test cell did not record its own colours"
+            );
+        }
+
+        // Выделить ровно эти четыре клетки настоящим путём `Selection::paint`.
+        let mut selection = Selection::new();
+        selection.set_range(
+            CellRange {
+                a: Cell {
+                    col: first_col,
+                    row,
+                },
+                b: Cell {
+                    col: first_col + CONTENT.len() - 1,
+                    row,
+                },
+            },
+            None,
+        );
+        selection.paint(cols);
+
+        // 1) Модель остаётся записью ОРИГИНАЛЬНЫХ цветов — именно из неё
+        //    восстанавливается клетка; подсветка видна только в пикселях.
+        //    Поэтому доказательство wash — пиксельное, а модель проверяется на
+        //    неизменность (иначе `clear` вернул бы уже подсвеченный фон).
+        for (cell, &(ch, fg, bg)) in CONTENT.iter().enumerate() {
+            let (m_ch, m_fg, m_bg) = console
+                .cell_model(first_col + cell, row)
+                .expect("selected cell in grid");
+            assert_eq_kernel!(m_ch, ch, "selection wash: glyph character changed");
+            assert_eq_kernel!(
+                m_fg,
+                fg,
+                "selection wash: fg changed — a coloured glyph must stay its own colour"
+            );
+            assert_eq_kernel!(
+                m_bg,
+                bg,
+                "selection wash: the model stopped holding the cell's own background"
+            );
+            let washed = wash_color(bg, ACCENT);
+            assert_kernel!(
+                washed != bg,
+                "selection wash: the wash is invisible (background was not mixed)"
+            );
+            let pixels = cell_pixels(first_col, row, cell);
+            // Фон клетки — смесь её собственного фона с акцентом, а не
+            // константа выделения: иначе логотип стал бы блоками, а полоса —
+            // одним прямоугольником.
+            assert_kernel!(
+                pixels.iter().any(|&p| p == washed),
+                "selection wash: no background pixel carries the washed colour"
+            );
+            assert_kernel!(
+                !pixels.iter().any(|&p| p == bg),
+                "selection wash: the original background survived — the wash did not cover the cell"
+            );
+            // Глиф нарисован своим прежним fg: `U` имеет полные пиксели, так что
+            // это сравнение точное, а не «почти».
+            if ch != b' ' {
+                assert_kernel!(
+                    pixels.iter().any(|&p| p == fg),
+                    "selection wash: no pixel kept the glyph's exact fg colour"
+                );
+            }
+            // Прежняя плоская заливка (SELECT_BG = 0xCCCCCC) не должна
+            // появляться вообще: это и был «серый» баг.
+            assert_kernel!(
+                !pixels.iter().any(|&p| p == 0xCC_CCCC),
+                "selection wash: the old flat selection colour came back"
+            );
+        }
+
+        // 2) Разные ANSI-заливки остаются различимыми после подмешивания одного
+        //    акцента — полоса палитры не превращается в один прямоугольник.
+        let washed_black = wash_color(0x00_0000, ACCENT);
+        let washed_red = wash_color(0xAA_0000, ACCENT);
+        let washed_blue = wash_color(0x00_00AA, ACCENT);
+        assert_kernel!(
+            washed_black != washed_red && washed_red != washed_blue && washed_black != washed_blue,
+            "selection wash: distinct ANSI backgrounds collapsed into one flat colour"
+        );
+
+        // 3) Снятие выделения возвращает клетки к их собственным цветам — и в
+        //    модели, и в пикселях.
+        selection.clear();
+        for (cell, &(ch, fg, bg)) in CONTENT.iter().enumerate() {
+            assert_eq_kernel!(
+                console.cell_model(first_col + cell, row),
+                Some((ch, fg, bg)),
+                "selection clear: cell did not return to its own colours"
+            );
+            assert_eq_kernel!(
+                cell_pixels(first_col, row, cell),
+                painted_pixels[cell],
+                "selection clear: pixels are not byte-identical to the pre-selection cell"
+            );
+        }
+
+        // 4) Area-политика на живой сетке: протяжка сверху донизу — все строки
+        //    целиком, и `select_area` даёт тот же диапазон. Рисовать не нужно —
+        //    проверяется геометрия, которую `paint` затем использует.
+        let mut drag = Selection::new();
+        drag.begin(Cell { col: 5, row: 0 });
+        assert_kernel!(
+            drag.extend(
+                Cell {
+                    col: cols / 2,
+                    row: rows - 1,
+                },
+                rows,
+                cols
+            ),
+            "selection area: extend reported no selection"
+        );
+        let area = drag.range().expect("area range");
+        assert_eq_kernel!(
+            area.a,
+            Cell { col: 0, row: 0 },
+            "area starts at the top-left"
+        );
+        assert_eq_kernel!(
+            area.b,
+            Cell {
+                col: cols - 1,
+                row: rows - 1
+            },
+            "area ends at the bottom-right"
+        );
+        assert_eq_kernel!(
+            (area.b.row - area.a.row + 1) * (area.b.col - area.a.col + 1),
+            rows * cols,
+            "area does not cover every cell of every visible row"
+        );
+
+        let mut whole = Selection::new();
+        assert_kernel!(
+            whole.select_area(rows, cols),
+            "selection area: select_area refused a live grid"
+        );
+        assert_eq_kernel!(
+            whole.range(),
+            Some(CellRange {
+                a: area.a,
+                b: area.b
+            }),
+            "select_area and a top-to-bottom drag must describe the same range"
+        );
+        drag.clear();
+        whole.clear();
+
+        // 5) Вернуть экран и модель в состояние до рутины, пиксель-в-пиксель.
+        framebuffer::with(|fb| {
+            for (cell, &(ch, fg, bg)) in original_model.iter().enumerate() {
+                fb.set_cell_colored(first_col + cell, row, ch, fg, bg);
+            }
+        });
+        restore_pixels(first_col, row, &original_pixels);
+        for (cell, &model) in original_model.iter().enumerate() {
+            assert_eq_kernel!(
+                console.cell_model(first_col + cell, row),
+                Some(model),
+                "selection wash: the routine did not restore the console model"
+            );
+        }
+        assert_eq_kernel!(
+            cell_pixels(first_col, row, 0),
+            {
+                let mut first = alloc::vec::Vec::with_capacity(CHAR_WIDTH * CHAR_HEIGHT);
+                first.extend_from_slice(&original_pixels[..CHAR_WIDTH * CHAR_HEIGHT]);
+                first
+            },
+            "selection wash: the routine did not restore the first test cell"
+        );
     }
 }

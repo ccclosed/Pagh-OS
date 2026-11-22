@@ -429,6 +429,21 @@ pub mod scrollback;
 #[path = "../../src/drivers/console_layout.rs"]
 pub mod console_layout;
 
+// Смешивание акцента выделения с фоном клетки: выделение kernel-консоли меняет
+// только фон (глиф сохраняет свой цвет), поэтому логотип fastfetch и ANSI-полоса
+// палитры переживают протяжку. `core`-only; unit-тесты модуля сверяют
+// рукописные векторы, свойство P69 доказывает законы (канал между base и accent,
+// монотонность, «различимые фоны остаются различимыми»).
+#[path = "../../src/drivers/cell_wash.rs"]
+pub mod cell_wash;
+
+// Геометрия выделения kernel-консоли: протяжка «сверху донизу» — это Area
+// (все строки целиком), протяжка внутри нескольких строк остаётся символьной.
+// `core`-only, поэтому P69 исполняет ровно тот исходник, который компилирует
+// ядро.
+#[path = "../../src/shell/selection_math.rs"]
+pub mod selection_math;
+
 // `ext2::symlink` is the pure symlink-layout + hard-link accounting core of the
 // ext2 writer (issue #18, contract `EXT2-LINKS.md` §2/§3): which targets stay
 // inline in the inode's `i_block` (≤ 59 bytes) and which need a data block, how
@@ -959,6 +974,13 @@ mod properties {
     // паника, поэтому свойства фиксируют round trip, маску, кламп и склейку
     // потока через границу `write(2)`.
     mod p68;
+
+    // Выделение мышью в kernel-консоли (P69): фон-только wash — канал остаётся
+    // между исходным фоном и акцентом, `base == accent` неподвижен, различимые
+    // заливки остаются различимыми, а fg в этой модели вообще не участвует; плюс
+    // Area-политика (протяжка сверху донизу покрывает полную ширину каждой
+    // строки, внутристрочная остаётся символьной).
+    mod p69;
 }
 
 // PHASE 0 diagnostic: large-scale (60k stanza) apt-index repro harness for the

@@ -42,6 +42,8 @@ mod progress;
 pub(crate) mod registry;
 pub(crate) mod render;
 pub(crate) mod selection;
+/// Чистая геометрия выделения (Area-политика), host-тестируемая.
+pub(crate) mod selection_math;
 pub(crate) mod suggest;
 pub(crate) mod texttools;
 pub(crate) mod theme;
@@ -605,7 +607,7 @@ pub(crate) fn shell_main_session(session: usize) -> ! {
                 if pressed {
                     selection.clear();
                     selection.begin(cell);
-                } else if selection.extend(cell) {
+                } else if selection.extend(cell, grid_rows, grid_cols) {
                     selection.paint(console_cols());
                 }
             } else if released {
@@ -762,6 +764,21 @@ pub(crate) fn shell_main_session(session: usize) -> ! {
                                     selection::CellRange::new(cells.first, cells.last),
                                     Some((0, line_len)),
                                 );
+                                selection.paint(cols);
+                            }
+                        } else {
+                            // Пустая строка ввода: Ctrl+A традиционно «выделить
+                            // всё». Здесь «всё» — весь видимый вывод, поэтому это
+                            // второй (после протяжки сверху донизу), клавиатурный
+                            // способ взять Area целиком — в том числе на экране,
+                            // где протяжка мышью неудобна. Прокрученный вид — это
+                            // история, а не живая сетка: выделение описало бы не
+                            // то, что на экране, поэтому сначала вернуться вниз.
+                            if console_scrolled() {
+                                reset_console_view(&mut caret, &mut selection);
+                            }
+                            let (cols, rows) = crate::drivers::framebuffer::console().text_grid();
+                            if selection.select_area(rows, cols) {
                                 selection.paint(cols);
                             }
                         }

@@ -265,6 +265,13 @@ pub struct FramebufferWriter {
     /// console default. Without this, selecting the green prompt and releasing
     /// would leave it white: the pixels carry no record of how they were drawn.
     grid_fg: alloc::vec::Vec<u32>,
+    /// The background colour each grid cell was drawn on, for the same reason one
+    /// level down: a selection in the kernel console washes the *cell's own*
+    /// background instead of filling it with one flat colour, and clearing has to
+    /// put that same background back. Recording it is also what lets the VT
+    /// emulator's ANSI backgrounds (fastfetch's palette strip) survive a selection
+    /// and enter the model that `read_row`/the clipboard already read.
+    grid_bg: alloc::vec::Vec<u32>,
     /// Console history: every row that has scrolled off the top of the grid, plus
     /// the user's scroll view offset. The wheel and PageUp/PageDown move `view`;
     /// drawing a history view repaints cells but never touches the live grid, so
@@ -405,6 +412,7 @@ impl FramebufferWriter {
             // output volume. History is a separate, byte-budgeted ring below.
             grid: alloc::vec![b' '; rows * cols],
             grid_fg: alloc::vec![0xFFFFFF; rows * cols],
+            grid_bg: alloc::vec![DEFAULT_BG; rows * cols],
             // History is bounded by BYTES, not by a row count: a wider console
             // row costs more, and a fixed 512-row ring that held ~256 KiB at 100
             // columns would hold ~800 KiB at 320. The row count is therefore
@@ -446,7 +454,11 @@ impl FramebufferWriter {
                 cells.push((
                     self.grid[base + col],
                     self.grid_fg[base + col],
-                    self.bg_color,
+                    // Per-cell background, not the console's current one: the VT's
+                    // ANSI art and the shell's themed cells can differ inside one
+                    // row, and a selection/share surface that reported one flat
+                    // background would erase exactly that difference.
+                    self.grid_bg[base + col],
                 ));
             }
         }
@@ -496,6 +508,9 @@ impl FramebufferWriter {
         for fg in self.grid_fg.iter_mut() {
             *fg = self.fg_color;
         }
+        for bg in self.grid_bg.iter_mut() {
+            *bg = self.bg_color;
+        }
         let (b, g, r) = (
             (self.bg_color & 0xFF) as u8,
             ((self.bg_color >> 8) & 0xFF) as u8,
@@ -531,24 +546,56 @@ impl FramebufferWriter {
         matches!(self.target, FbTarget::Mmio)
     }
 
-    /// Record `ch` at grid cell `(col, row)`; out-of-range writes are dropped.
+    /// Record `ch` at grid cell `(col, row)` in the console's current colours;
+    /// out-of-range writes are dropped.
     fn set_cell(&mut self, col: usize, row: usize, ch: u8) {
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        self.set_cell_colored(col, row, ch, self.fg_color, self.bg_color);
+        // Инкрементальная публикация в /dev/vtconsole0. Пока поверхности
+        // никто не открыл, `publish_shell_cell` — один atomic load.
+        if self.owns_vt_surface() {
+            crate::drivers::vtsurface::publish_shell_cell(
+                col,
+                row,
+                ch,
+                self.fg_color,
+                self.bg_color,
+            );
+        }
+    }
+
+    /// Record cell `(col, row)` with explicit colours, without moving the text
+    /// cursor or publishing to `/dev/vtconsole0`.
+    ///
+    /// This is the single model of what is on the text grid, so every renderer
+    /// has to feed it: the shell's console writer via [`Self::write_char`] and
+    /// the VT emulator (compat output, ANSI art) via [`Self::draw_cell`]. Before
+    /// it existed, the VT painted pixels straight into the shadow buffer and the
+    /// model still said "blank" there — a selection then repainted those cells
+    /// from the model and wiped the art it was supposed to highlight.
+    pub fn set_cell_colored(&mut self, col: usize, row: usize, ch: u8, fg: u32, bg: u32) {
         if col < self.cols && row < self.rows {
             let idx = row * self.cols + col;
             self.grid[idx] = ch;
-            self.grid_fg[idx] = self.fg_color;
-            // Инкрементальная публикация в /dev/vtconsole0. Пока поверхности
-            // никто не открыл, `publish_shell_cell` — один atomic load.
-            if self.owns_vt_surface() {
-                crate::drivers::vtsurface::publish_shell_cell(
-                    col,
-                    row,
-                    ch,
-                    self.fg_color,
-                    self.bg_color,
-                );
-            }
+            self.grid_fg[idx] = fg;
+            self.grid_bg[idx] = bg;
         }
+    }
+
+    /// Draw one glyph at grid position `(col, row)` with explicit fg/bg **and**
+    /// record it in the model (see [`Self::set_cell_colored`]).
+    ///
+    /// Cell→pixel conversion lives here, not in the VT emulator: one definition
+    /// of "where cell (col, row) is" is what keeps the glyphs the VT draws and
+    /// the cells a selection repaints at the same coordinates.
+    pub fn draw_cell(&mut self, col: usize, row: usize, ch: u8, fg: u32, bg: u32) {
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        self.set_cell_colored(col, row, ch, fg, bg);
+        self.draw_glyph_px(ch, col * CHAR_WIDTH, row * CHAR_HEIGHT, fg, bg);
     }
 
     /// The character recorded at grid cell `(col, row)`, or a space outside the
@@ -567,6 +614,34 @@ impl FramebufferWriter {
             self.grid_fg[row * self.cols + col]
         } else {
             0xFFFFFF
+        }
+    }
+
+    /// The background color cell `(col, row)` was drawn on.
+    fn cell_bg(&self, col: usize, row: usize) -> u32 {
+        if col < self.cols && row < self.rows {
+            self.grid_bg[row * self.cols + col]
+        } else {
+            DEFAULT_BG
+        }
+    }
+
+    /// `(character, foreground, background)` of cell `(col, row)` as recorded in
+    /// the model, or `None` outside the grid.
+    ///
+    /// Public because a selection must restore a cell *to its own* colours and an
+    /// in-QEMU selftest must be able to see exactly what the model holds after a
+    /// wash — reading pixels alone cannot tell "the glyph kept its colour" from
+    /// "a coincidence of antialiasing".
+    pub fn cell_model(&self, col: usize, row: usize) -> Option<(u8, u32, u32)> {
+        if col < self.cols && row < self.rows {
+            Some((
+                self.cell_char(col, row),
+                self.cell_fg(col, row),
+                self.cell_bg(col, row),
+            ))
+        } else {
+            None
         }
     }
 
@@ -843,12 +918,14 @@ impl FramebufferWriter {
             for col in 0..cols {
                 self.grid[dst + col] = self.grid[src + col];
                 self.grid_fg[dst + col] = self.grid_fg[src + col];
+                self.grid_bg[dst + col] = self.grid_bg[src + col];
             }
         }
         let last = (rows - 1) * cols;
         for col in 0..cols {
             self.grid[last + col] = b' ';
             self.grid_fg[last + col] = self.fg_color;
+            self.grid_bg[last + col] = self.bg_color;
         }
         self.row = rows - 1;
         // A scrolled-back view must not jump when output arrives: `push` moved the
@@ -1588,30 +1665,47 @@ impl FbWriter {
         out
     }
 
-    /// Paint cell `(col, row)` as selected: `bg` fills the cell, the glyph is
-    /// drawn in `fg` on top.
+    /// Paint cell `(col, row)` as selected — or restore it when `accent` is `None`.
     ///
-    /// A selection has to be visible *over* ordinary text, which a foreground-only
-    /// change cannot do — so this is the one place that paints a cell background.
-    /// It restores the glyph from the model, so clearing a selection is the same
-    /// call with the console's own colors.
-    pub fn paint_cell_selected(&self, col: usize, row: usize, fg: u32, bg: u32, restore: bool) {
+    /// Selection is a **background-only wash**: the cell's own background is
+    /// mixed toward `accent` ([`crate::drivers::cell_wash::wash_color`]) and the
+    /// glyph is drawn in the exact colour the model recorded for it. Filling the
+    /// cell with one flat selection colour (the previous `fg`/`bg` pair)
+    /// destroyed precisely what a selection must preserve: fastfetch's logo is
+    /// coloured `#` glyphs and its palette strip is ANSI *backgrounds*, so a flat
+    /// fill turned the logo into dark blocks and the strip into one bar.
+    ///
+    /// It restores from the model in both directions — glyph, foreground **and**
+    /// background — so clearing a selection returns each cell to its own colours
+    /// instead of to a console default.
+    pub fn paint_cell_selected(&self, col: usize, row: usize, accent: Option<u32>) {
         if let Some(ref mut writer) = *self.inner.lock() {
             let (max_cols, max_rows) = writer.text_grid();
             if col >= max_cols || row >= max_rows {
                 return;
             }
             let ch = writer.cell_char(col, row);
-            // Restoring uses the color the cell was drawn in, not a default: the
-            // pixels do not remember, but the model does.
-            let color = if restore {
-                writer.cell_fg(col, row)
-            } else {
-                fg
+            // Foreground is never touched: this is the whole fix.
+            let fg = writer.cell_fg(col, row);
+            let bg = writer.cell_bg(col, row);
+            let bg = match accent {
+                Some(accent) => super::cell_wash::wash_color(bg, accent),
+                None => bg,
             };
-            // A selection overlay really does want the cell filled.
-            writer.paint_cell_with_bg(col, row, ch, color, bg, true);
+            // A selection overlay really does want the cell filled — with the
+            // washed (or restored) background, not a constant.
+            writer.paint_cell_with_bg(col, row, ch, fg, bg, true);
         }
+    }
+
+    /// `(character, foreground, background)` recorded for cell `(col, row)`, or
+    /// `None` when the console is not initialized or the cell is outside the
+    /// grid. See [`FramebufferWriter::cell_model`].
+    pub fn cell_model(&self, col: usize, row: usize) -> Option<(u8, u32, u32)> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(|w| w.cell_model(col, row))
     }
 
     /// Push the changed rectangle of the shadow buffer to the framebuffer.
