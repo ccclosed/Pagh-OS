@@ -292,13 +292,20 @@ pub static FG_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 static DRV_CTRL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DRV_EXTENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// IRQ1: единственный байт клавиатуры за прерывание больше не читается.
+///
+/// Общий выходной буфер 8042 выгребает [`crate::drivers::i8042`]: один заход
+/// вычитывает все готовые байты (мышь и клавиатуру) и маршрутизирует их по
+/// AUXDATA. Так под нагрузкой не теряется ни клавиатура, ни мышь.
 pub fn irq_handler() {
-    // SAFETY: Reading from port 0x60 is standard PS/2 data port access.
-    let scancode: u8 = unsafe {
-        let mut port = x86_64::instructions::port::Port::new(0x60);
-        port.read()
-    };
+    crate::drivers::i8042::irq_drain();
+}
 
+/// Разобрать один клавиатурный байт из потока 8042 (вызывает `i8042`).
+///
+/// Вынесено из обработчика без изменения семантики: трекинг ^C/^Z и передача
+/// байта в `inputd` остались теми же, меняется только кто читает порт.
+pub(crate) fn handle_byte(scancode: u8) {
     // ── ^C tracking (make/break, E0-aware) ──
     use core::sync::atomic::Ordering;
     if scancode == 0xE0 {

@@ -12,6 +12,8 @@ pub mod fb_abi;
 /// host-тестируемая.
 pub mod fb_surface;
 pub mod framebuffer;
+/// Единый читатель байтового потока 8042 (IRQ1/IRQ12 + страховочный опрос `inputd`).
+pub mod i8042;
 /// Чистый кодек `struct input_event` + set-1 → Linux keycodes, host-тестируемый.
 pub mod input_event;
 /// Чистое кольцо сырого ввода (`inputd`-очередь), host-тестируемое.
