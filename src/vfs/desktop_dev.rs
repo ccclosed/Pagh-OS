@@ -82,6 +82,38 @@ impl VfsNode for EventDevice {
     }
 }
 
+/// `/dev/uevent` — push-события о блочных устройствах (ABI v2, 144 B).
+///
+/// Работа узла (эксклюзивный open, снимок, ring, ioctl) живёт в
+/// [`crate::drivers::usb_uevent`] и syscall-слое; здесь только VFS-личность,
+/// чтобы `open`/`read`/`poll`/`ioctl` могли отличить его от обычного файла.
+pub struct UeventDevice;
+
+impl VfsNode for UeventDevice {
+    fn name(&self) -> &str {
+        "uevent"
+    }
+    fn is_directory(&self) -> bool {
+        false
+    }
+    fn is_uevent(&self) -> bool {
+        true
+    }
+    fn size(&self) -> u64 {
+        0
+    }
+    fn read(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Err(super::VfsError::NotSupported)
+    }
+    fn write(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
+        Err(super::VfsError::NotSupported)
+    }
+    /// Root-only: события содержат vendor/product/uuid всех томов.
+    fn mode(&self) -> u32 {
+        0o600
+    }
+}
+
 /// Каталог-контейнер для устройств (например, `/dev/input`).
 pub struct DeviceDirectory {
     name: &'static str,
@@ -396,6 +428,11 @@ pub fn vtfb1() -> Arc<dyn VfsNode> {
 }
 
 /// `/dev/vtinput1` как `Arc<dyn VfsNode>`.
+/// `/dev/uevent` как `Arc<dyn VfsNode>`.
+pub fn uevent() -> Arc<dyn VfsNode> {
+    Arc::new(UeventDevice) as Arc<dyn VfsNode>
+}
+
 pub fn vtinput1() -> Arc<dyn VfsNode> {
     vtinput_session(1)
 }

@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 use alloc::fmt;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -119,6 +120,8 @@ pub enum ProcKind {
     FdInfo,
     /// `/proc/net/dev` — счётчики канала в Linux-формате.
     NetDev,
+    /// `/proc/partitions` — блочные устройства USB в Linux-подобном формате.
+    Partitions,
 }
 
 /// Одна именованная запись: имя для `readdir`, стабильный inode и вид
@@ -1678,6 +1681,34 @@ pub fn format_net_dev(rows: &[NetDevRow]) -> Vec<u8> {
                 0u64,
                 0u64,
             ),
+        );
+    }
+    out
+}
+
+// ─── /proc/partitions ───────────────────────────────────────────────────────
+
+/// Одна строка `/proc/partitions`. `major` синтетический (240 — USB), `minor`
+/// `16*N + (0 для целого, M для pM)`, `blocks` — в 1024-байтовых единицах.
+pub struct PartitionRow<'a> {
+    pub major: u32,
+    pub minor: u32,
+    pub blocks: u64,
+    pub name: &'a str,
+}
+
+/// Отрендерить таблицу `/proc/partitions`. Формат Linux-подобный, но major/minor
+/// синтетические — это диагностика, а не Linux-совместимые номера.
+pub fn format_partitions(rows: &[PartitionRow<'_>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + rows.len() * 40);
+    out.extend_from_slice(b"major minor  #blocks  name\n");
+    for row in rows {
+        out.extend_from_slice(
+            format!(
+                "{:>5} {:>5} {:>9}  {}\n",
+                row.major, row.minor, row.blocks, row.name
+            )
+            .as_bytes(),
         );
     }
     out

@@ -90,6 +90,10 @@ impl BlockDevice for PartitionSlice {
     fn flush(&self) -> Result<(), ()> {
         self.parent.flush()
     }
+
+    fn is_dead(&self) -> bool {
+        self.parent.is_dead()
+    }
 }
 
 /// GPT header: 92 bytes at LBA 1.
@@ -288,6 +292,42 @@ fn parse_mbr(dev: &Arc<dyn BlockDevice>, total: u64) -> usize {
         crate::info!("part: MBR on {}: {} partition(s)", dev.name(), registered);
     }
     registered
+}
+
+/// Уникальный GPT GUID раздела `index` (0-based, как в таблице записей).
+///
+/// Возвращает байты GUID **в on-disk порядке** — том же, в котором их кладёт
+/// `sgdisk`/`parted`; это идентичность раздела для uevent, а не текст для UI.
+/// `None` — таблицы нет, запись пуста или индекс вне массива. MBR-разделов
+/// функция не выдумывает: у MBR нет UUID, и нули в uevent честнее фейка.
+pub fn gpt_unique_guid(dev: &dyn BlockDevice, index: usize) -> Option<[u8; 16]> {
+    let total = dev.sector_count();
+    if total < 34 {
+        return None;
+    }
+    let header = read_sectors(dev, 1, 512)?;
+    if &header[0..8] != GPT_SIGNATURE {
+        return None;
+    }
+    let entries_lba = le64(&header, 72);
+    let entry_count = le32(&header, 80).min(GPT_MAX_ENTRIES) as usize;
+    let entry_size = (le32(&header, 84) as usize).max(GPT_ENTRY_SIZE);
+    if entries_lba == 0 || entries_lba >= total || index >= entry_count {
+        return None;
+    }
+    let byte_off = index.checked_mul(entry_size)?;
+    let sector = entries_lba + (byte_off / 512) as u64;
+    let window = read_sectors(dev, sector, 1024)?;
+    let rel = byte_off % 512;
+    if rel + 16 > window.len() {
+        return None;
+    }
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&window[rel..rel + 16]);
+    if guid.iter().all(|b| *b == 0) {
+        return None;
+    }
+    Some(guid)
 }
 
 /// Registered partition slices, newest first, for the shell's `disk` command.

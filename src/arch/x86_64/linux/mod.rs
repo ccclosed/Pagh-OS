@@ -556,6 +556,8 @@ fn dispatch_supported(nr: u64, a: &[u64; 6]) -> Result<u64, Errno> {
         sysno::READLINK => io_sys::sys_readlink(a[0], a[1], a[2]),
         sysno::READLINKAT => io_sys::sys_readlinkat(a[0], a[1], a[2], a[3]),
         sysno::STATFS => io_sys::sys_statfs(a[0], a[1]),
+        sysno::MOUNT => io_sys::sys_mount(a[0], a[1], a[2], a[3], a[4]),
+        sysno::UMOUNT2 => io_sys::sys_umount2(a[0], a[1]),
         sysno::FSTATFS => io_sys::sys_fstatfs(a[0], a[1]),
         // ── память ──
         sysno::BRK => mem_sys::sys_brk(a[0]),
