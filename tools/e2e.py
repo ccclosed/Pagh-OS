@@ -4578,8 +4578,13 @@ def mode_termwindow(h: "Harness") -> tuple[str, int]:
             # Linux nano by bare name through lxrun: Ctrl+O saves, Enter keeps the
             # name, Ctrl+X exits — the real ncurses binary, not the kernel editor.
             offset = mark()
-            log("window command: lxrun nano /mnt/linux-nano.txt")
-            kb.text("lxrun nano /mnt/linux-nano.txt")
+            # `-I` (ignore rc files): Debian's /etc/nanorc includes
+            # /usr/share/nano/*.nanorc by absolute path, which under this OS
+            # lives at /mnt/usr/share/nano — without `-I` nano aborts on that
+            # include before it ever reads a key. The rc file is user config, not
+            # part of the editor path this acceptance measures.
+            log("window command: lxrun nano -I /mnt/linux-nano.txt")
+            kb.text("lxrun nano -I /mnt/linux-nano.txt")
             kb.key("ret")
             opened = wait_new(offset, [diag("lxrun", "command")], 60.0, "lxrun nano start")
             # Sync on the kernel's own evidence that the editor reached its raw
