@@ -30,12 +30,15 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use pagh_terminal::cell::{CELL_WIDE, CELL_WIDE_CONT};
-use pagh_terminal::client::{close_name, error_name, Event, ShmFrame, SurfaceClient};
+use pagh_terminal::client::{
+    clamp_kernel_window, close_name, error_name, Event, ShmFrame, SurfaceClient,
+};
 use pagh_terminal::demo::{self, DemoShell};
 use pagh_terminal::font::{CELL_H, CELL_W};
 use pagh_terminal::kernelsession::{
-    fit_placement, is_missing_device, is_session_end, render_notice, Draw, FileInput, FrameSource,
-    KernelFrame, KeyForwarder, MouseForwarder, VtFbError,
+    is_missing_device, is_session_end, pan_step_for_key, render_notice, zoom_toggle_key, Draw,
+    FileInput, FrameSource, KernelFrame, KeyForwarder, MouseForwarder, ScaleMode, VtFbError,
+    WHEEL_PAN_X, WHEEL_PAN_Y,
 };
 use pagh_terminal::keys::{self, KeyModes};
 use pagh_terminal::protocol::{buttons, InputEvent};
@@ -135,6 +138,9 @@ struct Args {
     /// Diagnostics sink: a file instead of stderr (desktop-launched apps).
     log_file: Option<PathBuf>,
     size: (u32, u32),
+    /// Kernel-session presentation: `1` = full-size 1:1 viewport with panning
+    /// (default), `2` = integer zoom-out so the whole surface fits.
+    scale: u32,
     cols: Option<usize>,
     rows: Option<usize>,
     demo: Option<String>,
@@ -182,6 +188,7 @@ impl Default for Args {
             vt_trace: false,
             log_file: None,
             size: (900, 600),
+            scale: 1,
             cols: None,
             rows: None,
             demo: None,
@@ -1454,16 +1461,15 @@ fn open_kernel_devices(
                 return Err(devfs::OpenError::Failed(format!("{mouse_path}: {error}")));
             }
         };
-        let frame = KernelFrame::open(opened.source)
+        let mut frame = KernelFrame::open(opened.source)
             .map_err(|error| devfs::OpenError::Failed(error.message()))?;
+        // Раскладка по умолчанию — 1:1-вьюпорт; окно имеет смысл не меньше
+        // MIN_KERNEL_WINDOW, иначе от кадра остаётся полоска.
+        let (width, height) = clamp_kernel_window(args.size.0, args.size.1);
+        frame.set_view_mode(scale_mode(args.scale));
+        frame.set_window(width as usize, height as usize);
         let info = frame.info();
-        let place = fit_placement(
-            info.width as usize,
-            info.height as usize,
-            args.size.0 as usize,
-            args.size.1 as usize,
-        )
-        .ok_or_else(|| {
+        let place = frame.placement().ok_or_else(|| {
             devfs::OpenError::Failed("the kernel reported an empty surface or window".to_string())
         })?;
         // Клавиатурный приёмник не имеет геометрии; указатель — имеет.
@@ -1485,6 +1491,15 @@ fn open_kernel_devices(
         Err(devfs::OpenError::Busy)
     } else {
         Err(devfs::OpenError::Missing)
+    }
+}
+
+/// `--scale`: 1 — 1:1-вьюпорт с прокруткой (по умолчанию), 2 — целый зум-обзор.
+fn scale_mode(scale: u32) -> ScaleMode {
+    if scale >= 2 {
+        ScaleMode::Integer
+    } else {
+        ScaleMode::OneToOne
     }
 }
 
@@ -1570,6 +1585,28 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         info.generation,
         devices.session
     );
+    // Клиентское окно не меньше MIN_KERNEL_WINDOW; сама поверхность остаётся
+    // размером с экран.  По умолчанию — 1:1: если окно меньше, виден
+    // полноразмерный вьюпорт, который прокручивается (не дробный downscale).
+    let (mut width, mut height) = clamp_kernel_window(args.size.0, args.size.1);
+    if args.scale >= 2 {
+        note!(
+            "presentation: integer zoom-out (--scale 2): the whole {}x{} surface, \
+             at an integer divisor",
+            info.width,
+            info.height
+        );
+    } else if info.width > width || info.height > height {
+        note!(
+            "presentation: 1:1 viewport (window {width}x{height} < surface {}x{}), \
+             following the live bottom; wheel / Ctrl+Shift+arrows/PageUp/PageDown \
+             pan (up pauses following), Ctrl+Shift+End resumes, Ctrl+Shift+Z zooms out",
+            info.width,
+            info.height
+        );
+    } else {
+        note!("presentation: 1:1 (the surface fits the window)");
+    }
 
     let mut client = SurfaceClient::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
     let welcome = client
@@ -1592,7 +1629,7 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         1000 + (std::process::id() % 90_000)
     };
     client
-        .create_window(my_window_id, args.size.0, args.size.1, &args.title)
+        .create_window(my_window_id, width, height, &args.title)
         .map_err(|error| format!("create_window: {error}"))?;
     // Ядро игнорирует SO_RCVTIMEO (см. TERMINAL.md), поэтому окно обязано
     // опрашивать сокет неблокирующе и само возвращаться к кадру поверхности.
@@ -1601,8 +1638,6 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         .map_err(|e| format!("nonblocking: {e}"))?;
 
     let theme = Theme::default();
-    let mut width = args.size.0.max(64);
-    let mut height = args.size.1.max(32);
     // ShmSurface: блит пишется прямо в общий mmap, по сокету идут только
     // damage-прямоугольники. Для пиксельной поверхности сессии это не
     // оптимизация, а разница между «окно оживает» и «3 МиБ на кадр в QEMU-TCG».
@@ -1801,24 +1836,25 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
         {
             match event {
                 Event::Configure(configure) => {
-                    width = configure.width.max(64);
-                    height = configure.height.max(32);
+                    // Минимальный content rect — как при create: окно не
+                    // должно вырождаться в щель, даже если композитор
+                    // пришлёт меньше.
+                    let (clamped_w, clamped_h) =
+                        clamp_kernel_window(configure.width, configure.height);
+                    width = clamped_w;
+                    height = clamped_h;
                     // Клавиатурный фокус: пока он у окна, ядро не кладёт
                     // физические клавиши в boot-кольцо (иначе ввод терминала
                     // дублировался бы в boot-shell).
                     keyboard_focus = configure.focused();
                     set_keyboard_focus(&keys, &mut diag, &mut focus_reported, keyboard_focus);
-                    // Геометрия поверхности могла не меняться, но масштаб в окне
-                    // изменился: указатель обязан переводиться новой раскладкой.
-                    let info = frame.info();
-                    if let Some(place) = fit_placement(
-                        info.width as usize,
-                        info.height as usize,
-                        width as usize,
-                        height as usize,
-                    ) {
+                    // Геометрия поверхности могла не меняться, но вьюпорт в окне
+                    // изменился: прокрутка прижимается к новым границам, а
+                    // указатель переводится новой раскладкой.
+                    frame.set_window(width as usize, height as usize);
+                    if let Some(place) = frame.placement() {
                         if let Some(forwarder) = forwarder.as_mut() {
-                            forwarder.set_geometry(&info, place);
+                            forwarder.set_geometry(&frame.info(), place);
                         }
                     }
                     let same_size = shm.as_ref().is_some_and(|frame| {
@@ -1882,24 +1918,54 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                     code,
                     pressed,
                     modifiers,
-                }) => match keys.handle_key(code, pressed, modifiers) {
-                    Ok(_) => {}
-                    Err(error) if is_session_end(&error) => {
-                        // Сессия закончилась между кадром и нажатием: следующий
-                        // опрос поверхности вернёт ENODEV и покажет честное
-                        // сообщение с перезапуском.
-                        if !input_error_reported {
-                            note!("session ended while forwarding a key ({error})");
-                            input_error_reported = true;
+                }) => {
+                    // Панорама 1:1-вьюпорта: Ctrl+Shift+стрелки/PageUp/PageDown/
+                    // Home/End.  Простые стрелки остаются shell'у (редактирование,
+                    // history, kernel-scrollback), поэтому модификатор обязателен.
+                    if let Some(step) = pan_step_for_key(code, pressed, modifiers) {
+                        if frame.pan_step(step) {
+                            dirty = true;
+                        }
+                        continue;
+                    }
+                    // Необязательный зум-обзор: Ctrl+Shift+Z переключает
+                    // 1:1 ↔ целый downscale (2x/3x…) без перезапуска.
+                    if zoom_toggle_key(code, pressed, modifiers) {
+                        let mode = frame.toggle_view_mode();
+                        note!(
+                            "presentation: {}",
+                            match mode {
+                                ScaleMode::OneToOne => "1:1 viewport",
+                                ScaleMode::Integer => "integer zoom-out",
+                            }
+                        );
+                        if let Some(place) = frame.placement() {
+                            if let Some(forwarder) = forwarder.as_mut() {
+                                forwarder.set_geometry(&frame.info(), place);
+                            }
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                    match keys.handle_key(code, pressed, modifiers) {
+                        Ok(_) => {}
+                        Err(error) if is_session_end(&error) => {
+                            // Сессия закончилась между кадром и нажатием: следующий
+                            // опрос поверхности вернёт ENODEV и покажет честное
+                            // сообщение с перезапуском.
+                            if !input_error_reported {
+                                note!("session ended while forwarding a key ({error})");
+                                input_error_reported = true;
+                            }
+                        }
+                        Err(error) => {
+                            if !input_error_reported {
+                                note!("cannot write session input: {error}");
+                                input_error_reported = true;
+                            }
                         }
                     }
-                    Err(error) => {
-                        if !input_error_reported {
-                            note!("cannot write session input: {error}");
-                            input_error_reported = true;
-                        }
-                    }
-                },
+                }
                 Event::Focus { focused, .. } => {
                     // Курсор рисует ядро в пикселях: подсветка фокуса здесь не наша.
                     // А вот клавиатурный фокус — наша: он решает, дублируются ли
@@ -1910,11 +1976,29 @@ fn run_kernel_session(args: &Args, socket: &str) -> Result<(), String> {
                 Event::Input(InputEvent::Axis {
                     x,
                     y,
+                    horizontal,
                     vertical,
                     buttons,
-                    ..
                 }) => {
-                    if let Some(forwarder) = forwarder.as_mut() {
+                    if frame.pannable() {
+                        // Поверхность больше окна: колесо прокручивает 1:1-
+                        // вьюпорт (иначе скрытую правую/нижнюю часть кадра не
+                        // увидеть).  Указатель ядра при этом остаётся в
+                        // актуальной точке поверхности, но дельта колеса в
+                        // kernel-scrollback не уходит.
+                        if let Some(forwarder) = forwarder.as_mut() {
+                            if let Err(error) = forwarder.motion(x, y, buttons) {
+                                note_mouse_error(&mut diag, &mut mouse_error_reported, &error);
+                            }
+                        }
+                        let dx = horizontal.saturating_mul(WHEEL_PAN_X);
+                        let dy = vertical.saturating_mul(WHEEL_PAN_Y);
+                        if frame.pan_by(dx, dy) {
+                            dirty = true;
+                        }
+                    } else if let Some(forwarder) = forwarder.as_mut() {
+                        // Кадр целиком в окне: колесо сохраняет своё значение
+                        // (kernel-scrollback/selection).
                         if let Err(error) = forwarder.axis(x, y, buttons, vertical) {
                             note_mouse_error(&mut diag, &mut mouse_error_reported, &error);
                         }
@@ -2244,6 +2328,19 @@ fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                 out.log_file = Some(PathBuf::from(next_value(&mut args, "--log-file")?))
             }
             "--size" => out.size = parse_size(&next_value(&mut args, "--size")?)?,
+            "--scale" => {
+                let value = next_value(&mut args, "--scale")?;
+                out.scale = match value.as_str() {
+                    "1" => 1,
+                    "2" => 2,
+                    other => {
+                        return Err(format!(
+                            "--scale expects 1 (full-size 1:1 viewport) or 2 \
+                             (integer zoom-out), got {other:?}"
+                        ))
+                    }
+                };
+            }
             "--cols" => out.cols = Some(parse_usize(&next_value(&mut args, "--cols")?)?),
             "--rows" => out.rows = Some(parse_usize(&next_value(&mut args, "--rows")?)?),
             "--demo" => out.demo = Some(next_value(&mut args, "--demo")?),
@@ -2369,7 +2466,14 @@ HEADLESS:
 
 LIVE:
   --socket PATH    AF_UNIX control socket of pagh-desktop
-  --size WxH       initial window content size (default 900x600)
+  --size WxH       initial window content size (default 900x600; kernel-session
+                   mode enforces a 320x200 minimum)
+  --scale N        kernel-session presentation: 1 = full-size 1:1 viewport
+                   following the live bottom, with panning (default),
+                   2 = integer zoom-out (2x/3x/..., whole surface, no
+                   fractional scale).  At runtime Ctrl+Shift+Z toggles it;
+                   the wheel or Ctrl+Shift+arrows/PageUp/PageDown pan the 1:1
+                   viewport, Ctrl+Shift+End returns to the live bottom.
   --window-id N    client-chosen window id (default: derived from pid in
                    kernel-session mode, 101 elsewhere)
   --feed FILE      preload terminal output into the demo shell
@@ -2612,5 +2716,16 @@ mod tests {
         );
         assert!(typing.area() * 100 < (width * height) as i64);
         assert!(blink.area() * 100 < (width * height) as i64);
+    }
+
+    #[test]
+    fn scale_flag_defaults_to_one_and_rejects_unknown_values() {
+        let args = parse_args(std::iter::empty::<String>()).unwrap();
+        assert_eq!(args.scale, 1, "default presentation is 1:1");
+        let args = parse_args(["--scale".to_string(), "2".to_string()].into_iter()).unwrap();
+        assert_eq!(args.scale, 2);
+        let error = parse_args(["--scale".to_string(), "3".to_string()].into_iter())
+            .expect_err("only 1 (1:1) or 2 (integer zoom) are valid");
+        assert!(error.contains("--scale expects 1"), "{error}");
     }
 }

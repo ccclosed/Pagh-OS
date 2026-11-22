@@ -27,6 +27,22 @@ use crate::render::Canvas;
 
 /// Default control socket used by the sibling `pagh-desktop` server.
 pub const DEFAULT_SOCKET: &str = "/tmp/pagh-desktop.sock";
+/// Smallest content size `pagh-terminal` accepts for a kernel-session window.
+///
+/// 320×200 px ≈ 40×11 cells at 1:1 — a prompt plus a command line, and well
+/// above the compositor's 64×48 floor, so the 1:1 viewport never collapses
+/// into a sliver.  The window is *allowed* to stay smaller than the 1280×800
+/// vtfb surface: that is the pannable case (wheel / Ctrl+Shift+aims), not a
+/// reason to downscale the frame.
+pub const MIN_KERNEL_WINDOW: (u32, u32) = (320, 200);
+
+/// Clamp a requested kernel-session content size to [`MIN_KERNEL_WINDOW`].
+pub fn clamp_kernel_window(width: u32, height: u32) -> (u32, u32) {
+    (
+        width.max(MIN_KERNEL_WINDOW.0),
+        height.max(MIN_KERNEL_WINDOW.1),
+    )
+}
 /// Framing + commit prefix overhead (diagnostics).
 pub const COMMIT_OVERHEAD: usize = HEADER_LEN + 24;
 /// Optional PDP/1 trace file (one line per message, no pixel bytes).
@@ -825,6 +841,14 @@ mod tests {
     #[test]
     fn default_socket_is_the_server_default() {
         assert_eq!(DEFAULT_SOCKET, "/tmp/pagh-desktop.sock");
+    }
+
+    #[test]
+    fn kernel_window_minimum_never_collapses_into_a_sliver() {
+        assert_eq!(clamp_kernel_window(900, 600), (900, 600));
+        assert_eq!(clamp_kernel_window(0, 0), MIN_KERNEL_WINDOW);
+        assert_eq!(clamp_kernel_window(100, 500), (MIN_KERNEL_WINDOW.0, 500));
+        assert_eq!(clamp_kernel_window(500, 100), (500, MIN_KERNEL_WINDOW.1));
     }
 
     #[test]

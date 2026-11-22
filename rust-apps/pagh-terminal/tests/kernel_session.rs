@@ -20,9 +20,9 @@ use std::time::Duration;
 use pagh_terminal::kernelsession::{
     buttons_to_mask, encode_key_bytes, encode_mouse_event, encode_snapshot, fit_placement,
     is_missing_device, is_session_end, render_notice, solid_pixels, wheel_from_axis,
-    window_to_surface, winsize_cells, Draw, FileInput, FitPlacement, FrameSource, InputSink,
-    KernelFrame, KeyForwarder, MouseEvent, MouseForwarder, ReadFrameSource, VtFbError, VtFbInfo,
-    MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_EVENT_LEN,
+    window_to_surface, winsize_cells, Draw, FileInput, FrameSource, InputSink, KernelFrame,
+    KeyForwarder, MouseEvent, MouseForwarder, PanStep, ReadFrameSource, ScaleMode, VtFbError,
+    VtFbInfo, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_EVENT_LEN,
 };
 use pagh_terminal::protocol::{self, configure_flags, welcome_flags, Message};
 use pagh_terminal::render::{Canvas, Theme};
@@ -68,6 +68,9 @@ struct MockFb {
     respawned: usize,
     /// Сколько раз источник закрывали перед переоткрытием.
     closed: usize,
+    /// Публиковать новый generation на каждый `poll()` после первого —
+    /// имитация нового вывода shell'а без внешнего доступа к источнику.
+    publish_on_poll: Option<(u8, u8, u8)>,
 }
 
 impl MockFb {
@@ -80,6 +83,7 @@ impl MockFb {
             fail_after: 0,
             respawned: 0,
             closed: 0,
+            publish_on_poll: None,
         }
     }
 
@@ -99,7 +103,14 @@ impl FrameSource for MockFb {
         match self.failure {
             Some("ended") => Err(VtFbError::Ended),
             Some("io") => Err(VtFbError::Io(io::Error::other("device exploded"))),
-            _ => Ok(self.info),
+            _ => {
+                if let Some(rgb) = self.publish_on_poll {
+                    if self.polls > 1 {
+                        self.publish(rgb);
+                    }
+                }
+                Ok(self.info)
+            }
         }
     }
 
@@ -235,6 +246,8 @@ fn a_republished_frame_reaches_the_window() {
 fn a_small_window_shows_the_whole_frame_scaled_down() {
     let fb = MockFb::new(info(16, 8, 1), (0x33, 0x44, 0x55));
     let mut frame = KernelFrame::open(fb).expect("open");
+    // Целочисленный зум — необязательный режим (по умолчанию 1:1-вьюпорт).
+    frame.set_view_mode(ScaleMode::Integer);
     let theme = Theme::default();
     let mut canvas = Canvas::new(8, 4, theme.bg);
     assert_eq!(
@@ -243,15 +256,7 @@ fn a_small_window_shows_the_whole_frame_scaled_down() {
     );
     // Пропорции сохранены (16:8 → 8:4), отступов нет: кадр занимает окно.
     let place = fit_placement(16, 8, 8, 4).unwrap();
-    assert_eq!(
-        place,
-        FitPlacement {
-            x: 0,
-            y: 0,
-            width: 8,
-            height: 4
-        }
-    );
+    assert_eq!((place.x, place.y, place.width, place.height), (0, 0, 8, 4));
     for (x, y) in [(0, 0), (7, 0), (0, 3), (7, 3)] {
         assert_eq!(
             canvas.pixel(x, y),
@@ -259,6 +264,225 @@ fn a_small_window_shows_the_whole_frame_scaled_down() {
             "downscale обязан покрыть всё окно"
         );
     }
+}
+
+#[test]
+fn a_1280x800_surface_in_a_small_window_uses_an_integer_two_times_fit() {
+    // Регрессия FIX #1: раньше 1280×800 в окне 900×600 сжимались дробно
+    // (0.70), и штрихи 8×18-шрифта попадали между пикселями окна.  Теперь —
+    // ровно 2× (640×400) по центру, поля — фон темы, кадр не обрезан.
+    let surface = (0x33, 0x44, 0x55);
+    let fb = MockFb::new(info(1280, 800, 1), surface);
+    let mut frame = KernelFrame::open(fb).expect("open");
+    frame.set_view_mode(ScaleMode::Integer);
+    let theme = Theme::default();
+    let mut canvas = Canvas::new(900, 600, theme.bg);
+    assert_eq!(
+        frame.draw_if_changed(&mut canvas, &theme).unwrap(),
+        Draw::Drawn { generation: 1 }
+    );
+    let place = fit_placement(1280, 800, 900, 600).unwrap();
+    assert_eq!(
+        (place.x, place.y, place.width, place.height),
+        (130, 100, 640, 400),
+        "small window must use the integer 2x fit, not a fractional scale"
+    );
+    let bg = [theme.bg.0, theme.bg.1, theme.bg.2, 255];
+    let fg = [surface.0, surface.1, surface.2, 255];
+    // Углы кадра — пиксели поверхности.
+    for (x, y) in [
+        (place.x, place.y),
+        (place.x + place.width - 1, place.y),
+        (place.x, place.y + place.height - 1),
+        (place.x + place.width - 1, place.y + place.height - 1),
+    ] {
+        assert_eq!(canvas.pixel(x, y), fg, "surface pixel at ({x},{y})");
+    }
+    // Letterbox слева/справа/сверху/снизу — фон темы, ни одного пикселя
+    // поверхности за пределами 640×400.
+    for (x, y) in [
+        (place.x - 1, place.y + place.height / 2),
+        (place.x + place.width, place.y + place.height / 2),
+        (place.x + place.width / 2, place.y - 1),
+        (place.x + place.width / 2, place.y + place.height),
+    ] {
+        assert_eq!(canvas.pixel(x, y), bg, "letterbox at ({x},{y})");
+    }
+}
+
+/// Поверхность, в которой пиксель (x, y) несёт свои координаты в R/G:
+/// блит отдаёт `[x & 0xff, y & 0xff, 0, 255]`, поэтому тест видит, какой
+/// именно пиксель поверхности попал в окно после прокрутки.
+fn coordinate_surface(info: VtFbInfo) -> MockFb {
+    let mut fb = MockFb::new(info, (0, 0, 0));
+    let mut pixels = vec![0u8; info.pixels_len()];
+    for y in 0..info.height as usize {
+        for x in 0..info.width as usize {
+            let i = y * info.stride as usize + x * 4;
+            pixels[i] = 0;
+            pixels[i + 1] = (y & 0xff) as u8;
+            pixels[i + 2] = (x & 0xff) as u8;
+        }
+    }
+    fb.pixels = pixels;
+    fb
+}
+
+#[test]
+fn default_kernel_frame_is_a_full_size_one_to_one_viewport() {
+    // По умолчанию — 1:1, а не дробный/целый downscale: в маленьком окне
+    // виден полноразмерный вырез поверхности, а не сжатый кадр.
+    let surface = (0x33, 0x44, 0x55);
+    let fb = MockFb::new(info(1280, 800, 1), surface);
+    let mut frame = KernelFrame::open(fb).expect("open");
+    assert_eq!(frame.view().mode(), ScaleMode::OneToOne);
+    let theme = Theme::default();
+    let mut canvas = Canvas::new(900, 600, theme.bg);
+    assert_eq!(
+        frame.draw_if_changed(&mut canvas, &theme).unwrap(),
+        Draw::Drawn { generation: 1 }
+    );
+    assert_eq!(frame.window_size(), (900, 600));
+    // По умолчанию вьюпорт стоит на нижнем крае: приглашение/новый вывод
+    // видны без ручной прокрутки.
+    assert!(frame.following());
+    assert_eq!(frame.scroll(), (0, 200));
+    let fg = [surface.0, surface.1, surface.2, 255];
+    // Всё окно заполнено пикселями поверхности: 1:1, без полей и без сжатия.
+    for (x, y) in [(0, 0), (899, 0), (0, 599), (899, 599), (450, 300)] {
+        assert_eq!(canvas.pixel(x, y), fg, "1:1 pixel at ({x},{y})");
+    }
+    let place = frame.placement().expect("placement");
+    assert_eq!(
+        (place.x, place.y, place.width, place.height),
+        (0, 0, 900, 600)
+    );
+    assert_eq!(
+        (place.src_x, place.src_y, place.src_width, place.src_height),
+        (0, 200, 900, 600)
+    );
+    // Зум-обзор остаётся доступным переключателем: 2× по центру.
+    assert_eq!(frame.toggle_view_mode(), ScaleMode::Integer);
+    let zoomed = frame.placement().expect("zoomed placement");
+    assert_eq!(
+        (zoomed.x, zoomed.y, zoomed.width, zoomed.height),
+        (130, 100, 640, 400)
+    );
+    assert_eq!(frame.toggle_view_mode(), ScaleMode::OneToOne);
+}
+
+#[test]
+fn one_to_one_viewport_follows_bottom_pans_up_and_resize_recenters() {
+    let fb = coordinate_surface(info(1280, 800, 1));
+    let mut frame = KernelFrame::open(fb).expect("open");
+    let theme = Theme::default();
+    let mut canvas = Canvas::new(900, 600, theme.bg);
+    frame.draw_if_changed(&mut canvas, &theme).unwrap();
+    // Default: bottom edge, prompt/newest output visible.
+    assert_eq!(frame.scroll(), (0, 200));
+    assert_eq!(canvas.pixel(0, 0), [0, 200, 0, 255]);
+
+    // Wheel up: history, auto-follow off, the same window shows y=100.
+    assert!(frame.pan_by(0, -100));
+    assert_eq!(frame.scroll(), (0, 100));
+    assert!(!frame.following());
+    frame.draw_if_changed(&mut canvas, &theme).unwrap();
+    assert_eq!(canvas.pixel(0, 0), [0, 100, 0, 255]);
+    assert_eq!(
+        canvas.pixel(899, 599),
+        [(899 & 0xff) as u8, (699 & 0xff) as u8, 0, 255]
+    );
+
+    // Back to the bottom: auto-follow resumes, newest output is visible.
+    assert!(frame.pan_by(0, 10_000));
+    assert_eq!(frame.scroll(), (0, 200));
+    assert!(frame.following());
+    frame.draw_if_changed(&mut canvas, &theme).unwrap();
+    assert_eq!(canvas.pixel(0, 0), [0, 200, 0, 255]);
+
+    // Pan up, then resize bigger than the surface: user's offset is preserved
+    // clamped to 0; the frame is centred and follow stays off.
+    assert!(frame.pan_by(0, -100));
+    assert_eq!(frame.scroll(), (0, 100));
+    frame.set_window(1400, 900);
+    assert_eq!(frame.scroll(), (0, 0));
+    assert!(!frame.following());
+    let mut big = Canvas::new(1400, 900, theme.bg);
+    frame.draw_if_changed(&mut big, &theme).unwrap();
+    let place = frame.placement().expect("placement");
+    assert_eq!(
+        (place.x, place.y, place.width, place.height),
+        (60, 50, 1280, 800)
+    );
+    let bg = [theme.bg.0, theme.bg.1, theme.bg.2, 255];
+    assert_eq!(big.pixel(0, 0), bg);
+    assert_eq!(big.pixel(60, 50), [0, 0, 0, 255]);
+
+    // Ctrl+Shift+End re-enables following; shrinking the window keeps bottom.
+    frame.pan_step(PanStep::End);
+    assert!(frame.following());
+    frame.set_window(900, 600);
+    assert_eq!(frame.scroll(), (0, 200));
+    let mut small = Canvas::new(900, 600, theme.bg);
+    frame.draw_if_changed(&mut small, &theme).unwrap();
+    assert_eq!(small.pixel(0, 0), [0, 200, 0, 255]);
+}
+
+#[test]
+fn new_generation_keeps_following_until_the_user_pans_up() {
+    let mut fb = MockFb::new(info(1280, 800, 1), (0x33, 0x44, 0x55));
+    fb.publish_on_poll = Some((0x33, 0x44, 0x55));
+    let mut frame = KernelFrame::open(fb).expect("open");
+    let theme = Theme::default();
+    let mut canvas = Canvas::new(900, 600, theme.bg);
+
+    // First draw follows the bottom.
+    frame.draw_if_changed(&mut canvas, &theme).unwrap();
+    assert!(frame.following());
+    assert_eq!(frame.scroll(), (0, 200));
+
+    // New shell output while following: still pinned to the bottom.
+    frame.invalidate();
+    frame.draw_if_changed(&mut canvas, &theme).unwrap();
+    assert!(frame.following());
+    assert_eq!(frame.scroll(), (0, 200));
+
+    // The user reads history: new output must not yank the view back.
+    assert!(frame.pan_by(0, -100));
+    assert!(!frame.following());
+    frame.invalidate();
+    frame.draw_if_changed(&mut canvas, &theme).unwrap();
+    assert!(!frame.following());
+    assert_eq!(frame.scroll(), (0, 100));
+
+    // End returns to the live bottom and re-enables following.
+    frame.pan_step(PanStep::End);
+    assert!(frame.following());
+    frame.invalidate();
+    frame.draw_if_changed(&mut canvas, &theme).unwrap();
+    assert_eq!(frame.scroll(), (0, 200));
+}
+
+#[test]
+fn help_documents_full_size_scale_and_pan() {
+    let out = Command::new(binary()).arg("--help").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("--scale"),
+        "help must document the optional integer zoom-out: {text}"
+    );
+    assert!(
+        text.contains("1:1"),
+        "help must name the default 1:1 presentation: {text}"
+    );
+    assert!(
+        text.contains("Ctrl+Shift"),
+        "help must name the viewport pan keys: {text}"
+    );
+    assert!(
+        text.contains("live bottom"),
+        "help must state that the 1:1 viewport follows the live bottom: {text}"
+    );
 }
 
 #[test]
