@@ -895,6 +895,13 @@ impl Server {
                 stats.tick(Instant::now());
             }
             self.poll_input();
+            // Снимок ввода для строки `--frame-stats`: доказательство того, что
+            // композитор не только рисует, но и получает события.
+            let ev_events = self.input.as_ref().map(|i| i.events_read).unwrap_or(0);
+            let pointer = self.compositor.pointer();
+            if let Some(stats) = self.stats.as_mut() {
+                stats.bucket.set_input(ev_events, (pointer.x, pointer.y));
+            }
             self.accept_pending();
             let mut shutdown = false;
             // Неблокирующий дренаж: `recv_timeout` в compat-слое Pagh опирается
