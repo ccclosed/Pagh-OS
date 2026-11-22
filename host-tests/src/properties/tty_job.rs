@@ -24,8 +24,10 @@
 
 use crate::signal_frame::{default_action, DefaultAction, SIGTTIN, SIGTTOU};
 use crate::tty::{
-    decode_pgrp_arg, may_set_foreground, pgrp_request, PgrpRequest, TtyAccess, TtyJobControl,
-    TtyVerdict, TIOCGPGRP, TIOCSPGRP,
+    decode_pgrp_arg, decode_winsize, encode_winsize, may_set_foreground, pgrp_request,
+    surface_winsize, winsize_changed, winsize_request, PgrpRequest, TtyAccess, TtyJobControl,
+    TtyVerdict, Winsize, WinsizeRequest, TIOCGPGRP, TIOCSPGRP, TIOCGWINSZ, TIOCSWINSZ,
+    WINSIZE_SIZE,
 };
 use proptest::prelude::*;
 
@@ -185,5 +187,112 @@ proptest! {
         prop_assert_eq!(pgrp_request(0x5401), None); // TCGETS
         prop_assert_eq!(pgrp_request(0x5402), None); // TCSETS
         prop_assert_eq!(pgrp_request(0x5413), None); // TIOCGWINSZ
+    }
+
+    // ─── winsize: struct winsize / TIOCGWINSZ / TIOCSWINSZ ──────────────────
+
+    /// `struct winsize` is four little-endian `u16`: encoding then decoding is
+    /// the identity for every field vector, and the wire layout is exactly the
+    /// one Linux UAPI documents (`ws_row, ws_col, ws_xpixel, ws_ypixel`).
+    #[test]
+    fn winsize_round_trips_and_matches_the_uapi_layout(
+        rows in any::<u16>(),
+        cols in any::<u16>(),
+        xpixel in any::<u16>(),
+        ypixel in any::<u16>(),
+    ) {
+        let ws = Winsize { rows, cols, xpixel, ypixel };
+        let bytes = encode_winsize(&ws);
+        prop_assert_eq!(decode_winsize(&bytes), Some(ws));
+        prop_assert_eq!(&bytes[0..2], &rows.to_le_bytes());
+        prop_assert_eq!(&bytes[2..4], &cols.to_le_bytes());
+        prop_assert_eq!(&bytes[4..6], &xpixel.to_le_bytes());
+        prop_assert_eq!(&bytes[6..8], &ypixel.to_le_bytes());
+        prop_assert_eq!(bytes.len(), WINSIZE_SIZE);
+        // Every strict prefix is a rejection, never a truncated success.
+        for cut in 0..WINSIZE_SIZE {
+            prop_assert_eq!(decode_winsize(&bytes[..cut]), None);
+        }
+    }
+
+    /// `surface_winsize` is integer division with a one-cell floor on non-empty
+    /// surfaces (a zero row/col would make TUI programs divide by zero), and the
+    /// zero-input cases stay zero.
+    #[test]
+    fn surface_winsize_matches_the_division_oracle(
+        pw in 0usize..=8192,
+        ph in 0usize..=8192,
+        cw in 0usize..=64,
+        ch in 0usize..=64,
+    ) {
+        let ws = surface_winsize(pw, ph, cw, ch);
+        if pw == 0 || ph == 0 || cw == 0 || ch == 0 {
+            prop_assert_eq!(ws, Winsize::default());
+            prop_assert!(ws.is_empty());
+        } else {
+            prop_assert_eq!(ws.cols as usize, (pw / cw).max(1));
+            prop_assert_eq!(ws.rows as usize, (ph / ch).max(1));
+            prop_assert!(!ws.is_empty());
+            prop_assert_eq!(ws.xpixel as usize, core::cmp::min(pw, u16::MAX as usize));
+            prop_assert_eq!(ws.ypixel as usize, core::cmp::min(ph, u16::MAX as usize));
+        }
+    }
+
+    /// `winsize_request` classifies exactly the two Linux ioctls; the constants
+    /// are the UAPI ones and the neighbouring termios requests are not winsize.
+    #[test]
+    fn winsize_request_classifies_exactly_the_two_ioctls(request in any::<u64>()) {
+        prop_assert_eq!(TIOCGWINSZ, 0x5413);
+        prop_assert_eq!(TIOCSWINSZ, 0x5414);
+        let oracle = match request {
+            0x5413 => Some(WinsizeRequest::Get),
+            0x5414 => Some(WinsizeRequest::Set),
+            _ => None,
+        };
+        prop_assert_eq!(winsize_request(request), oracle);
+        prop_assert_eq!(winsize_request(0x5401), None); // TCGETS
+        prop_assert_eq!(winsize_request(0x540F), None); // TIOCGPGRP
+        prop_assert_eq!(winsize_request(0x5410), None); // TIOCSPGRP
+    }
+
+    /// `winsize_changed` is exactly "some field differs": SIGWINCH must fire on
+    /// a real resize and stay quiet on an idempotent `TIOCSWINSZ`.
+    #[test]
+    fn winsize_change_is_fieldwise_inequality(
+        a in (any::<u16>(), any::<u16>(), any::<u16>(), any::<u16>()),
+        b in (any::<u16>(), any::<u16>(), any::<u16>(), any::<u16>()),
+    ) {
+        let a = Winsize { rows: a.0, cols: a.1, xpixel: a.2, ypixel: a.3 };
+        let b = Winsize { rows: b.0, cols: b.1, xpixel: b.2, ypixel: b.3 };
+        prop_assert_eq!(winsize_changed(&a, &b), a != b);
+        prop_assert_eq!(winsize_changed(&a, &a), false);
+        prop_assert_eq!(winsize_changed(&b, &b), false);
+    }
+
+    /// Two terminals are independent: moving/altering one never changes the
+    /// other's foreground group or TOSTOP. This is the pure restatement of
+    /// "per-session tty" — the kernel keeps one of these per console session.
+    #[test]
+    fn two_terminals_are_independent(
+        fg_a in 1u64..=4096,
+        fg_b in 1u64..=4096,
+        tostop_a in any::<bool>(),
+        tostop_b in any::<bool>(),
+        probe in 1u64..=4096,
+    ) {
+        let mut a = TtyJobControl::new(fg_a, tostop_a);
+        let mut b = TtyJobControl::new(fg_b, tostop_b);
+        a.set_foreground(probe);
+        a.set_tostop(!tostop_a);
+        prop_assert_eq!(a.foreground(), probe);
+        prop_assert_eq!(b.foreground(), fg_b);
+        prop_assert_eq!(b.tostop(), tostop_b);
+        prop_assert_eq!(a.access(probe, TtyAccess::Write), TtyVerdict::Allow);
+        if probe != fg_b {
+            prop_assert_eq!(
+                b.access(probe, TtyAccess::Read),
+                TtyVerdict::Background(SIGTTIN)
+            );
+        }
     }
 }

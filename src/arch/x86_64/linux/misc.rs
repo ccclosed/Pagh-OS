@@ -685,12 +685,25 @@ pub fn sys_clock_nanosleep(_clock_id: u64, _flags: u64, req: u64, _rem: u64) -> 
 /// при 1000 Гц).
 fn sleep_interruptible(total: u64) -> bool {
     let mut left = total;
+    // Раз в 100 тиков сбрасываем возраст in-flight записи: спящая задача не
+    // «застряла» — она делает ровно то, что попросила. Без этого watchdog
+    // печатал `[WATCHDOG] pid=N stuck in syscall ? (nr=230 …)` для любого
+    // законного сна, который вытеснили дольше чем на 500 мс (живой пример:
+    // фоновый сетевой опрос композитора спит по 100 мс и под нагрузкой
+    // просыпается позже). 100 < порога 500, поэтому ложных срабатываний нет,
+    // а настоящий висяк всё равно виден по другим маркерам (тик/EXC/panic).
+    let mut since_refresh = 0u64;
     while left > 0 {
         if super::signal::has_deliverable_current() {
             return false;
         }
         scheduler::sleep_ticks(1);
         left -= 1;
+        since_refresh += 1;
+        if since_refresh >= 100 {
+            since_refresh = 0;
+            super::inflight_refresh(crate::task::scheduler::current_pid());
+        }
     }
     true
 }

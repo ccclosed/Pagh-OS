@@ -82,6 +82,85 @@ static SESSION_RINGS: [Spinlock<KeyboardInner>; crate::drivers::session_route::M
 };
     crate::drivers::session_route::MAX_SESSIONS];
 
+// ─── per-session foreground pid / Ctrl-latches ───────────────────────────────
+//
+// Каждая консольная сессия имеет СВОЙ foreground-процесс и свои защёлки ^C/^Z:
+// два окна (или окно и boot-shell) не должны отбирать друг у друга терминал и
+// глотать чужой Ctrl+C. Boot-сессия (0) по-прежнему живёт в публичных статиках
+// [`CTRL_C`]/[`CTRL_Z`]/[`FG_PID`] — их читают IRQ1 и старые пути; сессии окон
+// (`>= 1`) — в массивах ниже, доступ через [`ctrl_c`]/[`ctrl_z`]/[`fg_pid`].
+
+/// Защёлка Ctrl+C по сессиям (индекс 0 не используется: см. [`CTRL_C`]).
+static SESSION_CTRL_C: [core::sync::atomic::AtomicBool;
+    crate::drivers::session_route::MAX_SESSIONS] = [const { core::sync::atomic::AtomicBool::new(false) };
+    crate::drivers::session_route::MAX_SESSIONS];
+/// Защёлка Ctrl+Z по сессиям (индекс 0 не используется).
+static SESSION_CTRL_Z: [core::sync::atomic::AtomicBool;
+    crate::drivers::session_route::MAX_SESSIONS] = [const { core::sync::atomic::AtomicBool::new(false) };
+    crate::drivers::session_route::MAX_SESSIONS];
+/// PID foreground `Compat_Process` по сессиям (индекс 0 не используется).
+static SESSION_FG_PIDS: [core::sync::atomic::AtomicU64;
+    crate::drivers::session_route::MAX_SESSIONS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::drivers::session_route::MAX_SESSIONS];
+
+fn session_slot(session: usize) -> Option<usize> {
+    if session != crate::drivers::session_route::BOOT_SESSION
+        && session < crate::drivers::session_route::MAX_SESSIONS
+    {
+        Some(session)
+    } else {
+        None
+    }
+}
+
+/// Забрать (и сбросить) защёлку Ctrl+C сессии.
+pub fn take_ctrl_c(session: usize) -> bool {
+    match session_slot(session) {
+        Some(s) => SESSION_CTRL_C[s].swap(false, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_C.swap(false, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Поставить защёлку Ctrl+C сессии.
+pub fn set_ctrl_c(session: usize, on: bool) {
+    match session_slot(session) {
+        Some(s) => SESSION_CTRL_C[s].store(on, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_C.store(on, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Забрать (и сбросить) защёлку Ctrl+Z сессии.
+pub fn take_ctrl_z(session: usize) -> bool {
+    match session_slot(session) {
+        Some(s) => SESSION_CTRL_Z[s].swap(false, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_Z.swap(false, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Поставить защёлку Ctrl+Z сессии.
+pub fn set_ctrl_z(session: usize, on: bool) {
+    match session_slot(session) {
+        Some(s) => SESSION_CTRL_Z[s].store(on, core::sync::atomic::Ordering::Relaxed),
+        None => CTRL_Z.store(on, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// PID foreground-программы сессии (`0` — foreground у shell).
+pub fn fg_pid(session: usize) -> u64 {
+    match session_slot(session) {
+        Some(s) => SESSION_FG_PIDS[s].load(core::sync::atomic::Ordering::Relaxed),
+        None => FG_PID.load(core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Записать PID foreground-программы сессии (`0` — вернуть терминал shell).
+pub fn set_fg_pid(session: usize, pid: u64) {
+    match session_slot(session) {
+        Some(s) => SESSION_FG_PIDS[s].store(pid, core::sync::atomic::Ordering::Relaxed),
+        None => FG_PID.store(pid, core::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 /// Initialize the PS/2 keyboard driver.
 pub fn init() {
     let kbd = Arc::new(Ps2Keyboard::new());
@@ -227,7 +306,12 @@ pub fn inject_scancode(byte: u8) {
 /// USB HID) только кладёт байт в очередь.
 pub(crate) fn deliver_physical(byte: u8) {
     crate::drivers::evdev::feed_scancode(byte);
-    if !crate::drivers::vtinput::client_active() {
+    // Второй источник, которому байт уже адресован, — сфокусированное
+    // терминальное окно: композитор отдаёт клавиши только ему, а клиент
+    // возвращает их через `/dev/vtinput{N}`. Прямой путь в boot-кольцо при
+    // этом обязан молчать, иначе ввод окна дублировался бы в boot-shell
+    // (этап 4: «ввод не уходит в boot VT»).
+    if !crate::drivers::vtinput::client_active() && !crate::drivers::vtinput::session_focused() {
         push_to_ring(byte);
     }
 }
@@ -292,13 +376,20 @@ pub static FG_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 static DRV_CTRL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DRV_EXTENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// IRQ1: единственный байт клавиатуры за прерывание больше не читается.
+///
+/// Общий выходной буфер 8042 выгребает [`crate::drivers::i8042`]: один заход
+/// вычитывает все готовые байты (мышь и клавиатуру) и маршрутизирует их по
+/// AUXDATA. Так под нагрузкой не теряется ни клавиатура, ни мышь.
 pub fn irq_handler() {
-    // SAFETY: Reading from port 0x60 is standard PS/2 data port access.
-    let scancode: u8 = unsafe {
-        let mut port = x86_64::instructions::port::Port::new(0x60);
-        port.read()
-    };
+    crate::drivers::i8042::irq_drain();
+}
 
+/// Разобрать один клавиатурный байт из потока 8042 (вызывает `i8042`).
+///
+/// Вынесено из обработчика без изменения семантики: трекинг ^C/^Z и передача
+/// байта в `inputd` остались теми же, меняется только кто читает порт.
+pub(crate) fn handle_byte(scancode: u8) {
     // ── ^C tracking (make/break, E0-aware) ──
     use core::sync::atomic::Ordering;
     if scancode == 0xE0 {
@@ -306,50 +397,52 @@ pub fn irq_handler() {
     } else {
         let extended = DRV_EXTENDED.swap(false, Ordering::Relaxed);
         let make = scancode & 0x80 == 0;
+        // Терминальные семантики ^C/^Z принадлежат ВЛАДЕЛЬЦУ клавиатуры. Пока
+        // вводом владеет VT-клиент (boot `/dev/vtinput` или окно
+        // `/dev/vtinput1`), тот же физический байт уже ушёл в его терминал, и
+        // IRQ-трекинг не должен дублировать SIGINT/SIGTSTP в boot-сессию:
+        // иначе `Ctrl+C` в окне убивал boot-клиента, а `Ctrl+Z` парковал его
+        // (live-QEMU). Модификаторы всё равно отслеживаются — это цена одного
+        // атомика на IRQ.
+        let terminal_owner = !crate::drivers::vtinput::client_active();
         match (extended, scancode) {
             (false, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
             (true, 0x1D) => DRV_CTRL.store(make, Ordering::Relaxed),
             (false, 0x2C) if make && DRV_CTRL.load(Ordering::Relaxed) => {
-                CTRL_Z.store(true, Ordering::Relaxed);
+                if terminal_owner {
+                    CTRL_Z.store(true, Ordering::Relaxed);
+                }
             }
             (false, 0x2E) if make && DRV_CTRL.load(Ordering::Relaxed) => {
-                CTRL_C.store(true, Ordering::Relaxed);
-                let fg = FG_PID.load(Ordering::Relaxed);
-                // Клавиатурой владеет клиент окна, а foreground-группа этой
-                // ветки — он сам (клиент запущен из boot-shell): ^C, набранный
-                // В окне, пришёл сюда как физический scancode, но адресован он
-                // session-shell'у окна (его байты уже идут через
-                // `/dev/vtinput1`). Убить здесь клиента — значит закрыть всё
-                // окно по ^C, набранному внутри него. Программа, запущенная
-                // `lxrun` В окне, привязана к сессии 1 и защиту не получает:
-                // её ^C по-прежнему доставляется ниже, foreground-группе.
-                let window_owns_keys = fg != 0
-                    && crate::drivers::vtinput::client_active()
-                    && crate::drivers::session::bound_session(fg)
-                        == crate::drivers::session_route::BOOT_SESSION;
-                if fg != 0
-                    && crate::task::compat::compat_exists(fg)
-                    && !crate::task::compat::compat_is_raw(fg)
-                    && !window_owns_keys
-                {
-                    // Phase-2 signals: ^C delivers a real SIGINT to the
-                    // terminal's FOREGROUND PROCESS GROUP — a job that forked
-                    // has several thread groups and every one of them must see
-                    // the interrupt, not only the pid the shell records. A
-                    // program with a handler gets it (the blocking-wait EINTR
-                    // checks wake it); without one the default-terminate action
-                    // kills it at the next syscall return — the classic
-                    // driver-level bypass remains only as the fallback for a
-                    // foreground group that has no live member (e.g. ^C racing
-                    // the handoff in `cmd_lxrun`).
-                    let pgid = crate::drivers::tty::foreground_pgid();
-                    if crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
-                        pgid,
-                        crate::arch::x86_64::linux::signal_frame::SIGINT,
-                    )
-                    .is_err()
+                if !terminal_owner {
+                    // Занято окном: байт уже ушёл композитору, а его сессия
+                    // разберёт `ISIG` сама.
+                } else {
+                    CTRL_C.store(true, Ordering::Relaxed);
+                    let fg = FG_PID.load(Ordering::Relaxed);
+                    if fg != 0
+                        && crate::task::compat::compat_exists(fg)
+                        && !crate::task::compat::compat_is_raw(fg)
                     {
-                        crate::task::scheduler::request_exit(fg);
+                        // Phase-2 signals: ^C delivers a real SIGINT to the
+                        // terminal's FOREGROUND PROCESS GROUP — a job that forked
+                        // has several thread groups and every one of them must see
+                        // the interrupt, not only the pid the shell records. A
+                        // program with a handler gets it (the blocking-wait EINTR
+                        // checks wake it); without one the default-terminate action
+                        // kills it at the next syscall return — the classic
+                        // driver-level bypass remains only as the fallback for a
+                        // foreground group that has no live member (e.g. ^C racing
+                        // the handoff in `cmd_lxrun`).
+                        let pgid = crate::drivers::tty::foreground_pgid();
+                        if crate::arch::x86_64::linux::signal::send_signal_to_pgid_all(
+                            pgid,
+                            crate::arch::x86_64::linux::signal_frame::SIGINT,
+                        )
+                        .is_err()
+                        {
+                            crate::task::scheduler::request_exit(fg);
+                        }
                     }
                 }
             }

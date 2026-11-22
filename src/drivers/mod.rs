@@ -14,6 +14,8 @@ pub mod fb_abi;
 /// host-тестируемая.
 pub mod fb_surface;
 pub mod framebuffer;
+/// Единый читатель байтового потока 8042 (IRQ1/IRQ12 + страховочный опрос `inputd`).
+pub mod i8042;
 /// Чистый кодек `struct input_event` + set-1 → Linux keycodes, host-тестируемый.
 pub mod input_event;
 /// Чистое кольцо сырого ввода (`inputd`-очередь), host-тестируемое.
@@ -47,6 +49,10 @@ pub mod vt;
 pub mod vt_abi;
 /// Чистый переводчик VT-байтов `/dev/vtinput` в PS/2 set-1.
 pub mod vt_keys;
+/// Указатель терминальных сессий: `/dev/vtmouse*` → состояние мыши сессии.
+pub mod vt_mouse;
+/// Чистый ABI `/dev/vtmouse*` (16-байтная запись указателя).
+pub mod vt_mouse_abi;
 /// Чистый ABI `/dev/vtfb1` (24-байтный `VTFBIOGET_INFO` + план `read`).
 pub mod vtfb_abi;
 /// `/dev/vtinput`: VT-байты → вход kernel-shell.

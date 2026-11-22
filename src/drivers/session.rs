@@ -150,6 +150,20 @@ pub fn bound_session(pid: u64) -> usize {
         .unwrap_or(session_route::BOOT_SESSION)
 }
 
+/// Унаследовать привязку родителя fork-ребёнком (`lxrun`-программа сделала
+/// `fork`).
+///
+/// Без этого ребёнок задания не принадлежал бы ни окну, ни boot-консоли: его
+/// вывод ушёл бы в boot-консоль, а stdin — в boot-терминал. Привязка — часть
+/// управляющего терминала, поэтому наследуется как `pgid`/`tty_job`. Boot-сессия
+/// привязок не имеет, и родитель из неё не создаёт запись.
+pub fn inherit_bind(child: u64) {
+    let session = current();
+    if session != session_route::BOOT_SESSION {
+        bind(child, session);
+    }
+}
+
 /// Снять привязку задачи (вызывается на её выходе, чтобы таблица не росла).
 pub fn unbind(pid: u64) {
     let mut binds = BINDS.lock();
@@ -158,12 +172,34 @@ pub fn unbind(pid: u64) {
     }
 }
 
-/// Сколько fd устройств сессии открыто (суммарно по `vtfb1` и `vtinput1`).
+/// Сколько fd устройств **каждой** сессии открыто (`vtfb{N}`, `vtinput{N}`,
+/// `vtmouse{N}` суммарно).
 ///
 /// «Последний close — reap»: пока счётчик > 0, окно живо; на переходе в 0
 /// сессия получает запрос выхода. Счётчик сбрасывается при выходе сессии, чтобы
 /// close «просроченных» fd прошлой генерации не убил новую (см. [`exit`]).
-static OPEN_FDS: AtomicU32 = AtomicU32::new(0);
+///
+/// Счётчик **на сессию**, а не один на ядро: иначе закрытие второго окна
+/// гасило бы первое, а переоткрытие первого считалось бы вторым клиентом.
+static OPEN_FDS: [AtomicU32; MAX_SESSIONS] = [const { AtomicU32::new(0) }; MAX_SESSIONS];
+
+/// PID задачи-клиента, открывшей устройства сессии (`0` — клиентов нет).
+///
+/// Окно открывает **три** устройства (поверхность, ввод, указатель), и каждое
+/// — отдельный `open(2)`. Без этой записи второй же `open` того же клиента
+/// получал бы `EBUSY` (сессия «занята»), то есть окно не могло бы подключиться
+/// вообще. `EBUSY` адресован *другому* окну, а не повторному `open` того же
+/// процесса.
+static OPEN_CLIENT: [AtomicU64; MAX_SESSIONS] = [const { AtomicU64::new(0) }; MAX_SESSIONS];
+
+/// Сериализует `open`/`close` устройств сессий.
+///
+/// Задача одна, но клиентов может быть несколько (композитор запускает окна
+/// подряд, а `open`/`close` — системные вызовы): проверка «сессия жива» и
+/// инкремент счётчика обязаны быть атомарны, иначе два окна одновременно
+/// решат, что сессия свободна, и второе получит ту же поверхность. Лок берётся
+/// только в `open`/`close` устройств сессии, не на путях печати/ввода.
+static OPEN_LOCK: Spinlock<()> = Spinlock::new(());
 
 /// Сессия, которую должен подхватить следующий [`session_entry`].
 ///
@@ -172,9 +208,43 @@ static OPEN_FDS: AtomicU32 = AtomicU32::new(0);
 /// слот пишется непосредственно перед спавном и читается в его начале.
 static PENDING: AtomicU64 = AtomicU64::new(0);
 
-/// Открыт ли какой-нибудь fd устройств сессии (для диагностики/тестов).
-pub fn open_fds() -> u32 {
-    OPEN_FDS.load(Ordering::Relaxed)
+/// PID клиента, открывшего устройства слота (для focus-latch); `0` — нет.
+pub fn open_client(session: usize) -> u64 {
+    if session < MAX_SESSIONS {
+        OPEN_CLIENT[session].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Сколько fd устройств конкретной сессии открыто (для диагностики/тестов).
+pub fn open_fds(session: usize) -> u32 {
+    if session < MAX_SESSIONS {
+        OPEN_FDS[session].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Суммарное число открытых fd всех терминальных сессий (диагностика).
+pub fn total_open_fds() -> u32 {
+    OPEN_FDS
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Результат [`note_open`]: почему `open` устройства сессии удался/нет.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionOpen {
+    /// Сессия уже была жива, клиент подключился к ней.
+    Attached,
+    /// Сессия поднята этим `open` (первый клиент).
+    Started,
+    /// Сессия уже принадлежит другому живому клиенту — `EBUSY`.
+    Busy,
+    /// Сессию поднять нельзя (нет фреймбуфера/PMM) — `ENODEV`.
+    Unavailable,
 }
 
 /// Учесть `open` устройства сессии: поднять сессию, если она ещё не запущена.
@@ -184,29 +254,48 @@ pub fn open_fds() -> u32 {
 /// открывающего, чтобы `mmap`/`ioctl` сразу после `open` видели готовую
 /// геометрию. `false` — сессию поднять нельзя (нет фреймбуфера/PMM), и `open`
 /// обязан ответить `ENODEV`, а не отдать fd на мёртвое окно.
-pub fn note_open(session: usize) -> bool {
+pub fn note_open(session: usize) -> SessionOpen {
+    note_open_as(session, crate::task::scheduler::current_pid())
+}
+
+/// [`note_open`] от имени конкретного процесса.
+///
+/// Отдельная точка входа нужна тестам: правило «повторный open того же клиента
+/// — не занятость» проверяется только с двумя РАЗНЫМИ pid'ами, а self-test
+/// исполняется в одной задаче. В бою единственный вызывающий — [`note_open`].
+pub fn note_open_as(session: usize, opener: u64) -> SessionOpen {
     if session == session_route::BOOT_SESSION || session >= MAX_SESSIONS {
-        return false;
+        return SessionOpen::Unavailable;
     }
-    if live(session) {
-        // Переоткрытие в тот же слот снимает возможный запрос выхода. Гонка
-        // реальная и наблюдалась живым клиентом: он закрывает ОБА устройства
-        // (последний close просит reap) и сразу открывает их заново, чтобы
-        // поднять сессию в том же окне. Задача сессии проверяет флаг только на
-        // границе своего цикла, поэтому «close → open» успевает проскочить до
-        // неё; без отмены она выходит уже ПОСЛЕ нового open, и клиент получает
-        // `ENODEV` от ioctl на только что открытой сессии (в его логах —
-        // «surface not up yet … retrying»).
-        //
-        // Отменять безопасно: open — это намерение пользователя продолжать
-        // сессию; если после этого не последует ни одного fd, следующий close
-        // снова поставит флаг.
+    // `live` + снятие reap — та же гонка, что в #174: клиент закрывает оба
+    // устройства (последний close просит reap) и сразу открывает их заново;
+    // задача сессии проверяет флаг только на границе цикла, поэтому без отмены
+    // она выходит уже ПОСЛЕ нового open, и клиент получает `ENODEV`. Отмена
+    // безопасна: open — намерение продолжать; если fd не останется, следующий
+    // close снова поставит флаг.
+    let _serial = OPEN_LOCK.lock();
+    let outcome = if live(session) {
+        // Живая сессия с клиентами — не наша: два окна не должны делить
+        // поверхность, ввод и scrollback (изоляция сессий). Повторный `open`
+        // **того же** клиента (второе/третье устройство окна) — не занятость.
+        // Без клиентов (окно закрыли) — это переподключение к той же сессии,
+        // и запрос выхода снимается.
+        let client = OPEN_CLIENT[session].load(Ordering::Relaxed);
+        if OPEN_FDS[session].load(Ordering::Relaxed) > 0 && client != 0 && client != opener {
+            return SessionOpen::Busy;
+        }
         clear_reap(session);
-    } else if !start(session) {
-        return false;
-    }
-    OPEN_FDS.fetch_add(1, Ordering::Relaxed);
-    true
+        SessionOpen::Attached
+    } else {
+        if !start(session) {
+            return SessionOpen::Unavailable;
+        }
+        SessionOpen::Started
+    };
+    clear_reap(session);
+    OPEN_CLIENT[session].store(opener, Ordering::Relaxed);
+    OPEN_FDS[session].fetch_add(1, Ordering::Relaxed);
+    outcome
 }
 
 /// Учесть `close` устройства сессии; на последнем — запросить выход.
@@ -218,12 +307,18 @@ pub fn note_close(session: usize) {
     if session == session_route::BOOT_SESSION || session >= MAX_SESSIONS {
         return;
     }
-    let mut cur = OPEN_FDS.load(Ordering::Relaxed);
+    let _serial = OPEN_LOCK.lock();
+    let mut cur = OPEN_FDS[session].load(Ordering::Relaxed);
     loop {
         if cur == 0 {
             return;
         }
-        match OPEN_FDS.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
+        match OPEN_FDS[session].compare_exchange_weak(
+            cur,
+            cur - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => {
                 if cur == 1 {
                     request_reap(session);
@@ -244,6 +339,7 @@ fn start(session: usize) -> bool {
     // Новая генерация окна начинает с чистого ввода: недоставленный хвост
     // прошлой пачки и недособранная ESC-последовательность не должны съесть
     // первые клавиши пользователя (см. `vtinput::reset_session`).
+    crate::drivers::vt_mouse::reset(session);
     crate::drivers::vtinput::reset_session(session);
     PENDING.store(session as u64, Ordering::Relaxed);
     // Инвариант 6: путь спавна идёт с замаскированными прерываниями — тик не
@@ -258,7 +354,14 @@ fn start(session: usize) -> bool {
 
 /// Точка входа задачи сессии: подхватить номер из [`PENDING`] и запустить REPL.
 fn session_entry() {
-    let session = PENDING.load(Ordering::Relaxed) as usize;
+    // Сессию ищем по pid-владельцу: `set_owner` записан спавнером под
+    // маскированными прерываниями **до** того, как задача успела получить CPU,
+    // поэтому гонки двух одновременных спавнов через общий слот нет. `PENDING`
+    // остаётся запасным путём для вырожденного случая (владелец не записан).
+    let pid = crate::task::scheduler::current_pid();
+    let session = (1..MAX_SESSIONS)
+        .find(|slot| OWNERS[*slot].load(Ordering::Relaxed) == pid)
+        .unwrap_or_else(|| PENDING.load(Ordering::Relaxed) as usize);
     // Владелец записан спавнером под маскированными прерываниями; повторная
     // запись делает задачу владельцем и в вырожденном случае (pid переиспользован
     // после неудачного старта). Reap НЕ снимается: close, случившийся между
@@ -299,7 +402,11 @@ pub fn clear_reap(session: usize) {
 pub fn exit(session: usize) -> ! {
     // Забыть fd прошлой генерации: их close придёт позже и не должен
     // сосчитаться как закрытие будущей сессии (см. [`note_close`]).
-    OPEN_FDS.store(0, Ordering::Relaxed);
+    OPEN_FDS[session].store(0, Ordering::Relaxed);
+    OPEN_CLIENT[session].store(0, Ordering::Relaxed);
+    // #172: задания, размер окна и foreground-группа — тоже по сессии.
+    crate::shell::jobs::clear_session(session);
+    crate::drivers::tty::reset_session(session);
     reset(session);
     crate::drivers::framebuffer::reset_session(session);
     crate::task::scheduler::exit_current()
@@ -327,6 +434,10 @@ pub fn reset(session: usize) {
     }
     OWNERS[session].store(0, Ordering::Relaxed);
     LIVE[session].store(false, Ordering::Relaxed);
+    // Указатель окна не должен переживать генерацию: зажатая кнопка/старая
+    // позиция в переоткрытом окне выглядели бы как ввод, которого не было.
+    crate::drivers::vt_mouse::reset(session);
+    crate::drivers::vtinput::reset_session(session);
     let mut binds = BINDS.lock();
     binds.retain(|_, s| *s != session as u64);
     BIND_COUNT.store(binds.len() as u32, Ordering::Relaxed);

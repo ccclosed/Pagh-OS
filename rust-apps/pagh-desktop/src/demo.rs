@@ -268,10 +268,23 @@ pub fn paint_surface(width: u32, height: u32, state: &DemoState) -> Surface {
 
 /// Текущее UTC-время и дата в форматах панели (`HH:MM` и `DD.MM.YYYY`).
 pub fn clock_now() -> (String, String) {
-    let seconds = std::time::SystemTime::now()
+    format_unix(unix_now())
+}
+
+/// Секунды с UNIX epoch по стенным часам (один syscall `clock_gettime`).
+///
+/// В Pagh `CLOCK_REALTIME` читает CMOS RTC, а это медленная port-I/O операция:
+/// вызывать её из кадра нельзя (измерено: десятки миллисекунд под TCG). Панель
+/// берёт базовую точку один раз и дальше идёт по монотонным `Instant`.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// `(HH:MM, DD.MM.YYYY)` из секунд UNIX epoch — чистая функция (host-тесты).
+pub fn format_unix(seconds: u64) -> (String, String) {
     let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
     let time = format!("{:02}:{:02}", (seconds / 3600) % 24, (seconds / 60) % 60);
     let date = format!("{day:02}.{month:02}.{year:04}");
@@ -295,6 +308,21 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_unix_is_the_panel_clock() {
+        // 2026-11-15 23:38:00 UTC (the fixed demo clock) and the epoch.
+        assert_eq!(
+            format_unix(1_794_785_880),
+            ("23:38".to_string(), "15.11.2026".to_string())
+        );
+        assert_eq!(
+            format_unix(0),
+            ("00:00".to_string(), "01.01.1970".to_string())
+        );
+        // A minute later only the time changes.
+        assert_eq!(format_unix(1_794_785_940).0, "23:39");
+    }
 
     #[test]
     fn terminal_surface_has_expected_size_and_pixels() {
