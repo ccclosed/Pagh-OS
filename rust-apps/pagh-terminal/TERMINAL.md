@@ -342,7 +342,12 @@ client                                   server
   будущего расширения; IME не поддержан);
 * wheel без mouse-reporting листает scrollback; drag левой кнопкой создаёт
   selection.  Выделенный текст доступен `Screen::selection_text()`; запись в
-  системный clipboard в v1 не выполняется.
+  системный clipboard в v1 не выполняется.  Selection меняет **только фон**:
+  это полупрозрачная подсветка поверх исходного фона
+  (`render::SELECTION_BG_MIX`), поэтому foreground и ANSI-цвета остаются
+  байт-в-байт прежними.  Перекрашивать текст в один `selection_fg` нельзя:
+  на выводе `fastfetch` это стирает цветной логотип и полосу цветовых фонов
+  (регрессия — `tests/selection_live.rs` и `tests/render_png.rs`).
 
 Resize — только серверный: клиент не просит размер, а принимает `configure`.
 Декорации и заголовок принадлежат композитору, поэтому `set_title` в PDP/1

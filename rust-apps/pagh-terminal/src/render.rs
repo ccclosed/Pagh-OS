@@ -17,6 +17,14 @@ use crate::screen::Screen;
 
 /// Padding around the text grid inside a client surface.
 pub const VIEWPORT_PADDING: usize = 2;
+/// Share of [`Theme::selection`] mixed into a selected cell's background.
+///
+/// Selection is a *wash over the existing background*, not an opaque repaint:
+/// background art (ANSI `48;*` cells, colour swatches) stays readable and the
+/// foreground is never touched, while 60 % accent is still unmistakably a
+/// highlight on the dark theme.  100 % would erase the background; a much lower
+/// value makes the selection hard to see.
+pub const SELECTION_BG_MIX: f32 = 0.6;
 /// Height of the screenshot-only title strip.
 pub const TITLE_H: usize = 22;
 /// Window border thickness.
@@ -405,7 +413,6 @@ pub struct Theme {
     pub cursor_text: Rgb,
     pub cursor_unfocused: Rgb,
     pub selection: Rgb,
-    pub selection_fg: Rgb,
     pub palette: [Rgb; 256],
     pub window_bg: Rgb,
     pub border: Rgb,
@@ -424,7 +431,6 @@ impl Default for Theme {
             cursor_text: Rgb(0x23, 0x26, 0x27),
             cursor_unfocused: Rgb(0x7f, 0x8c, 0x8d),
             selection: Rgb(0x3d, 0xae, 0xe9),
-            selection_fg: Rgb(0x23, 0x26, 0x27),
             palette: default_palette(),
             window_bg: Rgb(0x23, 0x26, 0x27),
             border: Rgb(0x1b, 0x1e, 0x1f),
@@ -684,18 +690,28 @@ fn resolve_style(
     if cell.attrs.contains(Attrs::DIM) {
         fg = fg.scale(0.62);
     }
-    if cell.attrs.contains(Attrs::HIDDEN) {
-        fg = bg;
-    }
-    if cell.attrs.contains(Attrs::BLINK) && !blink_on {
-        fg = bg;
-    }
+    // HIDDEN and a dark blink phase paint the foreground in the background
+    // colour.  Defer that decision until after the selection wash: it has to
+    // track the *current* background, or selection would make hidden text show
+    // up (fg keeps the pre-selection colour while bg moved).
+    let blank =
+        cell.attrs.contains(Attrs::HIDDEN) || (cell.attrs.contains(Attrs::BLINK) && !blink_on);
     if screen.reverse_video {
         std::mem::swap(&mut fg, &mut bg);
     }
     if selected {
-        bg = theme.selection;
-        fg = theme.selection_fg;
+        // Selection changes the background only.  Overwriting the foreground
+        // with one dark colour (the old `selection_fg`) erased exactly what a
+        // selection must preserve: a fastfetch logo is coloured `#` glyphs and
+        // its palette strip is ANSI *backgrounds*, so a flat fill turned the
+        // logo into dark blocks and the strip into one blue bar, while every
+        // coloured key/value went grey.  A wash keeps the glyph colour
+        // byte-identical and lets background art show through, and the mixed
+        // contrast still makes the highlight obvious.
+        bg = bg.lerp(theme.selection, SELECTION_BG_MIX);
+    }
+    if blank {
+        fg = bg;
     }
     let focused_cursor = cursor_block;
     if cursor_block {
@@ -1201,7 +1217,126 @@ mod tests {
         let theme = Theme::default();
         let canvas = render_screen(&t.screen, &theme, &RenderOptions::default());
         let px = canvas.pixel(VIEWPORT_PADDING + CELL_W + 2, VIEWPORT_PADDING + 2);
-        assert_eq!(&px[..3], &theme.selection.to_array());
+        assert_eq!(
+            &px[..3],
+            &theme.bg.lerp(theme.selection, SELECTION_BG_MIX).to_array()
+        );
+    }
+
+    /// Собрать цвета всех пикселей клетки `(row, col)`.
+    fn cell_pixels(canvas: &Canvas, row: usize, col: usize) -> Vec<[u8; 3]> {
+        let mut out = Vec::with_capacity(CELL_W * CELL_H);
+        for y in 0..CELL_H {
+            for x in 0..CELL_W {
+                let px = canvas.pixel(
+                    VIEWPORT_PADDING + col * CELL_W + x,
+                    VIEWPORT_PADDING + row * CELL_H + y,
+                );
+                out.push([px[0], px[1], px[2]]);
+            }
+        }
+        out
+    }
+
+    /// Репро бага: выделение fastfetch (цветной `#`-логотип + ANSI-текст)
+    /// раньше перекрашивало foreground в один серый (`selection_fg`), поэтому
+    /// логотип и цветные ключи пропадали. Выделение обязано менять только фон:
+    /// каждый пиксель глифа сохраняет свой цвет, а фон уходит в подсветку.
+    #[test]
+    fn selection_preserves_glyph_colours() {
+        let mut t = Terminal::new(12, 2);
+        t.feed_str("\x1b[1m\x1b[33m##\x1b[0m\x1b[1m\x1b[37mPagh\x1b[0m");
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let plain = render_screen(&t.screen, &theme, &opts);
+
+        let mut selected = Terminal::new(12, 2);
+        selected.feed_str("\x1b[1m\x1b[33m##\x1b[0m\x1b[1m\x1b[37mPagh\x1b[0m");
+        selected
+            .screen
+            .begin_selection_abs(0, 0, crate::screen::SelectionMode::Char);
+        selected.screen.extend_selection_abs(0, 5);
+        let after = render_screen(&selected.screen, &theme, &opts);
+
+        let highlight = theme.bg.lerp(theme.selection, SELECTION_BG_MIX);
+        let yellow = theme.palette[11].lerp(Rgb::WHITE, 0.12);
+        let white = theme.palette[15].lerp(Rgb::WHITE, 0.12);
+        let mut glyph_pixels = 0usize;
+        for col in 0..6 {
+            let before = cell_pixels(&plain, 0, col);
+            let now = cell_pixels(&after, 0, col);
+            for (b, a) in before.iter().zip(now.iter()) {
+                if *b == yellow.to_array() || *b == white.to_array() {
+                    glyph_pixels += 1;
+                    assert_eq!(b, a, "foreground pixel at cell {col} changed colour");
+                } else if *b == theme.bg.to_array() {
+                    assert_eq!(a, &highlight.to_array(), "selection background mismatch");
+                }
+            }
+        }
+        assert!(glyph_pixels > 40, "too few glyph pixels: {glyph_pixels}");
+    }
+
+    /// Full-block art (the `█`-style logo) is pure foreground in the cell: the
+    /// old opaque `selection_fg` fill turned the whole cell into the theme
+    /// background, i.e. the logo visibly disappeared.  Its pixels must stay
+    /// byte-identical under selection.
+    #[test]
+    fn selection_does_not_erase_full_block_glyphs() {
+        let mut t = Terminal::new(4, 1);
+        t.screen.pen.fg = Color::Rgb(255, 0, 0);
+        t.feed_str("█");
+        t.screen
+            .begin_selection_abs(0, 0, crate::screen::SelectionMode::Char);
+        t.screen.extend_selection_abs(0, 0);
+        let canvas = render_screen(&t.screen, &Theme::default(), &RenderOptions::default());
+        for px in cell_pixels(&canvas, 0, 0) {
+            assert_eq!(px, [255, 0, 0], "selected block glyph was repainted");
+        }
+    }
+
+    /// ANSI-background art (`48;*`) is part of the picture too: the wash must
+    /// keep it distinguishable instead of replacing it with a solid bar.
+    #[test]
+    fn selection_keeps_ansi_background_art() {
+        let mut t = Terminal::new(4, 1);
+        t.feed_str("\x1b[41m  \x1b[0m");
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+        let plain = render_screen(&t.screen, &theme, &opts);
+        t.screen
+            .begin_selection_abs(0, 0, crate::screen::SelectionMode::Char);
+        t.screen.extend_selection_abs(0, 1);
+        let after = render_screen(&t.screen, &theme, &opts);
+        let red = theme.palette[1];
+        let washed = red.lerp(theme.selection, SELECTION_BG_MIX);
+        for col in 0..2 {
+            assert_eq!(cell_pixels(&plain, 0, col)[0], red.to_array());
+            let px = cell_pixels(&after, 0, col)[0];
+            assert_eq!(px, washed.to_array());
+            assert_ne!(px, theme.selection.to_array(), "background art was erased");
+            assert_ne!(px, red.to_array(), "selection is invisible");
+        }
+    }
+
+    /// Hidden text must stay hidden: now that the foreground is preserved, the
+    /// "paint fg in the background colour" decision has to follow the *washed*
+    /// background, not the pre-selection one.
+    #[test]
+    fn selection_keeps_hidden_text_hidden() {
+        let mut t = Terminal::new(8, 1);
+        t.feed_str("\x1b[8msecret");
+        let theme = Theme::default();
+        t.screen
+            .begin_selection_abs(0, 0, crate::screen::SelectionMode::Char);
+        t.screen.extend_selection_abs(0, 5);
+        let canvas = render_screen(&t.screen, &theme, &RenderOptions::default());
+        let washed = theme.bg.lerp(theme.selection, SELECTION_BG_MIX);
+        for col in 0..6 {
+            for px in cell_pixels(&canvas, 0, col) {
+                assert_eq!(px, washed.to_array(), "hidden glyph appeared on selection");
+            }
+        }
     }
 
     #[test]
